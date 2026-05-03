@@ -13,6 +13,13 @@ storage/
 # ── Log files ──────────────────────────────────────────────────────────────────
 server.log
 server.log.*
+tests/browser/server.log.*
+
+# ── Browser tests ──────────────────────────────────────────────────────────────
+tests/browser/
+
+#MCPs
+.playwright-mcp
 
 # ── IDE / editor ───────────────────────────────────────────────────────────────
 .vscode/
@@ -37,3 +44,5 @@ Thumbs.db
 plans/
 
 PRD.md
+.mcp.json
+ROADMAP.md
