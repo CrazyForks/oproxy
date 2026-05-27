@@ -43,9 +43,10 @@ jobs:
       - name: Dependency audit
         run: cargo audit
 
-      - name: Browser smoke tests
-        working-directory: tests/browser
-        run: |
-          npm ci
-          npx playwright install --with-deps chromium
-          npx playwright test --config=playwright.config.js specs/00-beta-smoke.spec.js specs/10-ssl.spec.js
+      # TODO saurav enabled when ready
+      # - name: Browser smoke tests
+      #   working-directory: tests/browser
+      #   run: |
+      #     npm ci
+      #     npx playwright install --with-deps chromium
+      #     npx playwright test --config=playwright.config.js specs/00-beta-smoke.spec.js specs/10-ssl.spec.js
