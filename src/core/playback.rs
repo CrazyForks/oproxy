@@ -97,6 +97,7 @@ impl PlaybackEngine {
                             ttfb_ms: 0,
                             body_ms: 0,
                             body_bytes: None,
+                            ..Default::default()
                         },
                     );
                     info!(status=%status, uri=%uri, "Playback: replayed");

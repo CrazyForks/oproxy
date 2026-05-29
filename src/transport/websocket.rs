@@ -280,6 +280,7 @@ pub async fn handle_websocket(
             body: String::new(),
             host: target_host.clone(),
             body_bytes: None,
+            ..Default::default()
         },
     );
 

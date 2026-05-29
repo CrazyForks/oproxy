@@ -77,9 +77,8 @@ impl Middleware for GraphQLInspectorMiddleware {
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         if Self::is_graphql(ctx)
             && let Some(info) = Self::parse(&ctx.body)
-            && let Ok(json) = serde_json::to_string(&info)
         {
-            ctx.headers.insert("x-oproxy-graphql".to_string(), json);
+            ctx.inspector.graphql = Some(info);
         }
         MiddlewareAction::Continue
     }
@@ -104,6 +103,7 @@ mod tests {
             body: body.to_string(),
             host: "api.example.com".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 

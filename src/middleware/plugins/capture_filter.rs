@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-pub const SKIP_RECORDING_HEADER: &str = "x-oproxy-skip-recording";
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum FilterMode {
@@ -58,8 +56,7 @@ impl Middleware for CaptureFilterMiddleware {
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         let cfg = self.config.read().await;
         if cfg.should_skip(&ctx.host) {
-            ctx.headers
-                .insert(SKIP_RECORDING_HEADER.to_string(), "true".to_string());
+            ctx.skip_recording = true;
         }
         // Always continue — we never block proxying, only toggle recording.
         MiddlewareAction::Continue
@@ -91,6 +88,7 @@ mod tests {
             body: String::new(),
             host: host.to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -99,7 +97,7 @@ mod tests {
         let mw = CaptureFilterMiddleware::new(cfg(FilterMode::Disabled, &[]));
         let mut ctx = req_ctx("api.example.com");
         mw.on_request(&mut ctx).await;
-        assert!(!ctx.headers.contains_key(SKIP_RECORDING_HEADER));
+        assert!(!ctx.skip_recording);
     }
 
     #[tokio::test]
@@ -107,7 +105,7 @@ mod tests {
         let mw = CaptureFilterMiddleware::new(cfg(FilterMode::Allowlist, &["example.com"]));
         let mut ctx = req_ctx("api.example.com");
         mw.on_request(&mut ctx).await;
-        assert!(!ctx.headers.contains_key(SKIP_RECORDING_HEADER));
+        assert!(!ctx.skip_recording);
     }
 
     #[tokio::test]
@@ -115,10 +113,7 @@ mod tests {
         let mw = CaptureFilterMiddleware::new(cfg(FilterMode::Allowlist, &["example.com"]));
         let mut ctx = req_ctx("cdn.other.net");
         mw.on_request(&mut ctx).await;
-        assert_eq!(
-            ctx.headers.get(SKIP_RECORDING_HEADER).map(|s| s.as_str()),
-            Some("true")
-        );
+        assert!(ctx.skip_recording);
     }
 
     #[tokio::test]
@@ -126,7 +121,7 @@ mod tests {
         let mw = CaptureFilterMiddleware::new(cfg(FilterMode::Allowlist, &[]));
         let mut ctx = req_ctx("anything.com");
         mw.on_request(&mut ctx).await;
-        assert!(ctx.headers.contains_key(SKIP_RECORDING_HEADER));
+        assert!(ctx.skip_recording);
     }
 
     #[tokio::test]
@@ -134,7 +129,7 @@ mod tests {
         let mw = CaptureFilterMiddleware::new(cfg(FilterMode::Denylist, &["analytics."]));
         let mut ctx = req_ctx("analytics.google.com");
         mw.on_request(&mut ctx).await;
-        assert!(ctx.headers.contains_key(SKIP_RECORDING_HEADER));
+        assert!(ctx.skip_recording);
     }
 
     #[tokio::test]
@@ -142,7 +137,7 @@ mod tests {
         let mw = CaptureFilterMiddleware::new(cfg(FilterMode::Denylist, &["analytics."]));
         let mut ctx = req_ctx("api.example.com");
         mw.on_request(&mut ctx).await;
-        assert!(!ctx.headers.contains_key(SKIP_RECORDING_HEADER));
+        assert!(!ctx.skip_recording);
     }
 
     #[tokio::test]
@@ -150,7 +145,7 @@ mod tests {
         let mw = CaptureFilterMiddleware::new(cfg(FilterMode::Denylist, &["ANALYTICS"]));
         let mut ctx = req_ctx("Analytics.Google.Com");
         mw.on_request(&mut ctx).await;
-        assert!(ctx.headers.contains_key(SKIP_RECORDING_HEADER));
+        assert!(ctx.skip_recording);
     }
 
     #[tokio::test]

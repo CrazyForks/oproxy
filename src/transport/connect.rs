@@ -60,6 +60,7 @@ pub async fn handle_connect(
                 body: String::new(),
                 host: host.clone(),
                 body_bytes: None,
+                ..Default::default()
             },
         );
     }
@@ -105,6 +106,7 @@ pub async fn handle_connect(
                                     ttfb_ms: 0,
                                     body_ms: 0,
                                     body_bytes: None,
+                                    ..Default::default()
                                 },
                                 crate::session::InspectionMetrics {
                                     latency_ms: start.elapsed().as_millis() as u64,
@@ -130,6 +132,7 @@ pub async fn handle_connect(
                                     ttfb_ms: 0,
                                     body_ms: 0,
                                     body_bytes: None,
+                                    ..Default::default()
                                 },
                                 crate::session::InspectionMetrics {
                                     latency_ms: start.elapsed().as_millis() as u64,
@@ -155,6 +158,7 @@ pub async fn handle_connect(
                                     ttfb_ms: 0,
                                     body_ms: 0,
                                     body_bytes: None,
+                                    ..Default::default()
                                 },
                                 crate::session::InspectionMetrics {
                                     latency_ms: start.elapsed().as_millis() as u64,

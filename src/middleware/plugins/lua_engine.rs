@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use mlua::{Lua, VmState};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -218,13 +220,14 @@ impl Middleware for LuaEngineMiddleware {
             if let Some((status, body)) = check_abort(&lua) {
                 let sc = axum::http::StatusCode::from_u16(status)
                     .unwrap_or(axum::http::StatusCode::FORBIDDEN);
-                let payload = serde_json::json!({
-                    "status": sc.as_u16(),
-                    "headers": {"content-type": "text/plain"},
-                    "body": body,
+                let mut headers = HashMap::new();
+                headers.insert("content-type".to_string(), "text/plain".to_string());
+                ctx.mock_response = Some(crate::middleware::InterceptedResponse {
+                    status: sc.as_u16(),
+                    headers,
+                    body: Bytes::from(body),
+                    tags: Vec::new(),
                 });
-                ctx.headers
-                    .insert("x-oproxy-mock-response".to_string(), payload.to_string());
                 return MiddlewareAction::StopAndReturn;
             }
             if let Err(e) = extract_request(&lua, ctx) {
@@ -277,6 +280,7 @@ mod tests {
             body: body.to_string(),
             host: "example.com".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -340,10 +344,9 @@ mod tests {
         let mut ctx = make_req("GET", "/api", "");
         let action = mw.on_request(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::StopAndReturn);
-        let mock_resp = ctx.headers.get("x-oproxy-mock-response").unwrap();
-        let v: serde_json::Value = serde_json::from_str(mock_resp).unwrap();
-        assert_eq!(v["status"], 403);
-        assert_eq!(v["body"], "forbidden");
+        let mock = ctx.mock_response.as_ref().unwrap();
+        assert_eq!(mock.status, 403);
+        assert_eq!(&mock.body[..], b"forbidden");
     }
 
     #[tokio::test]

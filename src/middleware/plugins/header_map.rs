@@ -144,6 +144,7 @@ mod tests {
             headers: HashMap::new(),
             body: String::new(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 

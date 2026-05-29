@@ -1,6 +1,8 @@
-use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
+use crate::middleware::{
+    InterceptedResponse, Middleware, MiddlewareAction, RequestContext, ResponseContext,
+};
 use async_trait::async_trait;
-use base64::Engine as _;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -45,22 +47,15 @@ impl Middleware for RoutingMiddleware {
                         Some("txt") => "text/plain",
                         _ => "application/octet-stream",
                     };
-                    let mut mock = serde_json::json!({
-                        "status": 200,
-                        "headers": {
-                            "Content-Type": ct,
-                            "Content-Length": contents.len().to_string(),
-                        },
+                    let mut headers = HashMap::new();
+                    headers.insert("Content-Type".to_string(), ct.to_string());
+                    headers.insert("Content-Length".to_string(), contents.len().to_string());
+                    ctx.mock_response = Some(InterceptedResponse {
+                        status: 200,
+                        headers,
+                        body: Bytes::from(contents),
+                        tags: Vec::new(),
                     });
-                    if let Ok(body) = String::from_utf8(contents.clone()) {
-                        mock["body"] = serde_json::Value::String(body);
-                    } else {
-                        mock["body_base64"] = serde_json::Value::String(
-                            base64::engine::general_purpose::STANDARD.encode(&contents),
-                        );
-                    }
-                    ctx.headers
-                        .insert("x-oproxy-mock-response".to_string(), mock.to_string());
                     return MiddlewareAction::StopAndReturn;
                 }
                 Err(e) => {
@@ -72,8 +67,7 @@ impl Middleware for RoutingMiddleware {
 
         let table = self.routing_table.read().await;
         if let Some(destination) = table.get(&ctx.host) {
-            ctx.headers
-                .insert("x-oproxy-destination".to_string(), destination.clone());
+            ctx.destination = Some(destination.clone());
         }
         // No entry → forward to original host; engine.rs falls back to http://<host><path>
         MiddlewareAction::Continue
@@ -143,6 +137,7 @@ mod tests {
             body: "".to_string(),
             host: host.to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -164,10 +159,7 @@ mod tests {
         let mw = routing_with(vec![("api.local", "http://10.0.0.1:3000")]);
         let mut ctx = req("api.local");
         assert_eq!(mw.on_request(&mut ctx).await, MiddlewareAction::Continue);
-        assert_eq!(
-            ctx.headers.get("x-oproxy-destination").map(|s| s.as_str()),
-            Some("http://10.0.0.1:3000")
-        );
+        assert_eq!(ctx.destination.as_deref(), Some("http://10.0.0.1:3000"));
     }
 
     #[tokio::test]
@@ -176,8 +168,8 @@ mod tests {
         let mut ctx = req("unknown.host");
         assert_eq!(mw.on_request(&mut ctx).await, MiddlewareAction::Continue);
         assert!(
-            !ctx.headers.contains_key("x-oproxy-destination"),
-            "no destination header for unmapped host"
+            ctx.destination.is_none(),
+            "no destination for unmapped host"
         );
     }
 
@@ -207,6 +199,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         };
         assert_eq!(mw.on_response(&mut ctx).await, MiddlewareAction::Continue);
     }
@@ -227,13 +220,8 @@ mod tests {
         let mut ctx = req("local.mock");
         let action = mw.on_request(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::StopAndReturn);
-        // Body is now served via x-oproxy-mock-response header, not ctx.body directly.
-        let mock_resp = ctx
-            .headers
-            .get("x-oproxy-mock-response")
-            .expect("mock response header set");
-        let v: serde_json::Value = serde_json::from_str(mock_resp).unwrap();
-        assert_eq!(v["body"].as_str().unwrap(), "hello map local");
+        let mock = ctx.mock_response.expect("mock response set");
+        assert_eq!(&mock.body[..], b"hello map local");
 
         let _ = tokio::fs::remove_file(&tmp).await;
     }
@@ -254,17 +242,16 @@ mod tests {
         let mut ctx = req("local.mock");
         let action = mw.on_request(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::StopAndReturn);
-        let mock_resp = ctx
-            .headers
-            .get("x-oproxy-mock-response")
-            .expect("mock response header set");
-        let v: serde_json::Value = serde_json::from_str(mock_resp).unwrap();
-        assert_eq!(v["body_base64"].as_str().unwrap(), "AJ+Slg==");
+        let mock = ctx.mock_response.expect("mock response set");
+        assert_eq!(&mock.body[..], &[0, 159, 146, 150]);
         assert_eq!(
-            v["headers"]["Content-Type"].as_str().unwrap(),
-            "application/octet-stream"
+            mock.headers.get("Content-Type").map(String::as_str),
+            Some("application/octet-stream")
         );
-        assert_eq!(v["headers"]["Content-Length"].as_str().unwrap(), "4");
+        assert_eq!(
+            mock.headers.get("Content-Length").map(String::as_str),
+            Some("4")
+        );
 
         let _ = tokio::fs::remove_file(&tmp).await;
     }
@@ -356,6 +343,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         };
         assert_eq!(mw.on_response(&mut ctx).await, MiddlewareAction::Continue);
     }
@@ -380,6 +368,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         };
         let start = std::time::Instant::now();
         mw.on_response(&mut ctx).await;

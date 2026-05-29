@@ -35,6 +35,7 @@ mod tests {
                     body: "".to_string(),
                     host: "example.com".to_string(),
                     body_bytes: None,
+                    ..Default::default()
                 })
                 .await;
         }

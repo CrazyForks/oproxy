@@ -310,6 +310,7 @@ mod tests {
             body: String::new(),
             host: "localhost".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -341,6 +342,7 @@ mod tests {
                 ttfb_ms: 0,
                 body_ms: 0,
                 body_bytes: None,
+                ..Default::default()
             },
         );
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -394,6 +396,7 @@ mod tests {
                 ttfb_ms: 0,
                 body_ms: 0,
                 body_bytes: None,
+                ..Default::default()
             },
         );
 

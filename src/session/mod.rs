@@ -508,6 +508,7 @@ mod tests {
             body: "body".to_string(),
             host: "localhost".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -521,6 +522,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -943,6 +945,7 @@ mod tests {
             body: String::new(),
             host: host.to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 

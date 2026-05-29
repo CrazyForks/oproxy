@@ -78,9 +78,8 @@ impl Middleware for JwtInspectorMiddleware {
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         if let Some(token) = Self::extract_jwt(&ctx.headers)
             && let Some(info) = Self::decode_jwt(&token)
-            && let Ok(json) = serde_json::to_string(&info)
         {
-            ctx.headers.insert("x-oproxy-jwt".to_string(), json);
+            ctx.inspector.jwt = Some(info);
         }
         MiddlewareAction::Continue
     }

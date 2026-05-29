@@ -191,14 +191,11 @@ impl Middleware for GrpcInspectorMiddleware {
             vec![]
         };
 
-        let info = GrpcInfo {
+        ctx.inspector.grpc = Some(GrpcInfo {
             service,
             method,
             messages,
-        };
-        if let Ok(json) = serde_json::to_string(&info) {
-            ctx.headers.insert("x-oproxy-grpc".to_string(), json);
-        }
+        });
         MiddlewareAction::Continue
     }
 
@@ -222,6 +219,7 @@ mod tests {
             body: String::new(),
             host: "api.example.com".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 

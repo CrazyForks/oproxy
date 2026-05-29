@@ -204,6 +204,7 @@ mod tests {
             ttfb_ms: 4,
             body_ms: 2,
             body_bytes: None,
+            ..Default::default()
         });
         let metrics = status.map(|code| InspectionMetrics {
             latency_ms: 12,
@@ -225,6 +226,7 @@ mod tests {
                 body: String::new(),
                 host: "example.com".to_string(),
                 body_bytes: None,
+                ..Default::default()
             },
             response,
             metrics,

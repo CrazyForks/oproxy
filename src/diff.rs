@@ -197,6 +197,7 @@ mod tests {
                 body: body.to_string(),
                 host: "example.com".to_string(),
                 body_bytes: None,
+                ..Default::default()
             },
             response: Some(ResponseContext {
                 request_uri: uri.to_string(),
@@ -207,6 +208,7 @@ mod tests {
                 ttfb_ms: 10,
                 body_ms: 5,
                 body_bytes: None,
+                ..Default::default()
             }),
             metrics: Some(InspectionMetrics {
                 latency_ms: 100,

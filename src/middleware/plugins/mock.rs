@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
-#[allow(unused_imports)]
-use serde_json;
+use crate::middleware::{
+    InterceptedResponse, Middleware, MiddlewareAction, RequestContext, ResponseContext,
+};
+use bytes::Bytes;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MockResponse {
@@ -194,17 +195,13 @@ impl Middleware for MockMiddleware {
             if !resp_headers.contains_key("content-length") {
                 resp_headers.insert("content-length".to_string(), body.len().to_string());
             }
-            resp_headers.insert("x-oproxy-tags".to_string(), "mock".to_string());
 
-            let mock_payload = serde_json::json!({
-                "status": resp.status,
-                "headers": resp_headers,
-                "body": body,
+            ctx.mock_response = Some(InterceptedResponse {
+                status: resp.status,
+                headers: resp_headers,
+                body: Bytes::from(body),
+                tags: vec!["mock".to_string()],
             });
-            ctx.headers.insert(
-                "x-oproxy-mock-response".to_string(),
-                mock_payload.to_string(),
-            );
             return MiddlewareAction::StopAndReturn;
         }
         MiddlewareAction::Continue
@@ -228,6 +225,7 @@ mod tests {
             body: String::new(),
             host: "example.com".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -334,11 +332,10 @@ mod tests {
         let mut ctx = make_ctx("GET", "http://example.com/api");
         let action = mw.on_request(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::StopAndReturn);
-        // Mock response is encoded into request context header
-        let mock_resp = ctx.headers.get("x-oproxy-mock-response").unwrap();
-        let v: serde_json::Value = serde_json::from_str(mock_resp).unwrap();
-        assert_eq!(v["status"], 200);
-        assert_eq!(v["body"], "mocked");
+        let mock = ctx.mock_response.as_ref().unwrap();
+        assert_eq!(mock.status, 200);
+        assert_eq!(&mock.body[..], b"mocked");
+        assert_eq!(mock.tags, vec!["mock".to_string()]);
     }
 
     #[tokio::test]
@@ -393,10 +390,9 @@ mod tests {
             mw.on_request(&mut ctx).await,
             MiddlewareAction::StopAndReturn
         );
-        let mock_resp = ctx.headers.get("x-oproxy-mock-response").unwrap();
-        let v: serde_json::Value = serde_json::from_str(mock_resp).unwrap();
-        assert_eq!(v["status"], 201);
-        assert_eq!(v["body"], "first");
+        let mock = ctx.mock_response.as_ref().unwrap();
+        assert_eq!(mock.status, 201);
+        assert_eq!(&mock.body[..], b"first");
     }
 
     #[test]

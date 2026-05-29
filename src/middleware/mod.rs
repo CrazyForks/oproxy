@@ -3,6 +3,21 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A response a middleware wants the engine to return immediately instead of
+/// forwarding upstream (mock, map-local, Lua `abort()`, breakpoint timeout, …).
+///
+/// This is the typed replacement for the old `x-oproxy-mock-response` header
+/// protocol: the body is carried as raw [`Bytes`] so binary payloads survive
+/// without a base64 round-trip, and nothing leaks into the forwarded headers.
+#[derive(Debug, Clone)]
+pub struct InterceptedResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: Bytes,
+    /// Session tags to attach when this response is recorded (e.g. "mock").
+    pub tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RequestContext {
     pub method: String,
@@ -16,6 +31,29 @@ pub struct RequestContext {
     /// than the original bytes. Not serialised — only live in memory.
     #[serde(skip)]
     pub body_bytes: Option<Bytes>,
+    // ── Internal middleware ↔ engine side-channel ───────────────────────────────
+    // The fields below replace the former `x-oproxy-*` pseudo-header protocol.
+    // They are in-memory only (`#[serde(skip)]`) so they never serialise into
+    // recordings/exports and can never leak to the upstream server.
+    /// Upstream target override (Routing / DNS override / MITM). When set the
+    /// engine forwards here instead of the request's original host.
+    #[serde(skip)]
+    pub destination: Option<String>,
+    /// Session id assigned by InspectionMiddleware, used to correlate the
+    /// response back to the exact request even under concurrent same-URI traffic.
+    #[serde(skip)]
+    pub session_id: Option<String>,
+    /// Set by CaptureFilterMiddleware to suppress session recording for this host.
+    #[serde(skip)]
+    pub skip_recording: bool,
+    /// Short-circuit response set by Mock / map-local / Lua / breakpoint timeout.
+    /// When present the engine returns it instead of forwarding upstream.
+    #[serde(skip)]
+    pub mock_response: Option<InterceptedResponse>,
+    /// Parsed inspector data (JWT / GraphQL / gRPC) populated by the inspector
+    /// middlewares and consumed by InspectionMiddleware.
+    #[serde(skip)]
+    pub inspector: crate::session::InspectorData,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -38,6 +76,10 @@ pub struct ResponseContext {
     /// Engine uses these when no middleware modified `body`. Not serialised.
     #[serde(skip)]
     pub body_bytes: Option<Bytes>,
+    /// Session tags to attach when this exchange is recorded. Typed replacement
+    /// for the former `x-oproxy-tags` response header. Not serialised.
+    #[serde(skip)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

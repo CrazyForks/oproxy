@@ -1,4 +1,3 @@
-use crate::middleware::plugins::capture_filter::SKIP_RECORDING_HEADER;
 use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
 use crate::session::SharedSessionManager;
 use async_trait::async_trait;
@@ -21,56 +20,31 @@ impl Middleware for InspectionMiddleware {
     }
 
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
-        // CaptureFilterMiddleware signals "don't record this host" via a header.
-        // Strip it here so it never leaks to the upstream server.
-        if ctx.headers.remove(SKIP_RECORDING_HEADER).is_some() {
+        // CaptureFilterMiddleware signals "don't record this host" via a typed flag.
+        if ctx.skip_recording {
             return MiddlewareAction::Continue;
         }
 
-        // Extract inspector data injected by upstream inspector middlewares, then strip.
-        let jwt_info: Option<crate::session::JwtInfo> = ctx
-            .headers
-            .remove("x-oproxy-jwt")
-            .and_then(|v| serde_json::from_str(&v).ok());
-        let graphql_info: Option<crate::session::GraphQLInfo> = ctx
-            .headers
-            .remove("x-oproxy-graphql")
-            .and_then(|v| serde_json::from_str(&v).ok());
-        let grpc_info: Option<crate::session::GrpcInfo> = ctx
-            .headers
-            .remove("x-oproxy-grpc")
-            .and_then(|v| serde_json::from_str(&v).ok());
+        // Inspector data is populated by the upstream inspector middlewares into the
+        // typed `ctx.inspector` side-channel.
+        let inspector = std::mem::take(&mut ctx.inspector);
 
         let id = Uuid::new_v4().to_string();
-        ctx.headers
-            .insert("x-oproxy-session-id".to_string(), id.clone());
+        ctx.session_id = Some(id.clone());
 
         let mut recorded = ctx.clone();
         strip_internal_headers(&mut recorded.headers);
         self.session_manager.record_request(id.clone(), recorded);
 
-        if jwt_info.is_some() || graphql_info.is_some() || grpc_info.is_some() {
-            let data = crate::session::InspectorData {
-                jwt: jwt_info,
-                graphql: graphql_info,
-                grpc: grpc_info,
-            };
-            self.session_manager.update_inspector_data(&id, data);
+        if inspector.jwt.is_some() || inspector.graphql.is_some() || inspector.grpc.is_some() {
+            self.session_manager.update_inspector_data(&id, inspector);
         }
 
         MiddlewareAction::Continue
     }
 
     async fn on_response(&self, ctx: &mut ResponseContext) -> MiddlewareAction {
-        let tags: Vec<String> = ctx
-            .headers
-            .remove("x-oproxy-tags")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
+        let tags = std::mem::take(&mut ctx.tags);
         // Use the session ID injected during on_request for exact lookup.
         // This fixes correlation when multiple concurrent requests target the same URI.
         let session = if let Some(ref id) = ctx.session_id {
@@ -151,6 +125,7 @@ mod tests {
             body: "body12345".to_string(),
             host: "localhost".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -164,6 +139,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -192,14 +168,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_request_injects_session_id_header() {
+    async fn on_request_assigns_session_id() {
         let sm = Arc::new(SessionManager::new(10_000));
         let mw = InspectionMiddleware::new(sm.clone());
         let mut ctx = req("/test");
         mw.on_request(&mut ctx).await;
         assert!(
-            ctx.headers.contains_key("x-oproxy-session-id"),
-            "session ID header must be injected"
+            ctx.session_id.is_some(),
+            "session ID must be assigned on the context"
+        );
+        assert!(
+            !ctx.headers.contains_key("x-oproxy-session-id"),
+            "session ID must not leak into forwarded headers"
         );
     }
 
@@ -276,17 +256,15 @@ mod tests {
         let mw = InspectionMiddleware::new(sm.clone());
         let mut rq = req("/mocked");
         mw.on_request(&mut rq).await;
-        let session_id = rq.headers.get("x-oproxy-session-id").cloned().unwrap();
+        let session_id = rq.session_id.clone().unwrap();
         let mut rs = res("/mocked", 200, "ok");
         rs.session_id = Some(session_id.clone());
-        rs.headers
-            .insert("x-oproxy-tags".to_string(), "mock,replay".to_string());
+        rs.tags = vec!["mock".to_string(), "replay".to_string()];
 
         mw.on_response(&mut rs).await;
 
         let ex = sm.get_session(&session_id).unwrap();
         assert_eq!(ex.tags, vec!["mock".to_string(), "replay".to_string()]);
-        assert!(!rs.headers.contains_key("x-oproxy-tags"));
     }
 
     #[tokio::test]
@@ -300,36 +278,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skip_recording_header_prevents_session_creation() {
+    async fn skip_recording_flag_prevents_session_creation() {
         let sm = Arc::new(SessionManager::new(10_000));
         let mw = InspectionMiddleware::new(sm.clone());
         let mut ctx = req("/filtered");
-        ctx.headers.insert(
-            crate::middleware::plugins::capture_filter::SKIP_RECORDING_HEADER.to_string(),
-            "true".to_string(),
-        );
+        ctx.skip_recording = true;
         let action = mw.on_request(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::Continue);
         assert!(
             sm.get_all_sessions().is_empty(),
             "filtered host must not be recorded"
-        );
-    }
-
-    #[tokio::test]
-    async fn skip_recording_header_is_stripped_from_context() {
-        let sm = Arc::new(SessionManager::new(10_000));
-        let mw = InspectionMiddleware::new(sm.clone());
-        let mut ctx = req("/filtered");
-        ctx.headers.insert(
-            crate::middleware::plugins::capture_filter::SKIP_RECORDING_HEADER.to_string(),
-            "true".to_string(),
-        );
-        mw.on_request(&mut ctx).await;
-        assert!(
-            !ctx.headers
-                .contains_key(crate::middleware::plugins::capture_filter::SKIP_RECORDING_HEADER),
-            "skip header must be removed so it never reaches upstream"
         );
     }
 

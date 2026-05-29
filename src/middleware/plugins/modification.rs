@@ -69,6 +69,7 @@ mod tests {
             body: "original".to_string(),
             host: "localhost".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -153,6 +154,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         };
         let action = mw.on_response(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::Continue);

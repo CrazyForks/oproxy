@@ -1,5 +1,6 @@
 use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
 use async_trait::async_trait;
+use bytes::Bytes;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -183,23 +184,23 @@ impl Middleware for RewriteMiddleware {
             if self.matches(rule, ctx) {
                 match &rule.action {
                     RewriteAction::Redirect { status, location } => {
-                        let mock = serde_json::json!({
-                            "status": status,
-                            "headers": {"Location": location},
-                            "body": ""
+                        let mut headers = HashMap::new();
+                        headers.insert("Location".to_string(), location.clone());
+                        ctx.mock_response = Some(crate::middleware::InterceptedResponse {
+                            status: *status,
+                            headers,
+                            body: Bytes::new(),
+                            tags: Vec::new(),
                         });
-                        ctx.headers
-                            .insert("x-oproxy-mock-response".to_string(), mock.to_string());
                         return MiddlewareAction::StopAndReturn;
                     }
                     RewriteAction::Block { status } => {
-                        let mock = serde_json::json!({
-                            "status": status,
-                            "headers": {},
-                            "body": ""
+                        ctx.mock_response = Some(crate::middleware::InterceptedResponse {
+                            status: *status,
+                            headers: HashMap::new(),
+                            body: Bytes::new(),
+                            tags: Vec::new(),
                         });
-                        ctx.headers
-                            .insert("x-oproxy-mock-response".to_string(), mock.to_string());
                         return MiddlewareAction::StopAndReturn;
                     }
                     _ => {
@@ -247,6 +248,7 @@ mod tests {
             body: body.to_string(),
             host: host.to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -260,6 +262,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         }
     }
 

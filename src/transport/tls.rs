@@ -60,18 +60,15 @@ pub async fn mitm_intercept<IO>(
     if let Err(e) = hyper::server::conn::http1::Builder::new()
         .serve_connection(
             tls_io,
-            hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+            hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let eng = engine_ref.clone();
                 let h = host_ref.clone();
                 async move {
-                    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("https://{}", h)) {
-                        req.headers_mut().insert(
-                            axum::http::header::HeaderName::from_static("x-oproxy-destination"),
-                            v,
-                        );
-                    }
                     let req = req.map(axum::body::Body::new);
-                    Ok::<_, std::convert::Infallible>(eng.handle_request(req).await)
+                    let dest = format!("https://{}", h);
+                    Ok::<_, std::convert::Infallible>(
+                        eng.handle_request_with_destination(req, Some(dest)).await,
+                    )
                 }
             }),
         )

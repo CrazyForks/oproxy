@@ -21,12 +21,12 @@ use tracing::{debug, error, info, instrument};
 
 fn display_request_uri(
     uri: &axum::http::Uri,
-    headers: &std::collections::HashMap<String, String>,
+    mitm_destination: Option<&str>,
     host: &str,
 ) -> String {
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-    if let Some(destination) = headers.get("x-oproxy-destination") {
+    if let Some(destination) = mitm_destination {
         let base = destination.trim_end_matches('/');
         return format!("{}{}", base, path_and_query);
     }
@@ -200,8 +200,20 @@ impl ProxyEngine {
         self.max_body_bytes.store(v, Ordering::Relaxed);
     }
 
-    #[instrument(skip(self, req))]
     pub async fn handle_request(self: Arc<Self>, req: Request<Body>) -> Response {
+        self.handle_request_with_destination(req, None).await
+    }
+
+    /// Like [`handle_request`] but with an explicit upstream destination supplied by
+    /// the MITM TLS layer. Passing it as a typed argument (rather than the former
+    /// `x-oproxy-destination` request header) keeps it off the wire and prevents a
+    /// client from spoofing the proxy target.
+    #[instrument(skip(self, req, mitm_destination))]
+    pub async fn handle_request_with_destination(
+        self: Arc<Self>,
+        req: Request<Body>,
+        mitm_destination: Option<String>,
+    ) -> Response {
         let start = Instant::now();
         let method = req.method().clone();
         let uri = req.uri().clone();
@@ -231,7 +243,7 @@ impl ProxyEngine {
             req_headers.insert(name.to_string(), value.to_str().unwrap_or("").to_string());
         }
 
-        let display_uri = display_request_uri(&uri, &req_headers, &host);
+        let display_uri = display_request_uri(&uri, mitm_destination.as_deref(), &host);
 
         let req_body_bytes = axum::body::to_bytes(req.into_body(), self.max_body_bytes())
             .await
@@ -246,6 +258,10 @@ impl ProxyEngine {
             host: host.clone(),
             // Store original bytes; middlewares clear this when they modify body.
             body_bytes: Some(req_body_bytes.clone()),
+            // MITM supplies the upstream target up front; routing/dns middleware may
+            // still override it during the chain.
+            destination: mitm_destination,
+            ..Default::default()
         };
 
         // Execute Request Middleware Chain
@@ -256,27 +272,15 @@ impl ProxyEngine {
             match action {
                 MiddlewareAction::Continue => {}
                 MiddlewareAction::StopAndReturn => {
-                    // Check if a mock response was embedded by MockMiddleware.
-                    if let Some(mock_json) = req_ctx.headers.get("x-oproxy-mock-response")
-                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(mock_json)
-                    {
-                        let status = v["status"].as_u64().unwrap_or(200) as u16;
-                        let mut headers = std::collections::HashMap::new();
-                        if let Some(header_obj) = v["headers"].as_object() {
-                            for (k, val) in header_obj {
-                                if let Some(vs) = val.as_str() {
-                                    headers.insert(k.to_string(), vs.to_string());
-                                }
-                            }
-                        }
-                        let body_text = v["body"].as_str().unwrap_or("");
-                        let decoded_body = v["body_base64"].as_str().and_then(|encoded| {
-                            base64::engine::general_purpose::STANDARD
-                                .decode(encoded)
-                                .ok()
-                        });
-                        let raw_body =
-                            decoded_body.unwrap_or_else(|| body_text.as_bytes().to_vec());
+                    // A middleware (Mock / map-local / Lua abort / breakpoint timeout) may
+                    // have set a typed short-circuit response to return instead of forwarding.
+                    if let Some(intercepted) = req_ctx.mock_response.take() {
+                        let crate::middleware::InterceptedResponse {
+                            status,
+                            headers,
+                            body: raw_body,
+                            tags,
+                        } = intercepted;
                         let content_type =
                             header_value(&headers, "content-type").unwrap_or_default();
                         let body = if is_binary_content_type(&content_type) {
@@ -289,10 +293,11 @@ impl ProxyEngine {
                             headers,
                             body,
                             request_uri: display_uri.clone(),
-                            session_id: req_ctx.headers.get("x-oproxy-session-id").cloned(),
+                            session_id: req_ctx.session_id.clone(),
                             ttfb_ms: 0,
                             body_ms: 0,
-                            body_bytes: Some(Bytes::from(raw_body)),
+                            body_bytes: Some(raw_body),
+                            tags,
                         };
                         {
                             let chain = self.middleware_chain.read().await.clone();
@@ -326,23 +331,14 @@ impl ProxyEngine {
             }
         }
 
-        // Strip internal proxy headers so they are never forwarded to the upstream target.
-        // Read the session ID before removing it so we can pass it to ResponseContext for
-        // exact session correlation in InspectionMiddleware::on_response.
-        let destination = req_ctx.headers.remove("x-oproxy-destination");
-        let oproxy_session_id = req_ctx.headers.remove("x-oproxy-session-id");
-        // Strip inspector side-channel headers — set by inspector middlewares and read by
-        // InspectionMiddleware; must never be forwarded to the upstream target.
-        for hdr in &[
-            "x-oproxy-jwt",
-            "x-oproxy-graphql",
-            "x-oproxy-grpc",
-            "x-oproxy-mock-response",
-            "x-oproxy-skip-recording",
-            "x-oproxy-map-local-file",
-        ] {
-            req_ctx.headers.remove(*hdr);
-        }
+        // Upstream target + session id now travel as typed context fields, not headers.
+        let destination = req_ctx.destination.take();
+        let oproxy_session_id = req_ctx.session_id.clone();
+        // Defensively drop any client-supplied `x-oproxy-*` headers so a malicious client
+        // can never smuggle one through to the upstream target.
+        req_ctx
+            .headers
+            .retain(|name, _| !name.trim().to_ascii_lowercase().starts_with("x-oproxy-"));
         // Instead of completely removing Accept-Encoding (which triggers WAF bot protection
         // on strict CDNs by creating a User-Agent / Accept-Encoding mismatch), we preserve it
         // but strip `zstd` since we don't have a manual zstd decoder. We rely on our manual
@@ -518,6 +514,7 @@ impl ProxyEngine {
                         ttfb_ms,
                         body_ms: 0,
                         body_bytes: None,
+                        ..Default::default()
                     };
                     {
                         let chain = self.middleware_chain.read().await.clone();
@@ -568,6 +565,7 @@ impl ProxyEngine {
                     ttfb_ms,
                     body_ms,
                     body_bytes: Some(res_body_bytes_canonical.clone()),
+                    ..Default::default()
                 };
 
                 // Execute Response Middleware Chain
@@ -630,6 +628,7 @@ impl ProxyEngine {
                     ttfb_ms: net_start.elapsed().as_millis() as u64,
                     body_ms: 0,
                     body_bytes: None,
+                    ..Default::default()
                 };
                 {
                     let chain = self.middleware_chain.read().await.clone();
@@ -674,14 +673,9 @@ mod tests {
     #[test]
     fn display_request_uri_uses_mitm_destination_for_origin_form_requests() {
         let uri: Uri = "/login?next=1".parse().unwrap();
-        let mut headers = HashMap::new();
-        headers.insert(
-            "x-oproxy-destination".to_string(),
-            "https://example.com".to_string(),
-        );
 
         assert_eq!(
-            display_request_uri(&uri, &headers, "example.com"),
+            display_request_uri(&uri, Some("https://example.com"), "example.com"),
             "https://example.com/login?next=1"
         );
     }
@@ -689,10 +683,9 @@ mod tests {
     #[test]
     fn display_request_uri_preserves_absolute_forward_proxy_uri() {
         let uri: Uri = "http://api.example.test/v1?q=1".parse().unwrap();
-        let headers = HashMap::new();
 
         assert_eq!(
-            display_request_uri(&uri, &headers, "api.example.test"),
+            display_request_uri(&uri, None, "api.example.test"),
             "http://api.example.test/v1?q=1"
         );
     }
@@ -700,14 +693,9 @@ mod tests {
     #[test]
     fn display_request_uri_keeps_root_path_for_mitm_requests() {
         let uri: Uri = "/".parse().unwrap();
-        let mut headers = HashMap::new();
-        headers.insert(
-            "x-oproxy-destination".to_string(),
-            "https://example.com".to_string(),
-        );
 
         assert_eq!(
-            display_request_uri(&uri, &headers, "example.com"),
+            display_request_uri(&uri, Some("https://example.com"), "example.com"),
             "https://example.com/"
         );
     }

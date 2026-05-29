@@ -75,20 +75,29 @@ pub trait Middleware: Send + Sync {
 **Middleware chain insertion order** (main.rs):
 `CaptureFilter → DnsOverride → Routing → Throttling → Rewrite → HeaderMap → Breakpoint → JWT Inspector → GraphQL Inspector → gRPC Inspector → Inspection → Modification → Mock → Lua`
 
-### Internal header protocol
+### Internal middleware ↔ engine side-channel
 
-These headers pass data between middleware plugins via `RequestContext.headers`. All are stripped before forwarding to upstream:
+Middleware plugins exchange data with each other and the engine through **typed,
+in-memory fields** on `RequestContext` / `ResponseContext` (all `#[serde(skip)]`, so
+they never serialise into recordings/exports and can never leak to the upstream
+server). This replaces the former `x-oproxy-*` pseudo-header protocol — there is no
+JSON-in-header encoding, no base64 round-trip for binary mock bodies, and a client
+can no longer spoof these by sending matching headers (the engine defensively strips
+any client-supplied `x-oproxy-*` request header before forwarding).
 
-| Header | Set by | Read by | Purpose |
+| Field | Set by | Read by | Purpose |
 |---|---|---|---|
-| `x-oproxy-skip-recording` | CaptureFilterMiddleware | InspectionMiddleware | Skip session recording for filtered hosts |
-| `x-oproxy-session-id` | InspectionMiddleware | engine.rs | Correlate response to exact request session |
-| `x-oproxy-destination` | RoutingMiddleware | engine.rs | Override upstream target URL |
-| `x-oproxy-jwt` | JwtInspectorMiddleware | InspectionMiddleware | Decoded JWT info (JSON) → stored in `Exchange.inspector_data` |
-| `x-oproxy-graphql` | GraphQLInspectorMiddleware | InspectionMiddleware | Parsed GraphQL operation (JSON) → `inspector_data` |
-| `x-oproxy-grpc` | GrpcInspectorMiddleware | InspectionMiddleware | Decoded gRPC frame (JSON) → `inspector_data` |
-| `x-oproxy-mock-response` | MockMiddleware / LuaEngine | engine.rs on StopAndReturn | `{"status":N,"headers":{...},"body":"..."}` |
-| `x-oproxy-map-local-file` | RoutingMiddleware | (unused — body already set) | Signals map-local short-circuit |
+| `RequestContext.skip_recording: bool` | CaptureFilterMiddleware | InspectionMiddleware | Skip session recording for filtered hosts |
+| `RequestContext.session_id: Option<String>` | InspectionMiddleware | engine.rs | Correlate response to exact request session |
+| `RequestContext.destination: Option<String>` | RoutingMiddleware / DnsOverride / MITM | engine.rs | Override upstream target URL |
+| `RequestContext.inspector: InspectorData` | JWT / GraphQL / gRPC inspectors | InspectionMiddleware | Parsed inspector data → `Exchange.inspector_data` |
+| `RequestContext.mock_response: Option<InterceptedResponse>` | Mock / Rewrite / Lua abort / Breakpoint timeout | engine.rs on StopAndReturn | Short-circuit response returned instead of forwarding |
+
+`InterceptedResponse { status: u16, headers, body: Bytes, tags: Vec<String> }` carries
+the body as raw `Bytes`, so binary mock payloads survive without base64. The MITM TLS
+layer passes its target via `engine.handle_request_with_destination(req, dest)` rather
+than a header. `ResponseContext.tags: Vec<String>` carries session tags (e.g. `"mock"`)
+to attach when the exchange is recorded.
 
 ### Binary body forwarding
 

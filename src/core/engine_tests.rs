@@ -21,6 +21,7 @@ mod tests {
             body: "".to_string(),
             host: host.to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -72,6 +73,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         };
         middleware.on_response(&mut resp_ctx).await;
 
@@ -80,18 +82,19 @@ mod tests {
         assert_eq!(sessions[0].metrics.as_ref().unwrap().status_code, 200);
     }
 
-    /// RoutingMiddleware must insert x-oproxy-destination into the request context
+    /// RoutingMiddleware must set the typed `destination` on the request context
     /// when a matching route is registered.
     #[tokio::test]
-    async fn routing_middleware_sets_destination_header() {
+    async fn routing_middleware_sets_destination() {
         let mut table = HashMap::new();
         table.insert("api.local".to_string(), "http://10.0.0.2:8000".to_string());
         let routing = RoutingMiddleware::new(Arc::new(RwLock::new(table)));
         let mut ctx = req("/data", "api.local");
         routing.on_request(&mut ctx).await;
-        assert_eq!(
-            ctx.headers.get("x-oproxy-destination").map(|s| s.as_str()),
-            Some("http://10.0.0.2:8000")
+        assert_eq!(ctx.destination.as_deref(), Some("http://10.0.0.2:8000"));
+        assert!(
+            !ctx.headers.contains_key("x-oproxy-destination"),
+            "destination must not be smuggled via headers"
         );
     }
 

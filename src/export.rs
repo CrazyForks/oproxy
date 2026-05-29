@@ -330,6 +330,7 @@ impl From<ParsedCurl> for RequestContext {
             } else {
                 Some(bytes::Bytes::from(p.body.into_bytes()))
             },
+            ..Default::default()
         }
     }
 }
@@ -369,6 +370,7 @@ mod tests {
                 body: body.to_string(),
                 host: "example.com".to_string(),
                 body_bytes: None,
+                ..Default::default()
             },
             response: None,
             metrics: None,

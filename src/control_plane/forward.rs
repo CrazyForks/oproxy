@@ -92,6 +92,7 @@ pub(super) async fn forward_request(
         headers: req.headers.clone(),
         body: req.body.clone().unwrap_or_default(),
         body_bytes: None,
+        ..Default::default()
     };
     let request_size_bytes = req_ctx.body.len();
     state
@@ -149,6 +150,7 @@ pub(super) async fn forward_request(
                 ttfb_ms,
                 body_ms,
                 body_bytes: None,
+                ..Default::default()
             };
             let metrics = crate::session::InspectionMetrics {
                 latency_ms: t0.elapsed().as_millis() as u64,

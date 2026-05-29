@@ -354,6 +354,7 @@ pub fn har_entry_to_exchange(entry: &HarEntry) -> Exchange {
             ttfb_ms,
             body_ms: entry.timings.receive as u64,
             body_bytes: None,
+            ..Default::default()
         })
     } else {
         None
@@ -387,6 +388,7 @@ pub fn har_entry_to_exchange(entry: &HarEntry) -> Exchange {
             body,
             host,
             body_bytes: None,
+            ..Default::default()
         },
         response,
         metrics,
@@ -595,6 +597,7 @@ mod tests {
                 ttfb_ms: 80,
                 body_ms: 20,
                 body_bytes: None,
+                ..Default::default()
             })
         } else {
             None
@@ -623,6 +626,7 @@ mod tests {
                 body: req_body.to_string(),
                 host: "example.com".to_string(),
                 body_bytes: None,
+                ..Default::default()
             },
             response,
             metrics,

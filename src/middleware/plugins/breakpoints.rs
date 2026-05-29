@@ -1,5 +1,6 @@
 use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -159,6 +160,7 @@ mod tests {
             body: body.to_string(),
             host: "localhost".to_string(),
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -172,6 +174,7 @@ mod tests {
             ttfb_ms: 0,
             body_ms: 0,
             body_bytes: None,
+            ..Default::default()
         }
     }
 
@@ -439,13 +442,14 @@ impl Middleware for BreakpointMiddleware {
             Err(_) => {
                 self.manager.pending.write().await.remove(&bp_id);
                 tracing::warn!(id = %bp_id, "Breakpoint request timed out, dropping");
-                let payload = serde_json::json!({
-                    "status": 504,
-                    "headers": {"content-type": "text/plain"},
-                    "body": "Breakpoint timed out",
+                let mut headers = HashMap::new();
+                headers.insert("content-type".to_string(), "text/plain".to_string());
+                ctx.mock_response = Some(crate::middleware::InterceptedResponse {
+                    status: 504,
+                    headers,
+                    body: Bytes::from_static(b"Breakpoint timed out"),
+                    tags: Vec::new(),
                 });
-                ctx.headers
-                    .insert("x-oproxy-mock-response".to_string(), payload.to_string());
                 MiddlewareAction::StopAndReturn
             }
         }
@@ -487,15 +491,6 @@ impl Middleware for BreakpointMiddleware {
             Err(_) => {
                 self.manager.pending.write().await.remove(&bp_id);
                 tracing::warn!(id = %bp_id, "Breakpoint response timed out, dropping");
-                ctx.headers.insert(
-                    "x-oproxy-mock-response".to_string(),
-                    serde_json::json!({
-                        "status": 504,
-                        "headers": {"content-type": "text/plain"},
-                        "body": "Breakpoint timed out",
-                    })
-                    .to_string(),
-                );
                 MiddlewareAction::StopAndReturn
             }
         }
