@@ -97,9 +97,8 @@ mod tests {
             method: "GET".to_string(),
             uri: "/".to_string(),
             headers: HashMap::new(),
-            body: "".to_string(),
+            body: bytes::Bytes::new(),
             host: "localhost".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -108,12 +107,11 @@ mod tests {
         ResponseContext {
             status: 200,
             headers: HashMap::new(),
-            body: "".to_string(),
+            body: bytes::Bytes::new(),
             request_uri: "/".to_string(),
             session_id: None,
             ttfb_ms: 0,
             body_ms: 0,
-            body_bytes: None,
             ..Default::default()
         }
     }

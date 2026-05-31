@@ -172,11 +172,7 @@ impl Middleware for GrpcInspectorMiddleware {
         }
 
         let (service, method) = Self::parse_uri(&ctx.uri);
-        let body_bytes = ctx
-            .body_bytes
-            .as_ref()
-            .map(|b| b.as_ref())
-            .unwrap_or(ctx.body.as_bytes());
+        let body_bytes = ctx.body.as_ref();
 
         let messages = if let Some((compressed, proto_bytes)) = Self::decode_grpc_frame(body_bytes)
         {
@@ -216,9 +212,8 @@ mod tests {
             method: "POST".to_string(),
             uri: uri.to_string(),
             headers,
-            body: String::new(),
+            body: bytes::Bytes::new(),
             host: "api.example.com".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }

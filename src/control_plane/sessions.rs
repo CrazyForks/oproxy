@@ -62,8 +62,16 @@ pub(super) async fn sessions_stream(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.session_manager.subscribe();
-    let stream = BroadcastStream::new(rx)
-        .map(|_| Ok::<_, std::convert::Infallible>(Event::default().data("update")));
+    let stream = BroadcastStream::new(rx).map(|result| {
+        let data = match result {
+            Ok(ref change) => {
+                serde_json::to_string(change).unwrap_or_else(|_| r#"{"kind":"reload"}"#.to_string())
+            }
+            // Receiver lagged (broadcast buffer overflowed) — tell the client to reload.
+            Err(_) => r#"{"kind":"reload"}"#.to_string(),
+        };
+        Ok::<_, std::convert::Infallible>(Event::default().data(data))
+    });
     Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))

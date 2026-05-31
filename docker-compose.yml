@@ -2,14 +2,8 @@ services:
   oproxy:
     image: oproxy:latest
     build: .
-    ports:
-      # Published to host loopback only. Change the host side to 0.0.0.0 only
-      # when you explicitly want LAN clients to use the proxy.
-      - "127.0.0.1:8080:8080"
-      - "127.0.0.1:1080:1080"
+    network_mode: host
     environment:
-      # The process must bind to all interfaces inside the container so Docker
-      # port publishing can reach it. Host-side publishing above is loopback-only.
       OPROXY_BIND_HOST: "0.0.0.0"
       OPROXY_MITM_ENABLED: "true"
       OPROXY_ALLOW_REMOTE_ADMIN: "false"

@@ -30,9 +30,9 @@ test.describe('Dialogs and downloads', () => {
     await page.goto('/');
     await page.getByRole('button', { name: 'Rules', exact: true }).click();
     await page.getByRole('button', { name: /Add rule/ }).click();
-    await expect(page.getByRole('heading', { name: 'Add route' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'New rule set' })).toBeVisible();
     await page.getByRole('button', { name: 'Cancel' }).click();
-    await expect(page.getByRole('heading', { name: 'Add route' })).toHaveCount(0);
+    await expect(page.getByRole('heading', { name: 'New rule set' })).toHaveCount(0);
   });
 
   test('confirm dialog closes when cancelled', async ({ page }) => {

@@ -198,12 +198,11 @@ mod tests {
         let response = status.map(|code| ResponseContext {
             status: code,
             headers: HashMap::new(),
-            body: String::new(),
+            body: bytes::Bytes::new(),
             request_uri: "/test".to_string(),
             session_id: Some(id.to_string()),
             ttfb_ms: 4,
             body_ms: 2,
-            body_bytes: None,
             ..Default::default()
         });
         let metrics = status.map(|code| InspectionMetrics {
@@ -223,9 +222,8 @@ mod tests {
                 method: "GET".to_string(),
                 uri: "/test".to_string(),
                 headers: HashMap::new(),
-                body: String::new(),
+                body: bytes::Bytes::new(),
                 host: "example.com".to_string(),
-                body_bytes: None,
                 ..Default::default()
             },
             response,

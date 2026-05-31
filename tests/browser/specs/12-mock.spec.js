@@ -5,8 +5,15 @@ const mockRule = () => ({
   id: '',
   name: 'test-mock',
   enabled: true,
-  method: null,
-  path_pattern: '.*',
+  location: {
+    host: null,
+    path: '.*',
+    port: null,
+    protocol: null,
+    query: null,
+    methods: [],
+    mode: 'regex',
+  },
   responses: [{ status: 200, headers: {}, body: '{"ok":true}', delay_ms: 0 }],
 });
 

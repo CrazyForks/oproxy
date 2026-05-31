@@ -14,7 +14,7 @@ module.exports = defineConfig({
     headless: true,
     viewport: { width: 1400, height: 900 },
     screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    video: process.env.OPROXY_E2E_VIDEO || 'retain-on-failure',
   },
   projects: [
     {

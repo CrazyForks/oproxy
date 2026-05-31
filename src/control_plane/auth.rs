@@ -90,7 +90,16 @@ fn configured_admin_token(config: &crate::config::Config) -> Option<&str> {
 
 fn is_auth_exempt_request(req: &axum::extract::Request) -> bool {
     req.uri().scheme().is_some()
-        || matches!(req.uri().path(), "/health" | "/robots.txt" | "/favicon.ico")
+        || matches!(
+            req.uri().path(),
+            "/health"
+                | "/robots.txt"
+                | "/favicon.ico"
+                | "/admin/ca"
+                | "/setup"
+                | "/setup/mobile"
+                | "/admin/setup/network-info"
+        )
 }
 
 fn request_has_admin_token(req: &axum::extract::Request, expected: &str) -> bool {
@@ -269,11 +278,30 @@ pub async fn proxy_dispatch_layer(
         })
         .unwrap_or_else(|| peer_ip.is_some_and(|ip| ip.is_loopback()));
 
-    if is_admin_host {
+    if is_admin_host || is_public_setup_endpoint(&req) {
         next.run(req).await
     } else {
         state.proxy_engine.clone().handle_request(req).await
     }
+}
+
+/// Returns true for the small set of GET endpoints that must be reachable from
+/// LAN clients (phones, VMs) without requiring admin-host status or a token:
+///   - /admin/ca            — CA cert download; clients need this before they can trust MITM
+///   - /setup, /setup/mobile — setup wizard UI
+///   - /admin/setup/network-info — JSON consumed by the setup wizard
+///
+/// We gate on origin-form URI (no scheme) to avoid misrouting forward-proxy
+/// requests like `GET http://evil.com/admin/ca` through the admin router.
+fn is_public_setup_endpoint(req: &axum::extract::Request) -> bool {
+    if req.uri().scheme().is_some() {
+        return false; // absolute-form → forward-proxy request, not for us
+    }
+    req.method() == axum::http::Method::GET
+        && matches!(
+            req.uri().path(),
+            "/admin/ca" | "/setup" | "/setup/mobile" | "/admin/setup/network-info"
+        )
 }
 
 fn is_management_host(
@@ -284,7 +312,7 @@ fn is_management_host(
     peer_ip: Option<IpAddr>,
 ) -> bool {
     let host = host_without_port(host_header).to_ascii_lowercase();
-    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
+    if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0") {
         return peer_ip.is_some_and(|ip| ip.is_loopback());
     }
 
@@ -360,6 +388,15 @@ mod tests {
             false,
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
         ));
+        // 0.0.0.0 as host header (Linux routes http://0.0.0.0:port to local machine)
+        assert!(
+            is_management_host("0.0.0.0:8080", "0.0.0.0", false, false, loopback),
+            "loopback peer with Host: 0.0.0.0 should reach admin UI"
+        );
+        assert!(
+            !is_management_host("0.0.0.0:8080", "0.0.0.0", true, true, remote),
+            "remote clients must not reach admin by sending Host: 0.0.0.0"
+        );
         assert!(
             !is_management_host("localhost:8080", "0.0.0.0", true, true, remote),
             "remote clients must not reach admin by spoofing a localhost Host header"

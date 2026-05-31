@@ -14,7 +14,7 @@ impl GraphQLInspectorMiddleware {
             .map(|v| v.as_str())
             .unwrap_or("");
         (ct.contains("application/json") || ct.contains("application/graphql"))
-            && ctx.body.contains("\"query\"")
+            && ctx.body_text().contains("\"query\"")
     }
 
     pub fn parse(body: &str) -> Option<GraphQLInfo> {
@@ -76,7 +76,7 @@ impl Middleware for GraphQLInspectorMiddleware {
 
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         if Self::is_graphql(ctx)
-            && let Some(info) = Self::parse(&ctx.body)
+            && let Some(info) = Self::parse(&ctx.body_text())
         {
             ctx.inspector.graphql = Some(info);
         }
@@ -100,9 +100,8 @@ mod tests {
             method: "POST".to_string(),
             uri: "/graphql".to_string(),
             headers,
-            body: body.to_string(),
+            body: bytes::Bytes::from(body.to_string()),
             host: "api.example.com".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }

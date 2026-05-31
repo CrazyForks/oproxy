@@ -6,12 +6,11 @@ mod tests {
         CaptureFilterConfig, CaptureFilterMiddleware, FilterMode,
     };
     use crate::middleware::plugins::inspection::InspectionMiddleware;
-    use crate::middleware::plugins::routing::RoutingMiddleware;
+    use crate::middleware::plugins::map_remote::MapRemoteMiddleware;
     use crate::session::{SessionManager, SharedSessionManager};
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
@@ -99,15 +98,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
-    /// When RoutingMiddleware is present and the host has no registered route,
+    /// When MapRemoteMiddleware is present with no matching rules,
     /// the engine must still attempt the request (pass-through forward proxy behaviour).
     /// We use a port that nothing listens on so it fails fast with BAD_GATEWAY —
     /// but the important assertion is that it is NOT 403 (StopAndReturn is not triggered).
     #[tokio::test]
     async fn test_proxy_unregistered_host_passes_through() {
-        let routing_table = Arc::new(RwLock::new(HashMap::new()));
         let mut chain = MiddlewareChain::new();
-        chain.add_middleware(Arc::new(RoutingMiddleware::new(routing_table)));
+        chain.add_middleware(Arc::new(MapRemoteMiddleware::new(vec![])));
         let middleware_chain = Arc::new(RwLock::new(chain));
         let engine = Arc::new(ProxyEngine::new(
             middleware_chain,
@@ -153,6 +151,7 @@ mod tests {
         );
 
         let status = request_unreachable_loopback(engine, "/filtered-deny").await;
+        sessions.flush().await;
 
         // BAD_GATEWAY means the request reached the forwarding path and was not blocked
         // by the filter; no listening loopback server is needed for this contract.
@@ -173,6 +172,7 @@ mod tests {
         );
 
         let matched_status = request_unreachable_loopback(matched_engine, "/allowed").await;
+        matched_sessions.flush().await;
 
         assert_eq!(matched_status, StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -189,6 +189,7 @@ mod tests {
         );
 
         let skipped_status = request_unreachable_loopback(skipped_engine, "/skipped").await;
+        skipped_sessions.flush().await;
 
         assert_eq!(skipped_status, StatusCode::BAD_GATEWAY);
         assert!(

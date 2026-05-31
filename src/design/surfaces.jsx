@@ -52,18 +52,11 @@ function ask(label, value = '') {
       </form>`;
     document.body.appendChild(overlay);
     const input = overlay.querySelector('input');
-    const close = (result) => {
-      overlay.remove();
-      resolve(result);
-    };
+    const close = (result) => { overlay.remove(); resolve(result); };
     overlay.querySelector('[data-cancel]').addEventListener('click', () => close(null));
     overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
-    overlay.querySelector('form').addEventListener('submit', e => {
-      e.preventDefault();
-      close(input.value.trim());
-    });
-    input.focus();
-    input.select();
+    overlay.querySelector('form').addEventListener('submit', e => { e.preventDefault(); close(input.value.trim()); });
+    input.focus(); input.select();
   });
 }
 
@@ -95,18 +88,14 @@ function formDialog(title, fields) {
     }).join('');
     overlay.innerHTML = `
       <form class="ui-dialog ui-form-dialog">
-        <h3>${title}</h3>
-        ${fieldHtml}
+        <h3>${title}</h3>${fieldHtml}
         <div class="ui-dialog-actions">
           <button type="button" class="btn ghost" data-cancel>Cancel</button>
           <button type="submit" class="btn primary">Save</button>
         </div>
       </form>`;
     document.body.appendChild(overlay);
-    const close = (result) => {
-      overlay.remove();
-      resolve(result);
-    };
+    const close = (result) => { overlay.remove(); resolve(result); };
     overlay.querySelector('[data-cancel]').addEventListener('click', () => close(null));
     overlay.addEventListener('click', e => { if (e.target === overlay) close(null); });
     overlay.querySelector('form').addEventListener('submit', e => {
@@ -123,8 +112,7 @@ function formDialog(title, fields) {
       close(data);
     });
     const first = overlay.querySelector('input, textarea, select');
-    first?.focus();
-    first?.select?.();
+    first?.focus(); first?.select?.();
   });
 }
 
@@ -142,60 +130,17 @@ function confirmAction(message, confirmLabel = 'Confirm', tone = 'primary') {
         </div>
       </form>`;
     document.body.appendChild(overlay);
-    const close = (result) => {
-      overlay.remove();
-      resolve(result);
-    };
+    const close = (result) => { overlay.remove(); resolve(result); };
     overlay.querySelector('[data-cancel]').addEventListener('click', () => close(false));
     overlay.addEventListener('click', e => { if (e.target === overlay) close(false); });
-    overlay.querySelector('form').addEventListener('submit', e => {
-      e.preventDefault();
-      close(true);
-    });
+    overlay.querySelector('form').addEventListener('submit', e => { e.preventDefault(); close(true); });
   });
 }
 
-Object.assign(window, { Toggle, SurfaceShell, fetchJson, sendJson, notifyError, ask, formDialog, confirmAction, nonEmpty });
+Object.assign(window, { Toggle, SurfaceShell, fetchJson, sendJson, notifyError, ask, formDialog, confirmAction, nonEmpty, Modal, LocationEditor });
 
 function nonEmpty(v) {
   return v != null && String(v).trim() !== '';
-}
-
-function criteriaKind(criteria) {
-  if (!criteria) return 'ALL';
-  if (criteria.Host) return 'HOST';
-  if (criteria.Path) return 'PATH';
-  if (criteria.Body) return 'BODY';
-  if (criteria.Header) return 'HDR';
-  return 'MATCH';
-}
-function criteriaValue(criteria) {
-  if (!criteria) return null;
-  if (criteria.Host) return `host contains ${criteria.Host}`;
-  if (criteria.Path) return `path regex ${criteria.Path}`;
-  if (criteria.Body) return `body regex ${criteria.Body}`;
-  if (criteria.Header) return `${criteria.Header.name}: ${criteria.Header.value}`;
-  return JSON.stringify(criteria);
-}
-function actionLabel(action) {
-  if (!action) return '';
-  if (action.AddHeader) return `add ${action.AddHeader.name}: ${action.AddHeader.value}`;
-  if (action.RemoveHeader) return action.RemoveHeader.name;
-  if (action.ReplaceHeader) return `${action.ReplaceHeader.name} → ${action.ReplaceHeader.replacement}`;
-  if (action.ReplaceBody) return `pattern: ${action.ReplaceBody.pattern}`;
-  if (action.Redirect) return action.Redirect.location || `${action.Redirect.status}`;
-  if (action.Block) return `${action.Block.status}`;
-  return JSON.stringify(action);
-}
-function actionKind(action) {
-  if (!action) return '';
-  if (action.AddHeader) return 'ADD HDR';
-  if (action.RemoveHeader) return 'DEL HDR';
-  if (action.ReplaceHeader) return 'SET HDR';
-  if (action.ReplaceBody) return 'BODY';
-  if (action.Redirect) return `${action.Redirect.status}`;
-  if (action.Block) return `BLOCK ${action.Block.status}`;
-  return '';
 }
 
 function SurfaceShell({ title, sub, tabs, activeTab, onTab, actions, children }) {
@@ -211,9 +156,7 @@ function SurfaceShell({ title, sub, tabs, activeTab, onTab, actions, children })
       {tabs && (
         <div className="surface-tabs">
           {tabs.map(t => (
-            <button key={t.key}
-                    className={'tab' + (activeTab === t.key ? ' on' : '')}
-                    onClick={() => onTab(t.key)}>
+            <button key={t.key} className={'tab' + (activeTab === t.key ? ' on' : '')} aria-label={t.ariaLabel || t.label} onClick={() => onTab(t.key)}>
               {t.label}
               {!!t.count && <span className="pill">{t.count}</span>}
             </button>
@@ -274,176 +217,612 @@ function RuleTable({ rows, onToggle, onEdit, onDelete, emptyTitle, emptyDesc }) 
   );
 }
 
-// ─── Rules surface ─────────────────────────────────────────────────────
-const RULES_INITIAL = {
-  routes: [],
-  rewrites: [],
-  headers: [],
-  mods: [],
-  mapLocal: [],
-  throttle: {
-    enabled: false,
-    preset: 'off',
-    latency: 0,
-    downKbps: 0,
-    upKbps: 0,
-    jitter: 0,
-  },
-};
+// ─── Rules surface ──────────────────────────────────────────────────────
+
+const EMPTY_LOCATION = { host: null, path: null, port: null, protocol: null, query: null, methods: [], mode: 'glob' };
+
+function summarizeLocation(loc) {
+  if (!loc) return null;
+  const parts = [];
+  if (loc.host) parts.push(loc.host);
+  if (loc.path) parts.push(loc.path);
+  if (loc.port) parts.push(`:${loc.port}`);
+  if (loc.protocol) parts.push(loc.protocol);
+  if (loc.methods && loc.methods.length) parts.push(loc.methods.join(' '));
+  if (loc.query) parts.push(`?${loc.query}`);
+  return parts.join(' · ') || null;
+}
+
+// ── React modal overlay ─────────────────────────────────────────────────
+
+function Modal({ title, onClose, onSave, saveLabel = 'Save', children }) {
+  React.useEffect(() => {
+    const h = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', h);
+    return () => document.removeEventListener('keydown', h);
+  }, [onClose]);
+  return (
+    <div className="ui-dialog-backdrop" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="ui-dialog ui-form-dialog"
+           style={{ maxWidth: 660, width: '92vw', maxHeight: '92vh', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}
+           onClick={e => e.stopPropagation()}>
+        <h3 style={{ margin: '0 0 12px', flexShrink: 0 }}>{title}</h3>
+        <div style={{ flex: 1, minHeight: 0 }}>{children}</div>
+        <div className="ui-dialog-actions" style={{ flexShrink: 0 }}>
+          <button className="btn ghost" onClick={onClose}>Cancel</button>
+          <button className="btn primary" onClick={onSave}>{saveLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, hint, children, row }) {
+  return (
+    <label className="ui-field" style={row ? { flexDirection: 'row', alignItems: 'center', gap: 8 } : {}}>
+      <span style={row ? { flexShrink: 0, minWidth: 80 } : {}}>{label}</span>
+      {children}
+      {hint && <span style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 2, gridColumn: '1 / -1' }}>{hint}</span>}
+    </label>
+  );
+}
+
+// ── Location editor ─────────────────────────────────────────────────────
+
+const METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
+
+function LocationEditor({ loc, onChange }) {
+  const set = (k, v) => onChange({ ...loc, [k]: v || null });
+  const toggleMethod = (m) => {
+    const cur = loc.methods || [];
+    onChange({ ...loc, methods: cur.includes(m) ? cur.filter(x => x !== m) : [...cur, m] });
+  };
+  const lbl = { fontSize: 12, color: 'var(--text-faint)', whiteSpace: 'nowrap' };
+
+  return (
+    <div style={{ background: 'rgba(0,0,0,0.04)', borderRadius: 6, padding: '10px 12px', marginBottom: 10 }}>
+      <div style={{ fontSize: 10.5, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--text-faint)', marginBottom: 8 }}>
+        Location — leave blank to match all
+      </div>
+      {/* 4-column inline grid: label | input | label | input */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr max-content 1fr', gap: '5px 10px', alignItems: 'center', marginBottom: 6 }}>
+        <span style={lbl}>Host</span>
+        <input className="cmp-input" value={loc.host || ''} onChange={e => set('host', e.target.value)} placeholder="api.example.com" />
+        <span style={lbl}>Path</span>
+        <input className="cmp-input" value={loc.path || ''} onChange={e => set('path', e.target.value)} placeholder="/api/*" />
+
+        <span style={lbl}>Query</span>
+        <input className="cmp-input" value={loc.query || ''} onChange={e => set('query', e.target.value)} placeholder="key=value*" />
+        <span style={lbl}>Port</span>
+        <input className="cmp-input" type="number" min="1" max="65535" value={loc.port || ''} onChange={e => set('port', e.target.value ? Number(e.target.value) : null)} placeholder="any" />
+
+        <span style={lbl}>Protocol</span>
+        <select className="cmp-input" value={loc.protocol || ''} onChange={e => set('protocol', e.target.value)}>
+          <option value="">any</option>
+          <option value="http">http</option>
+          <option value="https">https</option>
+        </select>
+        <span style={lbl}>Match mode</span>
+        <select className="cmp-input" value={loc.mode || 'glob'} onChange={e => onChange({ ...loc, mode: e.target.value })}>
+          <option value="glob">Glob (* ? wildcards)</option>
+          <option value="regex">Regex (unanchored)</option>
+        </select>
+      </div>
+      {/* Methods on a single row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px 10px', flexWrap: 'wrap' }}>
+        <span style={{ ...lbl, marginRight: 2 }}>Methods</span>
+        {METHODS.map(m => (
+          <label key={m} style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+            <input type="checkbox" checked={(loc.methods || []).includes(m)} onChange={() => toggleMethod(m)} />
+            {m}
+          </label>
+        ))}
+        <span style={{ fontSize: 11, color: 'var(--text-faint)', marginLeft: 2 }}>(blank = any)</span>
+      </div>
+    </div>
+  );
+}
+
+// ── Actions editor (for RewriteRuleSet) ────────────────────────────────
+
+const ACTION_TYPES = [
+  { value: 'set_header',        label: 'Set header' },
+  { value: 'append_header',     label: 'Append header' },
+  { value: 'remove_header',     label: 'Remove header' },
+  { value: 'set_query_param',   label: 'Set query param' },
+  { value: 'remove_query_param',label: 'Remove query param' },
+  { value: 'set_host',          label: 'Set host' },
+  { value: 'set_path',          label: 'Set path' },
+  { value: 'set_status',        label: 'Set status code' },
+  { value: 'replace_body',      label: 'Replace body' },
+  { value: 'redirect',          label: 'Redirect' },
+  { value: 'block',             label: 'Block' },
+];
+
+function defaultAction(type) {
+  switch (type) {
+    case 'set_header':         return { type, name: '', value: '' };
+    case 'append_header':      return { type, name: '', value: '' };
+    case 'remove_header':      return { type, name: '' };
+    case 'set_query_param':    return { type, name: '', value: '' };
+    case 'remove_query_param': return { type, name: '' };
+    case 'set_host':           return { type, value: '' };
+    case 'set_path':           return { type, pattern: '', replacement: '' };
+    case 'set_status':         return { type, code: 200 };
+    case 'replace_body':       return { type, pattern: '', replacement: '' };
+    case 'redirect':           return { type, status: 302, location: '' };
+    case 'block':              return { type, status: 403 };
+    default:                   return { type: 'set_header', name: '', value: '' };
+  }
+}
+
+function summarizeActions(actions) {
+  if (!actions || !actions.length) return 'no actions';
+  return actions.map(a => {
+    switch (a.type) {
+      case 'set_header':         return `set ${a.name}`;
+      case 'append_header':      return `append ${a.name}`;
+      case 'remove_header':      return `rm ${a.name}`;
+      case 'set_query_param':    return `?${a.name}=…`;
+      case 'remove_query_param': return `rm ?${a.name}`;
+      case 'set_host':           return `host→${a.value}`;
+      case 'set_path':           return `path ${a.pattern}→${a.replacement}`;
+      case 'set_status':         return `${a.code}`;
+      case 'replace_body':       return `body ${a.pattern}→${a.replacement}`;
+      case 'redirect':           return `→${a.location || a.status}`;
+      case 'block':              return `block ${a.status}`;
+      default:                   return a.type;
+    }
+  }).join(', ');
+}
+
+function ActionRow({ action, onChange, onRemove }) {
+  const set = (k, v) => onChange({ ...action, [k]: v });
+  const inp = (props) => <input className="cmp-input" style={{ flex: 1, minWidth: 60 }} {...props} />;
+  return (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+      <select className="cmp-input" style={{ flexShrink: 0, width: 160 }}
+              value={action.type} onChange={e => onChange(defaultAction(e.target.value))}>
+        {ACTION_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+      </select>
+      {(action.type === 'set_header' || action.type === 'append_header') && <>
+        {inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'header-name', style: { flex: 1, minWidth: 60 } })}
+        {inp({ value: action.value || '', onChange: e => set('value', e.target.value), placeholder: 'value' })}
+      </>}
+      {action.type === 'remove_header' &&
+        inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'header-name' })}
+      {(action.type === 'set_query_param') && <>
+        {inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'param' })}
+        {inp({ value: action.value || '', onChange: e => set('value', e.target.value), placeholder: 'value' })}
+      </>}
+      {action.type === 'remove_query_param' &&
+        inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'param' })}
+      {action.type === 'set_host' &&
+        inp({ value: action.value || '', onChange: e => set('value', e.target.value), placeholder: 'staging.example.com' })}
+      {action.type === 'set_path' && <>
+        {inp({ value: action.pattern || '', onChange: e => set('pattern', e.target.value), placeholder: '^/api/v1' })}
+        {inp({ value: action.replacement || '', onChange: e => set('replacement', e.target.value), placeholder: '/api/v2' })}
+      </>}
+      {action.type === 'set_status' &&
+        <input className="cmp-input" type="number" min="100" max="599" style={{ width: 80 }}
+               value={action.code || 200} onChange={e => set('code', Number(e.target.value))} />}
+      {action.type === 'replace_body' && <>
+        {inp({ value: action.pattern || '', onChange: e => set('pattern', e.target.value), placeholder: 'find regex' })}
+        <textarea className="cmp-input" rows={2} style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 12 }}
+                  value={action.replacement || ''} onChange={e => set('replacement', e.target.value)} placeholder="replacement" />
+      </>}
+      {action.type === 'redirect' && <>
+        <input className="cmp-input" type="number" min="300" max="399" style={{ width: 70 }}
+               value={action.status || 302} onChange={e => set('status', Number(e.target.value))} />
+        {inp({ value: action.location || '', onChange: e => set('location', e.target.value), placeholder: 'https://…' })}
+      </>}
+      {action.type === 'block' &&
+        <input className="cmp-input" type="number" min="400" max="599" style={{ width: 80 }}
+               value={action.status || 403} onChange={e => set('status', Number(e.target.value))} />}
+      <button className="copy-btn" onClick={onRemove} title="Remove action" style={{ flexShrink: 0 }}>×</button>
+    </div>
+  );
+}
+
+function ActionsEditor({ actions, onChange }) {
+  const add = () => onChange([...actions, defaultAction('set_header')]);
+  const update = (i, a) => onChange(actions.map((x, j) => j === i ? a : x));
+  const remove = (i) => onChange(actions.filter((_, j) => j !== i));
+  return (
+    <div>
+      <div style={{ fontSize: 10.5, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--text-faint)', marginBottom: 8 }}>
+        Actions  <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, fontSize: 11 }}>— applied in order</span>
+      </div>
+      {actions.map((a, i) => (
+        <ActionRow key={i} action={a} onChange={a2 => update(i, a2)} onRemove={() => remove(i)} />
+      ))}
+      {actions.length === 0 && (
+        <div style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 8 }}>No actions yet — add at least one.</div>
+      )}
+      <button className="btn ghost" style={{ fontSize: 12, marginTop: 4 }} onClick={add}>+ Add action</button>
+    </div>
+  );
+}
+
+// ── RuleSet modal ───────────────────────────────────────────────────────
+
+function RuleSetModal({ rule, onClose, onSave }) {
+  const isNew = !rule;
+  const [name, setName] = React.useState(rule?.name || '');
+  const [enabled, setEnabled] = React.useState(rule ? rule.enabled : true);
+  const [appliesTo, setAppliesTo] = React.useState((rule?.applies_to || 'both').toLowerCase());
+  const [loc, setLoc] = React.useState(rule?.location ? { ...EMPTY_LOCATION, ...rule.location } : { ...EMPTY_LOCATION });
+  const [actions, setActions] = React.useState(rule?.actions || []);
+
+  const save = async () => {
+    if (!name.trim()) { notifyError('Name is required'); return; }
+    const body = { id: rule?.id || '', name: name.trim(), enabled, applies_to: appliesTo, location: loc, actions };
+    try {
+      if (isNew) {
+        await sendJson('/admin/rule-sets', 'POST', body);
+      } else {
+        await sendJson(`/admin/rule-sets/${rule.id}`, 'PUT', body);
+      }
+      onSave();
+    } catch (e) { notifyError(e.message || e); }
+  };
+
+  return (
+    <Modal title={isNew ? 'New rule set' : `Edit — ${rule.name}`} onClose={onClose} onSave={save}>
+      {/* Name + Applies-to + Enabled on one row */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+        <input className="cmp-input" style={{ flex: 1 }} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Add CORS headers" autoFocus />
+        <select className="cmp-input" style={{ flexShrink: 0, width: 'auto' }} value={appliesTo} onChange={e => setAppliesTo(e.target.value)}>
+          <option value="both">Req &amp; Resp</option>
+          <option value="request">Request</option>
+          <option value="response">Response</option>
+        </select>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer', flexShrink: 0 }}>
+          <Toggle on={enabled} onChange={setEnabled} label="Enabled" />
+          Enabled
+        </label>
+      </div>
+      <LocationEditor loc={loc} onChange={setLoc} />
+      <ActionsEditor actions={actions} onChange={setActions} />
+    </Modal>
+  );
+}
+
+// ── Generic simple rule modal (Map Remote / Map Local / Access) ──────────
+
+function SimpleRuleModal({ title, rule, extraFields, onClose, onSave }) {
+  const isNew = !rule;
+  const [name, setName] = React.useState(rule?.name || '');
+  const [enabled, setEnabled] = React.useState(rule ? rule.enabled : true);
+  const [loc, setLoc] = React.useState(rule?.location ? { ...EMPTY_LOCATION, ...rule.location } : { ...EMPTY_LOCATION });
+  const [extra, setExtra] = React.useState(() => {
+    const init = {};
+    (extraFields || []).forEach(f => { init[f.key] = rule?.[f.key] ?? f.default ?? ''; });
+    return init;
+  });
+  const setE = (k, v) => setExtra(p => ({ ...p, [k]: v }));
+
+  const save = async () => {
+    if (!name.trim()) { notifyError('Name is required'); return; }
+    try {
+      await onSave({ name: name.trim(), enabled, location: loc, ...extra });
+    } catch (e) { notifyError(e.message || e); }
+  };
+
+  return (
+    <Modal title={title} onClose={onClose} onSave={save}>
+      {/* Name + Enabled on one row */}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 }}>
+        <input className="cmp-input" style={{ flex: 1 }} value={name} onChange={e => setName(e.target.value)} placeholder="Name" autoFocus />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer', flexShrink: 0 }}>
+          <Toggle on={enabled} onChange={setEnabled} label="Enabled" />
+          Enabled
+        </label>
+      </div>
+      <LocationEditor loc={loc} onChange={setLoc} />
+      {(extraFields || []).map(f => (
+        <div key={f.key} style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr', gap: '5px 10px', alignItems: 'center' }}>
+          <span style={{ fontSize: 12, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>{f.label}</span>
+          {f.type === 'select'
+            ? <select className="cmp-input" value={extra[f.key] ?? ''} onChange={e => setE(f.key, e.target.value)}>
+                {(f.options || []).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            : <input className="cmp-input" value={extra[f.key] ?? ''} onChange={e => setE(f.key, e.target.value)} placeholder={f.placeholder} />
+          }
+          {f.hint && <span style={{ fontSize: 11, color: 'var(--text-faint)', gridColumn: '2', marginTop: -2 }}>{f.hint}</span>}
+        </div>
+      ))}
+    </Modal>
+  );
+}
+
+// ── Generic rule list ───────────────────────────────────────────────────
+
+function GenericRuleList({ rules, renderExtra, onToggle, onEdit, onDelete, emptyTitle, emptyDesc }) {
+  return (
+    <div className="rule-list">
+      {rules.length === 0 && (
+        <div className="empty" style={{ padding: '40px 24px', textAlign: 'left', maxWidth: 520 }}>
+          <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>{emptyTitle || 'No rules yet'}</div>
+          {emptyDesc && <div style={{ fontSize: 12, color: 'var(--text-mid)', lineHeight: 1.6 }}>{emptyDesc}</div>}
+          <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-faint)' }}>Press <span className="key">+</span> to add one.</div>
+        </div>
+      )}
+      {rules.map((r, i) => {
+        const locStr = summarizeLocation(r.location);
+        return (
+          <div key={r.id || i} className={'rule-row rule-row-rich' + (r.enabled ? '' : ' off')}>
+            <div className="col-toggle">
+              <Toggle label={`Toggle ${r.name || i + 1}`} on={!!r.enabled} onChange={v => onToggle(r, v)} />
+            </div>
+            <div className="col-name" title={r.name}>{r.name || <span className="mute">—</span>}</div>
+            <div className="col-match-rich col-match">
+              {locStr
+                ? <code className="rule-pattern" title={locStr}>{locStr}</code>
+                : <span className="mute" style={{ fontSize: 11 }}>all requests</span>}
+            </div>
+            <div className="col-action-rich" style={{ fontSize: 12 }}>
+              {renderExtra(r)}
+            </div>
+            <div className="col-act">
+              <button className="copy-btn" onClick={() => onEdit(r)}>edit</button>
+              <button className="copy-btn" onClick={() => onDelete(r)}>×</button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Rules tab (RewriteRuleSet) ──────────────────────────────────────────
+
+function RuleSetTab({ rules, onReload, onAdd, editTarget, setEditTarget }) {
+  const toggle = async (r, v) => {
+    try { await sendJson(`/admin/rule-sets/${r.id}`, 'PUT', { ...r, enabled: v }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  const del = async (r) => {
+    if (!await confirmAction(`Delete "${r.name}"?`, 'Delete', 'danger')) return;
+    try { await fetch(`/admin/rule-sets/${r.id}`, { method: 'DELETE' }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+
+  return (
+    <>
+      <div className="rule-list">
+        {rules.length === 0 && (
+          <div className="empty" style={{ padding: '40px 24px', textAlign: 'left', maxWidth: 520 }}>
+            <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>No rule sets</div>
+            <div style={{ fontSize: 12, color: 'var(--text-mid)', lineHeight: 1.6 }}>
+              Rule sets match by location and run an ordered list of actions — set headers, redirect, block, rewrite paths, and more.
+            </div>
+            <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-faint)' }}>Press <span className="key">+</span> to add one.</div>
+          </div>
+        )}
+        {rules.map((r, i) => {
+          const locStr = summarizeLocation(r.location);
+          const actStr = summarizeActions(r.actions);
+          return (
+            <div key={r.id || i} className={'rule-row rule-row-rich' + (r.enabled ? '' : ' off')}>
+              <div className="col-toggle">
+                <Toggle label={`Toggle ${r.name}`} on={!!r.enabled} onChange={v => toggle(r, v)} />
+              </div>
+              <div className="col-name" title={r.name}>{r.name || <span className="mute">—</span>}</div>
+              <div className="col-match-rich col-match">
+                {locStr
+                  ? <code className="rule-pattern" title={locStr}>{locStr}</code>
+                  : <span className="mute" style={{ fontSize: 11 }}>all requests</span>}
+              </div>
+              <div className="col-action-rich" style={{ fontSize: 12 }}>
+                <RuleBadge kind={r.applies_to || 'Both'} variant="action" />
+                <span className="rule-action-text" title={actStr}>{actStr}</span>
+              </div>
+              <div className="col-act">
+                <button className="copy-btn" onClick={() => setEditTarget(r)}>edit</button>
+                <button className="copy-btn" onClick={() => del(r)}>×</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {(editTarget !== undefined) && (
+        <RuleSetModal
+          rule={editTarget}
+          onClose={() => setEditTarget(undefined)}
+          onSave={async () => { setEditTarget(undefined); await onReload(); }}
+        />
+      )}
+    </>
+  );
+}
+
+// ── Map Remote tab ──────────────────────────────────────────────────────
+
+function MapRemoteTab({ rules, onReload, editTarget, setEditTarget }) {
+  const toggle = async (r, v) => {
+    try { await sendJson(`/admin/map-remote-rules/${r.id}`, 'PUT', { ...r, enabled: v }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  const del = async (r) => {
+    if (!await confirmAction(`Delete "${r.name}"?`, 'Delete', 'danger')) return;
+    try { await fetch(`/admin/map-remote-rules/${r.id}`, { method: 'DELETE' }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  const saveRule = async (data) => {
+    if (editTarget && editTarget.id) {
+      await sendJson(`/admin/map-remote-rules/${editTarget.id}`, 'PUT', { id: editTarget.id, ...data });
+    } else {
+      await sendJson('/admin/map-remote-rules', 'POST', { id: '', ...data });
+    }
+    setEditTarget(undefined);
+    await onReload();
+  };
+
+  const fields = [{ key: 'destination', label: 'Destination URL', placeholder: 'http://10.0.0.1:3000', hint: 'Origin is replaced; path and query are preserved.' }];
+
+  return (
+    <>
+      <GenericRuleList
+        rules={rules}
+        renderExtra={r => <code className="rule-pattern" style={{ color: 'var(--c-2xx)' }}>{r.destination}</code>}
+        onToggle={toggle} onEdit={setEditTarget} onDelete={del}
+        emptyTitle="No Map Remote rules"
+        emptyDesc="Map Remote routes matching requests to a different upstream origin. The path and query string are preserved — only the origin changes." />
+      {editTarget !== undefined && (
+        <SimpleRuleModal
+          title={editTarget && editTarget.id ? `Edit — ${editTarget.name}` : 'New Map Remote rule'}
+          rule={editTarget || null}
+          extraFields={fields}
+          onClose={() => setEditTarget(undefined)}
+          onSave={saveRule}
+        />
+      )}
+    </>
+  );
+}
+
+// ── Map Local tab ───────────────────────────────────────────────────────
+
+function MapLocalTab({ rules, onReload, editTarget, setEditTarget }) {
+  const toggle = async (r, v) => {
+    try { await sendJson(`/admin/map-local-rules/${r.id}`, 'PUT', { ...r, enabled: v }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  const del = async (r) => {
+    if (!await confirmAction(`Delete "${r.name}"?`, 'Delete', 'danger')) return;
+    try { await fetch(`/admin/map-local-rules/${r.id}`, { method: 'DELETE' }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  const saveRule = async (data) => {
+    if (editTarget && editTarget.id) {
+      await sendJson(`/admin/map-local-rules/${editTarget.id}`, 'PUT', { id: editTarget.id, ...data });
+    } else {
+      await sendJson('/admin/map-local-rules', 'POST', { id: '', ...data });
+    }
+    setEditTarget(undefined);
+    await onReload();
+  };
+
+  const fields = [{ key: 'file_path', label: 'Local path', placeholder: '/absolute/path/or/dir', hint: 'File served verbatim; directory appends the request path.' }];
+
+  return (
+    <>
+      <GenericRuleList
+        rules={rules}
+        renderExtra={r => <code className="rule-pattern" style={{ fontSize: 11, wordBreak: 'break-all' }}>{r.file_path}</code>}
+        onToggle={toggle} onEdit={setEditTarget} onDelete={del}
+        emptyTitle="No Map Local rules"
+        emptyDesc="Map Local serves a local file (or directory) as the response for matching requests, bypassing the upstream entirely. Great for mocking API endpoints from fixture files." />
+      {editTarget !== undefined && (
+        <SimpleRuleModal
+          title={editTarget && editTarget.id ? `Edit — ${editTarget.name}` : 'New Map Local rule'}
+          rule={editTarget || null}
+          extraFields={fields}
+          onClose={() => setEditTarget(undefined)}
+          onSave={saveRule}
+        />
+      )}
+    </>
+  );
+}
+
+// ── Access tab ──────────────────────────────────────────────────────────
+
+function AccessTab({ rules, onReload, editTarget, setEditTarget }) {
+  const toggle = async (r, v) => {
+    try { await sendJson(`/admin/access-rules/${r.id}`, 'PUT', { ...r, enabled: v }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  const del = async (r) => {
+    if (!await confirmAction(`Delete "${r.name}"?`, 'Delete', 'danger')) return;
+    try { await fetch(`/admin/access-rules/${r.id}`, { method: 'DELETE' }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  const saveRule = async (data) => {
+    if (editTarget && editTarget.id) {
+      await sendJson(`/admin/access-rules/${editTarget.id}`, 'PUT', { id: editTarget.id, ...data });
+    } else {
+      await sendJson('/admin/access-rules', 'POST', { id: '', ...data });
+    }
+    setEditTarget(undefined);
+    await onReload();
+  };
+
+  const fields = [{
+    key: 'action', label: 'Action', type: 'select', default: 'block',
+    options: [{ value: 'block', label: 'Block — deny matching requests (403)' }, { value: 'allow', label: 'Allow — only allow matching (block everything else)' }],
+  }];
+
+  const accessBadge = (r) => (
+    <RuleBadge
+      kind={r.action === 'allow' ? 'ALLOW' : 'BLOCK'}
+      variant={r.action === 'allow' ? 'any' : 'action'}
+    />
+  );
+
+  return (
+    <>
+      <div style={{ padding: '10px 16px', fontSize: 12, color: 'var(--text-mid)', lineHeight: 1.6 }}>
+        <strong>Block</strong> rules 403 matching requests. <strong>Allow</strong> rules create an allowlist — if any exist, only matching requests pass. Block takes priority over Allow.
+      </div>
+      <GenericRuleList
+        rules={rules}
+        renderExtra={accessBadge}
+        onToggle={toggle} onEdit={setEditTarget} onDelete={del}
+        emptyTitle="No access rules"
+        emptyDesc="Block specific hosts or paths, or build an allowlist to restrict which requests the proxy forwards." />
+      {editTarget !== undefined && (
+        <SimpleRuleModal
+          title={editTarget && editTarget.id ? `Edit — ${editTarget.name}` : 'New access rule'}
+          rule={editTarget || null}
+          extraFields={fields}
+          onClose={() => setEditTarget(undefined)}
+          onSave={saveRule}
+        />
+      )}
+    </>
+  );
+}
+
+// ── Main RulesSurface ───────────────────────────────────────────────────
 
 function RulesSurface() {
-  const [tab, setTab] = React.useState('routes');
-  const [rules, setRules] = React.useState(RULES_INITIAL);
+  const [tab, setTab] = React.useState('rules');
+  const [ruleSets, setRuleSets] = React.useState([]);
+  const [mapRemote, setMapRemote] = React.useState([]);
+  const [mapLocal, setMapLocal] = React.useState([]);
+  const [access, setAccess] = React.useState([]);
+  const [throttle, setThrottle] = React.useState({ enabled: false, preset: 'off', latency: 0, downKbps: 0 });
+  // editTarget: undefined = modal closed, null = new rule, object = editing that rule
+  const [rsEdit, setRsEdit] = React.useState(undefined);
+  const [mrEdit, setMrEdit] = React.useState(undefined);
+  const [mlEdit, setMlEdit] = React.useState(undefined);
+  const [acEdit, setAcEdit] = React.useState(undefined);
 
   const load = React.useCallback(async () => {
-    const [routes, rewrites, headers, mods, mapLocal, throttle] = await Promise.all([
-      fetchJson('/admin/routes', {}),
-      fetchJson('/admin/rewrites', []),
-      fetchJson('/admin/header-maps', []),
-      fetchJson('/admin/modifications', []),
-      fetchJson('/admin/map-local', {}),
-      fetchJson('/admin/throttling', RULES_INITIAL.throttle),
+    const [rs, mr, ml, ac, th] = await Promise.all([
+      fetchJson('/admin/rule-sets', []),
+      fetchJson('/admin/map-remote-rules', []),
+      fetchJson('/admin/map-local-rules', []),
+      fetchJson('/admin/access-rules', []),
+      fetchJson('/admin/throttling', {}),
     ]);
-    setRules({
-      routes: Object.entries(routes || {}).map(([src, dst], index) => ({
-        name: `Route ${index + 1}`,
-        match: src, matchKind: 'HOST',
-        action: dst, actionKind: 'ROUTE',
-        on: true, toggle: false, raw: { src, dst },
-      })),
-      rewrites: (rewrites || []).map((r, index) => ({
-        name: r.name || `Rewrite ${index + 1}`,
-        match: criteriaValue(r.criteria), matchKind: criteriaKind(r.criteria),
-        action: actionLabel(r.action), actionKind: actionKind(r.action),
-        on: !!r.enabled, raw: r, index,
-      })),
-      headers: (headers || []).map(r => ({
-        name: r.name,
-        match: r.match || null, matchKind: r.scope === 'all' ? 'ALL' : 'HOST',
-        action: `${r.action || 'Set'} ${r.name}${r.value ? `: ${r.value}` : ''}`, actionKind: (r.action || 'Set').toUpperCase(),
-        on: r.enabled !== false, raw: r,
-      })),
-      mods: (mods || []).map((r, index) => {
-        const hdrCount = Object.keys(r.header_replacements || {}).length;
-        return {
-          name: `Modification ${index + 1}`,
-          match: r.request_uri_pattern || null, matchKind: r.request_uri_pattern ? 'URI' : 'ALL',
-          action: [hdrCount > 0 && `${hdrCount} header${hdrCount > 1 ? 's' : ''}`, r.body_replacement && 'body'].filter(Boolean).join(' + ') || 'no-op',
-          actionKind: 'MOD',
-          on: true, toggle: false, raw: r, index,
-        };
-      }),
-      mapLocal: Object.entries(mapLocal || {}).map(([host, filePath]) => ({
-        name: host,
-        match: host, matchKind: 'HOST',
-        action: filePath, actionKind: 'FILE',
-        on: true, toggle: false, raw: { host, file_path: filePath },
-      })),
-      throttle: {
-        enabled: !!throttle?.enabled,
-        preset: throttle?.enabled ? 'custom' : 'off',
-        latency: throttle?.latency_ms || 0,
-        downKbps: throttle?.bandwidth_limit_kbps || 0,
-        upKbps: 0,
-        jitter: 0,
-      },
+    setRuleSets(rs || []);
+    setMapRemote(mr || []);
+    setMapLocal(ml || []);
+    setAccess(ac || []);
+    setThrottle({
+      enabled: !!th?.enabled,
+      preset: th?.enabled ? 'custom' : 'off',
+      latency: th?.latency_ms || 0,
+      downKbps: th?.bandwidth_limit_kbps || 0,
     });
   }, []);
 
   React.useEffect(() => { load(); }, [load]);
 
-  const addRule = async () => {
-    try {
-      if (tab === 'routes') {
-        const form = await formDialog('Add route', [
-          { name: 'src', label: 'Source host  (request Host header)', placeholder: 'api.local or api.local:8080' },
-          { name: 'dst', label: 'Destination base URL', value: 'http://127.0.0.1:3000' },
-        ]);
-        if (!form || !nonEmpty(form.src) || !nonEmpty(form.dst)) return;
-        const current = await fetchJson('/admin/routes', {});
-        await sendJson('/admin/routes', 'POST', { ...current, [form.src]: form.dst });
-
-      } else if (tab === 'rewrites') {
-        const form = await formDialog('Add rewrite rule', [
-          { name: 'ruleName',      label: 'Rule name', placeholder: 'e.g. Add CORS header' },
-          { name: 'criteriaType',  label: 'Match on', type: 'select', value: 'Path', options: [
-            { value: 'Path',   label: 'Path regex' },
-            { value: 'Host',   label: 'Host contains' },
-            { value: 'Body',   label: 'Body regex' },
-          ]},
-          { name: 'pattern', label: 'Pattern', value: '/api/.*' },
-          { name: 'actionType',    label: 'Action', type: 'select', value: 'AddHeader', options: [
-            { value: 'AddHeader',    label: 'Add / set header' },
-            { value: 'RemoveHeader', label: 'Remove header' },
-            { value: 'Redirect',     label: 'Redirect (302)' },
-            { value: 'Block',        label: 'Block request' },
-          ]},
-          { name: 'param1', label: 'Header name  ·  Redirect URL  ·  Block status code', placeholder: 'x-custom  or  https://…  or  403' },
-          { name: 'param2', label: 'Header value  (Add / set only)', placeholder: '1' },
-        ]);
-        if (!form || !nonEmpty(form.pattern)) return;
-        const criteria = { [form.criteriaType]: form.pattern };
-        let action;
-        if (form.actionType === 'AddHeader')         action = { AddHeader:    { name: form.param1 || 'x-header', value: form.param2 || '' } };
-        else if (form.actionType === 'RemoveHeader') action = { RemoveHeader: { name: form.param1 || 'x-header' } };
-        else if (form.actionType === 'Redirect')     action = { Redirect: { status: 302, location: form.param1 || '/' } };
-        else if (form.actionType === 'Block')        action = { Block: { status: Number(form.param1) || 403 } };
-        else                                          action = { AddHeader: { name: 'x-header', value: '' } };
-        await sendJson('/admin/rewrites', 'POST', {
-          name: form.ruleName || `${form.actionType} on ${form.pattern}`,
-          criteria, action, enabled: true,
-        });
-
-      } else if (tab === 'headers') {
-        const form = await formDialog('Add header map', [
-          { name: 'name',   label: 'Header name', placeholder: 'x-forwarded-for' },
-          { name: 'value',  label: 'Header value', placeholder: '1' },
-          { name: 'action', label: 'Action', type: 'select', value: 'Set', options: [
-            { value: 'Set',    label: 'Set  (overwrite)' },
-            { value: 'Add',    label: 'Add  (append)' },
-            { value: 'Remove', label: 'Remove header' },
-          ]},
-          { name: 'match', label: 'Host pattern  (blank = all requests)', placeholder: 'api.example.com' },
-        ]);
-        if (!form || !nonEmpty(form.name)) return;
-        await sendJson('/admin/header-maps', 'POST', {
-          id: '',
-          scope: form.match ? 'host' : 'all',
-          match: form.match || '',
-          action: form.action || 'Set',
-          name: form.name,
-          value: form.value || '',
-          enabled: true,
-        });
-
-      } else if (tab === 'mods') {
-        const form = await formDialog('Add response modification', [
-          { name: 'pattern', label: 'Request URI regex  (blank = all)', placeholder: '/api/.*' },
-          { name: 'header',  label: 'Response header to set', placeholder: 'x-modified' },
-          { name: 'value',   label: 'Header value', placeholder: '1' },
-        ]);
-        if (!form) return;
-        await sendJson('/admin/modifications', 'POST', {
-          request_uri_pattern: form.pattern || '',
-          header_replacements: form.header ? { [form.header]: form.value || '' } : {},
-          body_replacement: null,
-        });
-
-      } else if (tab === 'maplocal') {
-        const form = await formDialog('Map host to local file', [
-          { name: 'host',     label: 'Host  (exact match)', placeholder: 'api.local:8080' },
-          { name: 'filePath', label: 'File path  (relative to storage dir)', placeholder: 'mapped/response.json' },
-        ]);
-        if (!form || !nonEmpty(form.host) || !nonEmpty(form.filePath)) return;
-        await sendJson('/admin/map-local', 'POST', { host: form.host, file_path: form.filePath });
-      }
-      await load();
-    } catch (e) {
-      notifyError(`Failed to save rule: ${e.message || e}`);
-    }
-  };
-
-  const saveThrottle = async (cfg = rules.throttle) => {
+  const saveThrottle = async (cfg) => {
     try {
       await sendJson('/admin/throttling', 'POST', {
         enabled: !!cfg.enabled,
@@ -451,238 +830,55 @@ function RulesSurface() {
         bandwidth_limit_kbps: Number(cfg.downKbps) || 0,
       });
       await load();
-    } catch (e) {
-      notifyError(`Failed to save throttling: ${e.message || e}`);
-    }
+    } catch (e) { notifyError(`Failed to save throttling: ${e.message || e}`); }
   };
 
-  const setOn = (group) => async (i, v) => {
-    const row = rules[group][i];
-    if (!row || row.toggle === false) return;
-    try {
-      if (group === 'rewrites') {
-        await sendJson(`/admin/rewrites/${row.index}`, 'PUT', { ...row.raw, enabled: v });
-      } else if (group === 'headers') {
-        await sendJson(`/admin/header-maps/${encodeURIComponent(row.raw.id)}`, 'PUT', { ...row.raw, enabled: v });
-      }
-      await load();
-    } catch (e) {
-      notifyError(`Failed to update rule: ${e.message || e}`);
-    }
-  };
-
-  const editRow = async (group, i, row) => {
-    try {
-      if (group === 'routes') {
-        const form = await formDialog(`Edit route — ${row.raw.src}`, [
-          { name: 'dst', label: 'Destination base URL', value: row.raw.dst },
-        ]);
-        if (!form || !nonEmpty(form.dst)) return;
-        const current = await fetchJson('/admin/routes', {});
-        await sendJson('/admin/routes', 'POST', { ...current, [row.raw.src]: form.dst });
-
-      } else if (group === 'rewrites') {
-        const raw = row.raw;
-        const existingActionType = raw.action
-          ? (raw.action.AddHeader ? 'AddHeader' : raw.action.RemoveHeader ? 'RemoveHeader'
-            : raw.action.Redirect ? 'Redirect' : raw.action.Block ? 'Block' : 'AddHeader')
-          : 'AddHeader';
-        const existingCriteriaType = raw.criteria
-          ? (raw.criteria.Host ? 'Host' : raw.criteria.Path ? 'Path' : raw.criteria.Body ? 'Body' : 'Path')
-          : 'Path';
-        const existingCriteriaValue = criteriaValue(raw.criteria) || '';
-        const existingP1 = raw.action?.AddHeader?.name || raw.action?.RemoveHeader?.name || raw.action?.Redirect?.location || String(raw.action?.Block?.status || '') || '';
-        const existingP2 = raw.action?.AddHeader?.value || raw.action?.ReplaceHeader?.replacement || '';
-        const form = await formDialog(`Edit rewrite — ${raw.name || ''}`, [
-          { name: 'ruleName',      label: 'Rule name', value: raw.name || '' },
-          { name: 'criteriaType',  label: 'Match on', type: 'select', value: existingCriteriaType, options: [
-            { value: 'Path', label: 'Path regex' },
-            { value: 'Host', label: 'Host contains' },
-            { value: 'Body', label: 'Body regex' },
-          ]},
-          { name: 'pattern', label: 'Pattern', value: existingCriteriaValue },
-          { name: 'actionType',    label: 'Action', type: 'select', value: existingActionType, options: [
-            { value: 'AddHeader',    label: 'Add / set header' },
-            { value: 'RemoveHeader', label: 'Remove header' },
-            { value: 'Redirect',     label: 'Redirect (302)' },
-            { value: 'Block',        label: 'Block request' },
-          ]},
-          { name: 'param1', label: 'Header name  ·  Redirect URL  ·  Block status', value: existingP1 },
-          { name: 'param2', label: 'Header value  (Add / set only)', value: existingP2 },
-        ]);
-        if (!form || !nonEmpty(form.pattern)) return;
-        const criteria = { [form.criteriaType]: form.pattern };
-        let action;
-        if (form.actionType === 'AddHeader')         action = { AddHeader:    { name: form.param1 || 'x-header', value: form.param2 || '' } };
-        else if (form.actionType === 'RemoveHeader') action = { RemoveHeader: { name: form.param1 || 'x-header' } };
-        else if (form.actionType === 'Redirect')     action = { Redirect: { status: 302, location: form.param1 || '/' } };
-        else if (form.actionType === 'Block')        action = { Block: { status: Number(form.param1) || 403 } };
-        else                                          action = raw.action;
-        await sendJson(`/admin/rewrites/${row.index}`, 'PUT', {
-          ...raw, name: form.ruleName || raw.name, criteria, action,
-        });
-
-      } else if (group === 'headers') {
-        const form = await formDialog(`Edit header map — ${row.raw.name}`, [
-          { name: 'value',  label: 'Header value', value: row.raw.value || '' },
-          { name: 'action', label: 'Action', type: 'select', value: row.raw.action || 'Set', options: [
-            { value: 'Set',    label: 'Set  (overwrite)' },
-            { value: 'Add',    label: 'Add  (append)' },
-            { value: 'Remove', label: 'Remove header' },
-          ]},
-          { name: 'match', label: 'Host pattern  (blank = all)', value: row.raw.match || '' },
-        ]);
-        if (!form) return;
-        await sendJson(`/admin/header-maps/${encodeURIComponent(row.raw.id)}`, 'PUT', {
-          ...row.raw,
-          value: form.value,
-          action: form.action || row.raw.action,
-          scope: form.match ? 'host' : 'all',
-          match: form.match || '',
-        });
-
-      } else if (group === 'mods') {
-        const hdrs = row.raw.header_replacements || {};
-        const existingHeader = Object.keys(hdrs)[0] || '';
-        const existingValue = hdrs[existingHeader] || '';
-        const form = await formDialog('Edit response modification', [
-          { name: 'pattern', label: 'Request URI regex  (blank = all)', value: row.raw.request_uri_pattern || '' },
-          { name: 'header',  label: 'Response header to set', value: existingHeader },
-          { name: 'value',   label: 'Header value', value: existingValue },
-        ]);
-        if (!form) return;
-        await sendJson(`/admin/modifications/${row.index}`, 'DELETE');
-        await sendJson('/admin/modifications', 'POST', {
-          ...row.raw,
-          request_uri_pattern: form.pattern || '',
-          header_replacements: form.header ? { [form.header]: form.value || '' } : {},
-        });
-
-      } else if (group === 'mapLocal') {
-        const form = await formDialog(`Edit map-local — ${row.raw.host}`, [
-          { name: 'filePath', label: 'File path  (relative to storage dir)', value: row.raw.file_path },
-        ]);
-        if (!form || !nonEmpty(form.filePath)) return;
-        await sendJson('/admin/map-local', 'POST', { host: row.raw.host, file_path: form.filePath });
-      }
-      await load();
-    } catch (e) {
-      notifyError(`Failed to edit rule: ${e.message || e}`);
-    }
-  };
-
-  const deleteRow = async (group, i, row) => {
-    if (!await confirmAction('Delete this rule?', 'Delete', 'danger')) return;
-    try {
-      if (group === 'routes') {
-        const current = await fetchJson('/admin/routes', {});
-        delete current[row.raw.src];
-        await sendJson('/admin/routes', 'POST', current);
-      } else if (group === 'rewrites') {
-        await fetch(`/admin/rewrites/${row.index}`, { method: 'DELETE' });
-      } else if (group === 'headers') {
-        await fetch(`/admin/header-maps/${encodeURIComponent(row.raw.id)}`, { method: 'DELETE' });
-      } else if (group === 'mods') {
-        await fetch(`/admin/modifications/${row.index}`, { method: 'DELETE' });
-      } else if (group === 'mapLocal') {
-        await fetch(`/admin/map-local/${encodeURIComponent(row.raw.host)}`, { method: 'DELETE' });
-      }
-      await load();
-    } catch (e) {
-      notifyError(`Failed to delete rule: ${e.message || e}`);
-    }
+  const openAdd = () => {
+    if (tab === 'rules')     setRsEdit(null);
+    if (tab === 'mapremote') setMrEdit(null);
+    if (tab === 'maplocal')  setMlEdit(null);
+    if (tab === 'access')    setAcEdit(null);
   };
 
   const tabs = [
-    { key: 'routes',   label: 'Routes',        count: rules.routes.length },
-    { key: 'rewrites', label: 'Rewrites',      count: rules.rewrites.length },
-    { key: 'headers',  label: 'Header maps',   count: rules.headers.length },
-    { key: 'mods',     label: 'Modifications', count: rules.mods.length },
-    { key: 'maplocal', label: 'Map local',     count: rules.mapLocal.length },
-    { key: 'throttle', label: 'Throttling',    count: rules.throttle.enabled ? '●' : null },
+    { key: 'rules',     label: 'Rules',      ariaLabel: 'Rule sets', count: ruleSets.length },
+    { key: 'mapremote', label: 'Map Remote',  count: mapRemote.length },
+    { key: 'maplocal',  label: 'Map Local',   count: mapLocal.length },
+    { key: 'access',    label: 'Access',      count: access.length },
+    { key: 'throttle',  label: 'Throttling',  count: throttle.enabled ? '●' : null },
   ];
 
-  const actions = (
-    <>
-      {tab !== 'throttle' && <button className="btn primary" onClick={addRule}><span style={{fontSize:14, lineHeight:0}}>＋</span> Add rule</button>}
-    </>
+  const actions = tab !== 'throttle' && (
+    <button className="btn primary" onClick={openAdd}>
+      <span style={{ fontSize: 14, lineHeight: 0 }}>＋</span> Add rule
+    </button>
   );
 
   return (
     <SurfaceShell
       title="Rules"
-      sub="match → transform · evaluated in chain order on every proxied request"
+      sub="location-based rules evaluated in order on every proxied request"
       tabs={tabs} activeTab={tab} onTab={setTab}
       actions={actions}>
-      {tab === 'routes' && (
-        <>
-          <div style={{ padding: '12px 16px 0', fontSize: 12, color: 'var(--text-mid)' }}>Destination</div>
-          <RuleTable
-            rows={rules.routes}
-            onToggle={setOn('routes')} onEdit={(i, r) => editRow('routes', i, r)} onDelete={(i, r) => deleteRow('routes', i, r)}
-            emptyTitle="No routes configured"
-            emptyDesc="Routes redirect a source host to a different upstream. Useful for mapping api.local → http://127.0.0.1:3000 so local apps can use meaningful hostnames."
-          />
-        </>
-      )}
-      {tab === 'rewrites' && (
-        <>
-          <div style={{ padding: '12px 16px 0', fontSize: 12, color: 'var(--text-mid)' }}>Target (regex)</div>
-          <RuleTable
-            rows={rules.rewrites}
-            onToggle={setOn('rewrites')} onEdit={(i, r) => editRow('rewrites', i, r)} onDelete={(i, r) => deleteRow('rewrites', i, r)}
-            emptyTitle="No rewrite rules"
-            emptyDesc="Rewrite rules match a path, host, or body pattern and apply an action: add or remove a header, redirect, or block the request."
-          />
-        </>
-      )}
-      {tab === 'headers' && (
-        <>
-          <div style={{ padding: '12px 16px 0', fontSize: 12, color: 'var(--text-mid)' }}>Target</div>
-          <RuleTable
-            rows={rules.headers}
-            onToggle={setOn('headers')} onEdit={(i, r) => editRow('headers', i, r)} onDelete={(i, r) => deleteRow('headers', i, r)}
-            emptyTitle="No header maps"
-            emptyDesc="Header maps add, set, or remove a specific header on every request (or only those matching a host pattern). Applied before the request is forwarded."
-          />
-        </>
-      )}
-      {tab === 'mods' && (
-        <>
-          <div style={{ padding: '12px 16px 0', fontSize: 12, color: 'var(--text-mid)' }}>URI contains</div>
-          <RuleTable
-            rows={rules.mods}
-            onToggle={setOn('mods')} onEdit={(i, r) => editRow('mods', i, r)} onDelete={(i, r) => deleteRow('mods', i, r)}
-            emptyTitle="No response modifications"
-            emptyDesc="Modifications rewrite response headers or bodies for requests whose URI matches a pattern. Applied after the upstream responds."
-          />
-        </>
-      )}
-      {tab === 'maplocal' && (
-        <>
-          <div style={{ padding: '12px 16px 0', fontSize: 12, color: 'var(--text-mid)' }}>Local file</div>
-          <RuleTable
-            rows={rules.mapLocal}
-            onToggle={setOn('mapLocal')} onEdit={(i, r) => editRow('mapLocal', i, r)} onDelete={(i, r) => deleteRow('mapLocal', i, r)}
-            emptyTitle="No map-local rules"
-            emptyDesc="Map-local serves a file from the storage directory as the response for a specific host, bypassing the real upstream entirely."
-          />
-        </>
-      )}
-      {tab === 'throttle' && <ThrottleControls cfg={rules.throttle} onChange={(t) => setRules(p => ({...p, throttle: t}))} onSave={saveThrottle} />}
+      {tab === 'rules'     && <RuleSetTab     rules={ruleSets} onReload={load} editTarget={rsEdit} setEditTarget={setRsEdit} />}
+      {tab === 'mapremote' && <MapRemoteTab   rules={mapRemote} onReload={load} editTarget={mrEdit} setEditTarget={setMrEdit} />}
+      {tab === 'maplocal'  && <MapLocalTab    rules={mapLocal}  onReload={load} editTarget={mlEdit} setEditTarget={setMlEdit} />}
+      {tab === 'access'    && <AccessTab      rules={access}    onReload={load} editTarget={acEdit} setEditTarget={setAcEdit} />}
+      {tab === 'throttle'  && <ThrottleControls cfg={throttle} onChange={setThrottle} onSave={saveThrottle} />}
     </SurfaceShell>
   );
 }
 
+// ─── Throttle ───────────────────────────────────────────────────────────
+
 function ThrottleControls({ cfg, onChange, onSave }) {
   const PRESETS = [
-    { id: 'wifi',    name: 'Wifi',          latency: 2,    down: 30000 },
-    { id: '3g-fast', name: '3G fast',       latency: 80,   down: 1600 },
-    { id: '3g-slow', name: '3G slow',       latency: 200,  down: 400 },
-    { id: 'edge',    name: 'Edge / 2G',     latency: 800,  down: 240 },
+    { id: 'wifi',    name: 'Wifi',      latency: 2,   down: 30000 },
+    { id: '3g-fast', name: '3G fast',   latency: 80,  down: 1600 },
+    { id: '3g-slow', name: '3G slow',   latency: 200, down: 400 },
+    { id: 'edge',    name: 'Edge / 2G', latency: 800, down: 240 },
   ];
   const applyPreset = (p) => onChange({ ...cfg, enabled: true, preset: p.id, latency: p.latency, downKbps: p.down });
-
   return (
     <div className="throttle-card">
       <div className="head">
@@ -699,9 +895,7 @@ function ThrottleControls({ cfg, onChange, onSave }) {
         </div>
         <div className="preset-row">
           {PRESETS.map(p => (
-            <button key={p.id}
-                    className={'preset' + (cfg.preset === p.id ? ' on' : '')}
-                    onClick={() => applyPreset(p)}>{p.name}</button>
+            <button key={p.id} className={'preset' + (cfg.preset === p.id ? ' on' : '')} onClick={() => applyPreset(p)}>{p.name}</button>
           ))}
         </div>
       </div>
@@ -727,33 +921,61 @@ function ThrottleControls({ cfg, onChange, onSave }) {
 // ─── Breakpoints surface ───────────────────────────────────────────────
 const BP_INITIAL = [];
 
+// ── Breakpoint modal ────────────────────────────────────────────────────
+
+const EMPTY_BP_LOC = { host: null, path: null, port: null, protocol: null, query: null, methods: [], mode: 'glob' };
+
+function BreakpointModal({ rule, onClose, onSave }) {
+  const isNew = !rule?.id;
+  const [loc, setLoc] = React.useState(rule?.location || EMPTY_BP_LOC);
+  const [bpType, setBpType] = React.useState(rule?.bp_type || 'Request');
+  const lbl = { fontSize: 12, color: 'var(--text-faint)', whiteSpace: 'nowrap' };
+  const save = async () => {
+    try { await onSave({ location: loc, bp_type: bpType }); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  return (
+    <Modal title={isNew ? 'Add breakpoint' : 'Edit breakpoint'} onClose={onClose} onSave={save}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+        <span style={lbl}>Pause</span>
+        <select className="cmp-input" style={{ width: 'auto' }} value={bpType} onChange={e => setBpType(e.target.value)} autoFocus>
+          <option value="Request">Requests</option>
+          <option value="Response">Responses</option>
+        </select>
+        <span style={{ ...lbl, marginLeft: 6 }}>matching</span>
+      </div>
+      <LocationEditor loc={loc} onChange={setLoc} />
+    </Modal>
+  );
+}
+
 function BreakpointsSurface({ sessions, onResume, onAbort }) {
   const [bps, setBps] = React.useState(BP_INITIAL);
   const [pending, setPending] = React.useState([]);
+  const [bpEdit, setBpEdit] = React.useState(undefined); // undefined=closed, null=new, obj=editing
   const load = React.useCallback(async () => {
     const [rules, held] = await Promise.all([
       fetchJson('/admin/breakpoints', []),
       fetchJson('/admin/breakpoints/pending', []),
     ]);
-    setBps((rules || []).map(r => ({ name: r.pattern, match: r.pattern, action: r.bp_type, meta: 'regex', on: !!r.enabled, raw: r })));
+    setBps((rules || []).map(r => {
+      const loc = r.location || {};
+      const parts = [loc.host, loc.path, loc.query].filter(Boolean);
+      const match = parts.length ? parts.join(' · ') : 'any';
+      return { name: match, match, action: r.bp_type, meta: loc.mode || 'glob', on: !!r.enabled, raw: r };
+    }));
     setPending(held || []);
   }, []);
   React.useEffect(() => { load(); const id = setInterval(load, 2000); return () => clearInterval(id); }, [load]);
-  // Breakpoints queue must reflect only live backend-held requests.
-  // Falling back to historical paused sessions causes aborted items to reappear.
   const paused = pending;
 
-  const addBreakpoint = async () => {
-    const form = await formDialog('Add breakpoint', [
-      { name: 'pattern', label: 'URI/body regex (* or blank = all)', value: '.*' },
-      { name: 'bpType', label: 'Pause on', type: 'select', value: 'Request', options: [
-        { value: 'Request', label: 'Request' },
-        { value: 'Response', label: 'Response' },
-      ] },
-    ]);
-    if (!form) return;
-    const pattern = nonEmpty(form.pattern) ? form.pattern : '.*';
-    await sendJson('/admin/breakpoints', 'POST', { id: '', pattern, bp_type: form.bpType, enabled: true }).catch(e => notifyError(e.message || e));
+  const saveBp = async (data) => {
+    if (bpEdit?.id) {
+      await sendJson(`/admin/breakpoints/${encodeURIComponent(bpEdit.id)}`, 'PUT', { ...bpEdit, ...data }).catch(e => notifyError(e.message || e));
+    } else {
+      await sendJson('/admin/breakpoints', 'POST', { id: '', ...data, enabled: true }).catch(e => notifyError(e.message || e));
+    }
+    setBpEdit(undefined);
     await load();
   };
   const deleteBreakpoint = async (_i, row) => {
@@ -773,7 +995,8 @@ function BreakpointsSurface({ sessions, onResume, onAbort }) {
         await sendJson(`/admin/breakpoints/${encodeURIComponent(row.raw.id)}`, 'PUT', { ...row.raw, enabled: false }).catch(e => notifyError(e.message || e));
       }
     }
-    for (const held of pending) {
+    const heldNow = await fetchJson('/admin/breakpoints/pending', pending);
+    for (const held of heldNow || []) {
       await sendJson(`/admin/breakpoints/pending/${encodeURIComponent(held.id)}/resolve`, 'POST', { action: 'continue' }).catch(e => notifyError(e.message || e));
     }
     await load();
@@ -786,7 +1009,7 @@ function BreakpointsSurface({ sessions, onResume, onAbort }) {
   const actions = (
     <>
       <button className="btn ghost" onClick={disableAll}>Disable all</button>
-      <button className="btn primary" onClick={addBreakpoint}><span style={{fontSize:14, lineHeight:0}}>＋</span> Add breakpoint</button>
+      <button className="btn primary" onClick={() => setBpEdit(null)}><span style={{fontSize:14, lineHeight:0}}>＋</span> Add breakpoint</button>
     </>
   );
 
@@ -795,7 +1018,6 @@ function BreakpointsSurface({ sessions, onResume, onAbort }) {
       title="Breakpoints"
       sub={`${paused.length} request${paused.length === 1 ? '' : 's'} currently held · ${bps.filter(b=>b.on).length} of ${bps.length} rules active`}
       actions={actions}>
-
       <div style={{ padding: '16px 16px 8px' }}>
         <div style={{ fontSize: 10.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
           Live queue · paused requests
@@ -806,70 +1028,71 @@ function BreakpointsSurface({ sessions, onResume, onAbort }) {
         {paused.map(s => {
           const ctx = s.context?.Request || s.context?.Response || s;
           return (
-          <div key={s.id} className="qrow">
-            <span className="cell-method" data-m={ctx.method || 'GET'} style={{ fontSize: 11 }}>{ctx.method || 'RESP'}</span>
-            <span className="tag-badge bp">BP</span>
-            <div>
-              <div className="url">
-                <span className="host">{ctx.host || ''}</span><span className="path">{ctx.uri || ctx.request_uri || ''}</span>
+            <div key={s.id} className="qrow">
+              <span className="cell-method" data-m={ctx.method || 'GET'} style={{ fontSize: 11 }}>{ctx.method || 'RESP'}</span>
+              <span className="tag-badge bp">BP</span>
+              <div>
+                <div className="url">
+                  <span className="host">{ctx.host || ''}</span><span className="path">{ctx.uri || ctx.request_uri || ''}</span>
+                </div>
+                <div className="when">held by breakpoint until resumed · {s.bp_type || s.note || ''}</div>
               </div>
-              <div className="when">held by breakpoint until resumed · {s.bp_type || s.note || ''}</div>
+              <div className="acts">
+                <button className="btn sm" onClick={() => pending.length ? resolvePending(s.id, 'drop') : onAbort(s.id)}>Abort</button>
+                <button className="btn sm primary" onClick={() => pending.length ? resolvePending(s.id, 'continue') : onResume(s.id)}><Icon name="resume" size={10} /> Resume</button>
+              </div>
             </div>
-            <div className="acts">
-              <button className="btn sm" onClick={() => pending.length ? resolvePending(s.id, 'drop') : onAbort(s.id)}>Abort</button>
-              <button className="btn sm primary" onClick={() => pending.length ? resolvePending(s.id, 'continue') : onResume(s.id)}><Icon name="resume" size={10} /> Resume</button>
-            </div>
-          </div>
-        );})}
+          );
+        })}
       </div>
-
       <div style={{ padding: '20px 16px 8px' }}>
         <div style={{ fontSize: 10.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
           Breakpoint rules
         </div>
       </div>
       <RuleTable
-        headers={['Match', 'Action', 'Filter', '']}
         rows={bps}
         onToggle={toggleBreakpoint}
         onDelete={deleteBreakpoint}
       />
+      {bpEdit !== undefined && (
+        <BreakpointModal
+          rule={bpEdit}
+          onClose={() => setBpEdit(undefined)}
+          onSave={saveBp}
+        />
+      )}
     </SurfaceShell>
   );
 }
 
 // ─── Inspectors surface ────────────────────────────────────────────────
 const PLUGIN_META = {
-  capture_filter:      { icon: 'filter',    label: 'Capture Filter',     desc: 'Controls which hosts are recorded into the session log. Configure in the Capture Filter surface.',       config: '/capture-filter' },
-  routing:             { icon: 'route',     label: 'Routing',            desc: 'Redirects matching host headers to a different upstream base URL. Configure in Rules → Routes.',           config: '/rules' },
-  dns_override:        { icon: 'globe',     label: 'DNS Override',       desc: 'Resolves specific hostnames to fixed IPs before forwarding. Configure in the DNS Override surface.',        config: '/dns' },
-  throttle:            { icon: 'activity',  label: 'Throttle',           desc: 'Injects latency and clamps bandwidth on proxied responses. Configure in Rules → Throttling.',              config: '/rules' },
-  rewrite:             { icon: 'edit',      label: 'Rewrite',            desc: 'Applies header, body, redirect, and block rules matched by path, host, or body regex. Configure in Rules → Rewrites.', config: '/rules' },
-  header_map:          { icon: 'layers',    label: 'Header Map',         desc: 'Adds, sets, or removes headers on matched requests. Configure in Rules → Header maps.',                    config: '/rules' },
-  breakpoint:          { icon: 'pause',     label: 'Breakpoints',        desc: 'Pauses requests or responses matching a URI/body pattern, allowing manual inspection and editing.',          config: '/breakpoints' },
-  jwt_inspector:       { icon: 'key',       label: 'JWT Inspector',      desc: 'Decodes JWT tokens found in Authorization and cookie headers. Decoded claims appear in the session detail panel.',   config: null },
-  graphql_inspector:   { icon: 'filter',    label: 'GraphQL Inspector',  desc: 'Parses GraphQL operations from request bodies. Operation name and type shown in the session detail panel.', config: null },
-  grpc_inspector:      { icon: 'layers',    label: 'gRPC Inspector',     desc: 'Decodes gRPC frames (application/grpc). Frame type and message shown in the session detail panel.',         config: null },
-  inspection:          { icon: 'inspector', label: 'Traffic Inspector',  desc: 'Records request/response pairs to the session log and broadcasts change events via SSE.',                  config: null },
-  modification:        { icon: 'edit',      label: 'Modification',       desc: 'Replaces response headers or body for requests whose URI matches a pattern. Configure in Rules → Modifications.', config: '/rules' },
-  mock:                { icon: 'shield',    label: 'Mock Server',        desc: 'Returns synthetic responses for matching path patterns, short-circuiting the real upstream.',               config: '/mock' },
-  map_local:           { icon: 'folder',    label: 'Map Local',          desc: 'Serves a local file as the response for a specific host, bypassing the real upstream entirely.',            config: '/rules' },
-  lua:                 { icon: 'bolt',      label: 'Lua Engine',         desc: 'Runs sandboxed Lua 5.4 scripts per-request after rewrite middleware. Scripts managed in the Lua Scripts surface.', config: '/lua' },
+  AccessControlMiddleware:   { icon: 'shield',    label: 'Access Control',     desc: 'Blocks or allows requests based on Location rules (host, path, method). Block rules 403 on match; Allow rules create an allowlist.', config: '/rules' },
+  CaptureFilterMiddleware:   { icon: 'filter',    label: 'Capture Filter',     desc: 'Controls which hosts are recorded into the session log. Configure in the Capture Filter surface.',         config: '/capture-filter' },
+  DnsOverrideMiddleware:     { icon: 'globe',     label: 'DNS Override',       desc: 'Resolves specific hostnames to fixed IPs before forwarding. Configure in the DNS Override surface.',         config: '/dns' },
+  MapRemoteMiddleware:       { icon: 'route',     label: 'Map Remote',         desc: 'Routes matching requests to a different upstream origin. Path and query string are preserved. Configure in Rules → Map Remote.',  config: '/rules' },
+  ThrottlingMiddleware:      { icon: 'activity',  label: 'Throttle',           desc: 'Injects latency and clamps bandwidth on proxied responses. Configure in Rules → Throttling.',               config: '/rules' },
+  UnifiedRewriteMiddleware:  { icon: 'edit',      label: 'Rewrite Rules',      desc: 'Applies Location-matched rule sets: set/remove headers, redirect, block, rewrite host/path/query, and more.', config: '/rules' },
+  BreakpointMiddleware:      { icon: 'pause',     label: 'Breakpoints',        desc: 'Pauses requests or responses matching a pattern, allowing manual inspection and editing before forwarding.', config: '/breakpoints' },
+  JwtInspectorMiddleware:    { icon: 'key',       label: 'JWT Inspector',      desc: 'Decodes JWT tokens in Authorization and cookie headers. Decoded claims appear in the session detail panel.', config: null },
+  GraphQLInspectorMiddleware:{ icon: 'filter',    label: 'GraphQL Inspector',  desc: 'Parses GraphQL operations from request bodies. Operation name and type shown in the session detail panel.',  config: null },
+  GrpcInspectorMiddleware:   { icon: 'layers',    label: 'gRPC Inspector',     desc: 'Decodes gRPC frames (application/grpc). Frame type and message shown in the session detail panel.',          config: null },
+  InspectionMiddleware:      { icon: 'inspector', label: 'Traffic Inspector',  desc: 'Records request/response pairs to the session log and broadcasts change events via SSE.',                   config: null },
+  MapLocalMiddleware:        { icon: 'folder',    label: 'Map Local',          desc: 'Serves local files as responses for matching requests, bypassing the upstream. Configure in Rules → Map Local.', config: '/rules' },
+  MockMiddleware:            { icon: 'shield',    label: 'Mock Server',        desc: 'Returns synthetic responses for matching path patterns, short-circuiting the real upstream.',                config: '/mock' },
+  LuaEngineMiddleware:       { icon: 'bolt',      label: 'Lua Engine',         desc: 'Runs sandboxed Lua 5.4 scripts per-request. Scripts managed in the Lua Scripts surface.',                   config: '/lua' },
 };
 
 function InspectorsSurface() {
   const [plugins, setPlugins] = React.useState([]);
   React.useEffect(() => {
-    fetchJson('/admin/plugins', { plugins: [] }).then(data => {
-      setPlugins(data.plugins || []);
-    });
+    fetchJson('/admin/plugins', { plugins: [] }).then(data => setPlugins(data.plugins || []));
   }, []);
 
   return (
     <SurfaceShell title="Inspectors" sub={`${plugins.length} middleware plugins active in proxy chain`}>
-      {plugins.length === 0 && (
-        <div className="empty">No inspector plugins registered.</div>
-      )}
+      {plugins.length === 0 && <div className="empty">No inspector plugins registered.</div>}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 12, padding: 16 }}>
         {plugins.map(name => {
           const meta = PLUGIN_META[name] || { icon: 'inspector', label: name, desc: 'Active in the proxy middleware chain.', config: null };
@@ -899,12 +1122,8 @@ async function computeCertFingerprint(pemText) {
     const b64 = pemText.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
     const der = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
     const hash = await crypto.subtle.digest('SHA-256', der);
-    return Array.from(new Uint8Array(hash))
-      .map(b => b.toString(16).padStart(2, '0').toUpperCase())
-      .join(':');
-  } catch {
-    return null;
-  }
+    return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
+  } catch { return null; }
 }
 
 // ─── Root CA surface ───────────────────────────────────────────────────
@@ -924,11 +1143,7 @@ function CertSurface() {
     <SurfaceShell
       title="Root CA"
       sub="HTTPS interception relies on a CA your client trusts"
-      actions={
-        <>
-          <a className="btn ghost" href="/setup" target="_blank" rel="noopener">Client setup guide</a>
-        </>
-      }>
+      actions={<a className="btn ghost" href="/setup" target="_blank" rel="noopener">Client setup guide</a>}>
       <div className="ca-grid">
         <div>
           <div className="ca-card">

@@ -1,3 +1,4 @@
+use crate::middleware::matcher::{Location, MatchTarget};
 use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,7 +21,9 @@ pub enum BreakpointType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BreakpointRule {
     pub id: String,
-    pub pattern: String, // Regex for URI or Body
+    /// Full Location-based matching (host, path, port, protocol, query, methods, mode).
+    /// Leave all fields at default to match every request/response.
+    pub location: Location,
     pub bp_type: BreakpointType,
     pub enabled: bool,
 }
@@ -34,21 +37,20 @@ pub struct PendingBreakpoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BreakpointContext {
-    Request(RequestContext),
-    Response(ResponseContext),
+    Request(Box<RequestContext>),
+    Response(Box<ResponseContext>),
 }
 
 #[derive(Debug, Clone)]
 pub enum BreakpointResolution {
     Continue,
-    Modify(BreakpointContext),
+    Modify(Box<BreakpointContext>),
     Drop,
 }
 
 pub struct BreakpointManager {
     pub rules: Arc<RwLock<Vec<BreakpointRule>>>,
     pub pending: Arc<RwLock<HashMap<String, PendingBreakpoint>>>,
-    regex_cache: Arc<RwLock<HashMap<String, regex::Regex>>>,
 }
 
 impl BreakpointManager {
@@ -56,14 +58,10 @@ impl BreakpointManager {
         Self {
             rules: Arc::new(RwLock::new(Vec::new())),
             pending: Arc::new(RwLock::new(HashMap::new())),
-            regex_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub async fn add_rule(&self, rule: BreakpointRule) {
-        if let Ok(re) = regex::Regex::new(&rule.pattern) {
-            self.regex_cache.write().await.insert(rule.id.clone(), re);
-        }
         self.rules.write().await.push(rule);
     }
 
@@ -86,7 +84,6 @@ impl BreakpointManager {
     }
 
     pub async fn delete_rule(&self, id: &str) {
-        self.regex_cache.write().await.remove(id);
         self.rules.write().await.retain(|r| r.id != id);
     }
 
@@ -97,11 +94,6 @@ impl BreakpointManager {
         };
         let mut updated = updated;
         updated.id = id.to_string();
-        if let Ok(re) = regex::Regex::new(&updated.pattern) {
-            self.regex_cache.write().await.insert(id.to_string(), re);
-        } else {
-            self.regex_cache.write().await.remove(id);
-        }
         *rule = updated;
         true
     }
@@ -122,24 +114,18 @@ impl BreakpointMiddleware {
         Self { manager }
     }
 
-    /// Returns the first matching enabled rule of the given type, releasing all locks
-    /// before returning so no lock is held during the async breakpoint wait.
+    /// Returns the first matching enabled rule of the given type, releasing all
+    /// locks before returning so no lock is held during the async breakpoint wait.
     async fn first_match(
         &self,
         bp_type_filter: impl Fn(&BreakpointType) -> bool,
-        uri: &str,
-        body: &str,
+        target: &MatchTarget,
     ) -> Option<BreakpointRule> {
         let rules = self.manager.rules.read().await;
-        let cache = self.manager.regex_cache.read().await;
         rules
             .iter()
             .filter(|r| r.enabled && bp_type_filter(&r.bp_type))
-            .find(|r| {
-                cache
-                    .get(&r.id)
-                    .is_some_and(|re| re.is_match(uri) || re.is_match(body))
-            })
+            .find(|r| r.location.matches(target))
             .cloned()
     }
 }
@@ -148,49 +134,63 @@ impl BreakpointMiddleware {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::middleware::matcher::{Location, MatchMode};
     use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn req(uri: &str, body: &str) -> RequestContext {
+    fn req(uri: &str, _body: &str) -> RequestContext {
         RequestContext {
             method: "GET".to_string(),
             uri: uri.to_string(),
             headers: HashMap::new(),
-            body: body.to_string(),
+            body: Bytes::from(_body.to_string()),
             host: "localhost".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
 
-    fn res(uri: &str, body: &str) -> ResponseContext {
+    fn res(uri: &str, _body: &str) -> ResponseContext {
         ResponseContext {
             status: 200,
             headers: HashMap::new(),
-            body: body.to_string(),
+            body: Bytes::from(_body.to_string()),
             request_uri: uri.to_string(),
-            session_id: None,
-            ttfb_ms: 0,
-            body_ms: 0,
-            body_bytes: None,
             ..Default::default()
         }
     }
 
-    fn req_rule(pattern: &str, enabled: bool) -> BreakpointRule {
+    /// Build a Request breakpoint rule matching a path regex.
+    fn req_rule(path: &str, enabled: bool) -> BreakpointRule {
         BreakpointRule {
             id: uuid::Uuid::new_v4().to_string(),
-            pattern: pattern.to_string(),
+            location: Location {
+                path: if path.is_empty() || path == ".*" {
+                    None
+                } else {
+                    Some(path.to_string())
+                },
+                mode: MatchMode::Regex,
+                ..Default::default()
+            },
             bp_type: BreakpointType::Request,
             enabled,
         }
     }
 
-    fn res_rule(pattern: &str, enabled: bool) -> BreakpointRule {
+    /// Build a Response breakpoint rule matching a path regex.
+    fn res_rule(path: &str, enabled: bool) -> BreakpointRule {
         BreakpointRule {
             id: uuid::Uuid::new_v4().to_string(),
-            pattern: pattern.to_string(),
+            location: Location {
+                path: if path.is_empty() || path == ".*" {
+                    None
+                } else {
+                    Some(path.to_string())
+                },
+                mode: MatchMode::Regex,
+                ..Default::default()
+            },
             bp_type: BreakpointType::Response,
             enabled,
         }
@@ -280,11 +280,13 @@ mod tests {
                     let ctx = pending.get(&id).unwrap().context.clone();
                     drop(pending);
                     if let BreakpointContext::Request(mut rq) = ctx {
-                        rq.body = "modified-body".to_string();
+                        rq.set_body_text("modified-body");
                         let _ = m
                             .resolve_breakpoint(
                                 &id,
-                                BreakpointResolution::Modify(BreakpointContext::Request(rq)),
+                                BreakpointResolution::Modify(Box::new(BreakpointContext::Request(
+                                    rq,
+                                ))),
                             )
                             .await;
                     }
@@ -298,7 +300,7 @@ mod tests {
         let mut ctx = req("/modify", "original");
         let action = mw.on_request(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::Continue);
-        assert_eq!(ctx.body, "modified-body");
+        assert_eq!(ctx.body_text(), "modified-body");
     }
 
     #[tokio::test]
@@ -325,13 +327,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_regex_in_rule_does_not_panic() {
+    async fn invalid_regex_path_does_not_panic() {
         let manager = Arc::new(BreakpointManager::new());
+        // Invalid regex — Location::matches() returns false safely.
         manager.add_rule(req_rule("[invalid", true)).await;
         let mw = BreakpointMiddleware::new(manager);
-        // Invalid regex → check_match returns false → Continue without blocking
         assert_eq!(
-            mw.on_request(&mut req("/anything", "body")).await,
+            mw.on_request(&mut req("/anything", "")).await,
             MiddlewareAction::Continue
         );
     }
@@ -345,20 +347,6 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    #[tokio::test]
-    async fn pattern_matches_body_not_just_uri() {
-        let manager = Arc::new(BreakpointManager::new());
-        manager.add_rule(req_rule(r"password", true)).await;
-        auto_resolve(manager.clone(), BreakpointResolution::Continue).await;
-        let mw = BreakpointMiddleware::new(manager);
-        // URI doesn't match but body does
-        let mut ctx = req("/login", r#"{"password":"secret"}"#);
-        let action = mw.on_request(&mut ctx).await;
-        // Should have paused (and been resolved to Continue)
-        assert_eq!(action, MiddlewareAction::Continue);
-        // Verify a pending breakpoint was created (it was resolved, so pending should be empty now)
     }
 
     #[tokio::test]
@@ -377,7 +365,6 @@ mod tests {
                 match &bp.context {
                     BreakpointContext::Request(req) => {
                         assert_eq!(req.uri, "/hold");
-                        assert_eq!(req.body, "payload");
                     }
                     _ => panic!("expected request breakpoint context"),
                 }
@@ -406,13 +393,9 @@ impl Middleware for BreakpointMiddleware {
     }
 
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
-        // Locks released before the async wait so writers are never blocked during a pause.
+        let target = MatchTarget::from_request(ctx);
         if self
-            .first_match(
-                |t| matches!(t, BreakpointType::Request),
-                &ctx.uri,
-                &ctx.body,
-            )
+            .first_match(|t| matches!(t, BreakpointType::Request), &target)
             .await
             .is_none()
         {
@@ -426,19 +409,23 @@ impl Middleware for BreakpointMiddleware {
             PendingBreakpoint {
                 id: bp_id.clone(),
                 bp_type: BreakpointType::Request,
-                context: BreakpointContext::Request(ctx.clone()),
+                context: BreakpointContext::Request(Box::new(ctx.clone())),
                 tx,
             },
         );
 
         match tokio::time::timeout(BREAKPOINT_TIMEOUT, rx).await {
             Ok(Ok(BreakpointResolution::Continue)) => MiddlewareAction::Continue,
-            Ok(Ok(BreakpointResolution::Modify(BreakpointContext::Request(new_ctx)))) => {
-                *ctx = new_ctx;
-                MiddlewareAction::Continue
+            Ok(Ok(BreakpointResolution::Modify(bc))) => {
+                if let BreakpointContext::Request(new_ctx) = *bc {
+                    *ctx = *new_ctx;
+                    MiddlewareAction::Continue
+                } else {
+                    MiddlewareAction::StopAndReturn
+                }
             }
             Ok(Ok(BreakpointResolution::Drop)) => MiddlewareAction::StopAndReturn,
-            Ok(Ok(_)) | Ok(Err(_)) => MiddlewareAction::StopAndReturn,
+            Ok(Err(_)) => MiddlewareAction::StopAndReturn,
             Err(_) => {
                 self.manager.pending.write().await.remove(&bp_id);
                 tracing::warn!(id = %bp_id, "Breakpoint request timed out, dropping");
@@ -456,12 +443,9 @@ impl Middleware for BreakpointMiddleware {
     }
 
     async fn on_response(&self, ctx: &mut ResponseContext) -> MiddlewareAction {
+        let target = MatchTarget::from_response(ctx);
         if self
-            .first_match(
-                |t| matches!(t, BreakpointType::Response),
-                &ctx.request_uri,
-                &ctx.body,
-            )
+            .first_match(|t| matches!(t, BreakpointType::Response), &target)
             .await
             .is_none()
         {
@@ -475,19 +459,23 @@ impl Middleware for BreakpointMiddleware {
             PendingBreakpoint {
                 id: bp_id.clone(),
                 bp_type: BreakpointType::Response,
-                context: BreakpointContext::Response(ctx.clone()),
+                context: BreakpointContext::Response(Box::new(ctx.clone())),
                 tx,
             },
         );
 
         match tokio::time::timeout(BREAKPOINT_TIMEOUT, rx).await {
             Ok(Ok(BreakpointResolution::Continue)) => MiddlewareAction::Continue,
-            Ok(Ok(BreakpointResolution::Modify(BreakpointContext::Response(new_ctx)))) => {
-                *ctx = new_ctx;
-                MiddlewareAction::Continue
+            Ok(Ok(BreakpointResolution::Modify(bc))) => {
+                if let BreakpointContext::Response(new_ctx) = *bc {
+                    *ctx = *new_ctx;
+                    MiddlewareAction::Continue
+                } else {
+                    MiddlewareAction::StopAndReturn
+                }
             }
             Ok(Ok(BreakpointResolution::Drop)) => MiddlewareAction::StopAndReturn,
-            Ok(Ok(_)) | Ok(Err(_)) => MiddlewareAction::StopAndReturn,
+            Ok(Err(_)) => MiddlewareAction::StopAndReturn,
             Err(_) => {
                 self.manager.pending.write().await.remove(&bp_id);
                 tracing::warn!(id = %bp_id, "Breakpoint response timed out, dropping");

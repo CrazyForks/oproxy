@@ -409,6 +409,13 @@ function App() {
   const [detailById, setDetailById] = React.useState({});
   const mainRef = React.useRef(null);
   const [splitSize, setSplitSize] = React.useState({ detailW: 560, detailH: 360 });
+  const lastFetchRef = React.useRef(null);    // Date of last full or incremental session fetch
+  const sessionsRef = React.useRef([]);        // always-current sessions array (no stale closure)
+  const selectedIdRef = React.useRef(null);    // always-current selectedId
+  const [detailVersion, setDetailVersion] = React.useState(0); // bumped to force detail re-fetch
+  // Keep refs in sync on every render (standard "latest-value ref" pattern).
+  sessionsRef.current = sessions;
+  selectedIdRef.current = selectedId;
 
   const loadSessions = React.useCallback(async () => {
     try {
@@ -416,6 +423,7 @@ function App() {
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       const live = (data.sessions || []).map((s, i) => adaptExchange(s, i));
+      lastFetchRef.current = new Date();
       setSessionsError(null);
       setSessions(live);
       setSelectedId(prev => prev && live.some(s => s.id === prev) ? prev : live[0]?.id || null);
@@ -426,6 +434,48 @@ function App() {
       setSelectedId(null);
     }
   }, []);
+
+  const fetchIncremental = React.useCallback(async () => {
+    if (!lastFetchRef.current) { loadSessions(); return; }
+    const since = new Date(lastFetchRef.current.getTime() - 2000);
+    try {
+      const params = new URLSearchParams({ since: since.toISOString(), limit: String(SESSION_LIST_LIMIT) });
+      const res = await fetch(`/api/sessions?${params}`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      lastFetchRef.current = new Date();
+      const updated = data.sessions || [];
+      if (updated.length === 0) return;
+      setSessions(prev => {
+        const idxMap = new Map(prev.map((s, i) => [s.id, i]));
+        const next = [...prev];
+        for (const ex of updated) {
+          const existingIdx = idxMap.get(ex.id) ?? -1;
+          const adapted = adaptExchange(ex, existingIdx >= 0 ? existingIdx : next.length);
+          if (existingIdx >= 0) {
+            next[existingIdx] = adapted;
+          } else {
+            if (next.length >= SESSION_LIST_LIMIT) next.shift();
+            next.push(adapted);
+          }
+        }
+        return next;
+      });
+      // Invalidate detail cache for updated sessions so the panel gets fresh data.
+      setDetailById(prev => {
+        const next = { ...prev };
+        for (const ex of updated) delete next[ex.id];
+        return next;
+      });
+      // If the currently-selected session was updated, bump version to re-fetch its detail.
+      if (updated.some(ex => ex.id === selectedIdRef.current)) {
+        setDetailVersion(v => v + 1);
+      }
+    } catch (err) {
+      console.warn('Incremental fetch failed, falling back to full reload', err);
+      loadSessions();
+    }
+  }, [loadSessions]);
 
   React.useEffect(() => {
     loadSessions();
@@ -439,7 +489,7 @@ function App() {
         const res = await fetch(`/api/sessions/${encodeURIComponent(selectedId)}`);
         if (!res.ok) throw new Error(await res.text());
         const data = await res.json();
-        const summary = sessions.find(s => s.id === selectedId);
+        const summary = sessionsRef.current.find(s => s.id === selectedId);
         const detail = adaptExchange(data.exchange, Math.max(0, (summary?.idx || 1) - 1));
         if (!cancelled) {
           setDetailById(prev => ({
@@ -452,7 +502,7 @@ function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [selectedId, sessions]);
+  }, [selectedId, detailVersion]);
 
   const loadRuntime = React.useCallback(async () => {
     const [config, throttle, socks5, caText, pendingBreakpoints] = await Promise.all([
@@ -484,9 +534,59 @@ function App() {
 
   React.useEffect(() => {
     if (!liveRefresh) return;
-    const id = setInterval(loadSessions, 1800);
-    return () => clearInterval(id);
-  }, [liveRefresh, loadSessions]);
+    let es = null;
+    let debounceTimer = null;
+    let watchdogTimer = null;
+
+    const scheduleIncremental = () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(fetchIncremental, 150);
+    };
+
+    function connect() {
+      if (es) { es.close(); es = null; }
+      es = new EventSource('/api/sessions/stream');
+      clearTimeout(watchdogTimer);
+      // Server sends keep-alive pings every 15 s; reconnect if silent for 35 s.
+      watchdogTimer = setTimeout(connect, 35000);
+
+      es.onmessage = (e) => {
+        clearTimeout(watchdogTimer);
+        watchdogTimer = setTimeout(connect, 35000);
+        try {
+          const ev = JSON.parse(e.data);
+          if (ev.kind === 'sessions_cleared') {
+            clearTimeout(debounceTimer);
+            setSessions([]);
+            setDetailById({});
+            setSelectedId(null);
+            lastFetchRef.current = new Date();
+          } else if (ev.kind === 'sessions_imported' || ev.kind === 'reload') {
+            clearTimeout(debounceTimer);
+            loadSessions();
+          } else {
+            scheduleIncremental();
+          }
+        } catch {
+          scheduleIncremental();
+        }
+      };
+
+      es.onerror = () => {
+        clearTimeout(watchdogTimer);
+        if (es) { es.close(); es = null; }
+        watchdogTimer = setTimeout(connect, 3000);
+      };
+    }
+
+    connect();
+
+    return () => {
+      clearTimeout(debounceTimer);
+      clearTimeout(watchdogTimer);
+      if (es) { es.close(); es = null; }
+    };
+  }, [liveRefresh, fetchIncremental, loadSessions]);
 
   const toggleMethod = (m) => {
     setMethodFilter(prev => {

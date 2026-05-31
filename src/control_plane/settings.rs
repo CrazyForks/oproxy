@@ -23,7 +23,9 @@ pub(super) async fn reload_config(
             &storage::HotConfig {
                 max_body_bytes: Some(v),
             },
-        ) {
+        )
+        .await
+        {
             return storage_error_response(e);
         }
         v
@@ -112,7 +114,7 @@ pub(super) async fn set_upstream_proxy_handler(
         )
             .into_response();
     }
-    if let Err(e) = storage::save_upstream_proxy(&state.storage_path, &url) {
+    if let Err(e) = storage::save_upstream_proxy(&state.storage_path, &url).await {
         return storage_error_response(e);
     }
     state.proxy_engine.set_upstream_proxy(url.as_deref()).await;

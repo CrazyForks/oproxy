@@ -20,6 +20,10 @@ impl Middleware for InspectionMiddleware {
     }
 
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
+        if ctx.session_id.is_some() {
+            return MiddlewareAction::Continue;
+        }
+
         // CaptureFilterMiddleware signals "don't record this host" via a typed flag.
         if ctx.skip_recording {
             return MiddlewareAction::Continue;
@@ -58,13 +62,19 @@ impl Middleware for InspectionMiddleware {
         };
 
         if let Some(session) = session {
+            if session.response.is_some() {
+                return MiddlewareAction::Continue;
+            }
+
             let latency_ms = (chrono::Utc::now() - session.timestamp).num_milliseconds() as u64;
-            let response_size_bytes = ctx
-                .body_bytes
-                .as_ref()
-                .map(|bytes| bytes.len())
-                .or_else(|| content_length(&ctx.headers))
-                .unwrap_or(ctx.body.len());
+            // `body` is now the canonical decoded bytes, so its length is the real
+            // response size. Fall back to Content-Length only when the body wasn't
+            // buffered (e.g. streamed responses leave it empty).
+            let response_size_bytes = if ctx.body.is_empty() {
+                content_length(&ctx.headers).unwrap_or(0)
+            } else {
+                ctx.body.len()
+            };
             let metrics = crate::session::InspectionMetrics {
                 latency_ms,
                 request_size_bytes: session.request.body.len(),
@@ -87,7 +97,8 @@ impl Middleware for InspectionMiddleware {
                     }
                 }
                 self.session_manager
-                    .annotate(&session.id, None, Some(merged));
+                    .annotate(&session.id, None, Some(merged))
+                    .await;
             }
         }
 
@@ -122,9 +133,8 @@ mod tests {
             method: "GET".to_string(),
             uri: uri.to_string(),
             headers: HashMap::new(),
-            body: "body12345".to_string(),
+            body: bytes::Bytes::from_static(b"body12345"),
             host: "localhost".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -133,12 +143,8 @@ mod tests {
         ResponseContext {
             status,
             headers: HashMap::new(),
-            body: body.to_string(),
+            body: bytes::Bytes::from(body.to_string()),
             request_uri: uri.to_string(),
-            session_id: None,
-            ttfb_ms: 0,
-            body_ms: 0,
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -149,6 +155,7 @@ mod tests {
         let mw = InspectionMiddleware::new(sm.clone());
         let mut ctx = req("/test");
         mw.on_request(&mut ctx).await;
+        sm.flush().await;
         assert_eq!(sm.get_all_sessions().len(), 1);
     }
 
@@ -162,6 +169,7 @@ mod tests {
             "https://example.com".to_string(),
         );
         mw.on_request(&mut ctx).await;
+        sm.flush().await;
         let ex = sm.get_all_sessions().pop().unwrap();
         assert!(!ex.request.headers.contains_key("x-oproxy-session-id"));
         assert!(!ex.request.headers.contains_key("x-oproxy-destination"));
@@ -197,8 +205,10 @@ mod tests {
         let mw = InspectionMiddleware::new(sm.clone());
         let mut rq = req("/check");
         mw.on_request(&mut rq).await;
+        sm.flush().await;
         let mut rs = res("/check", 201, "resp-body");
         mw.on_response(&mut rs).await;
+        sm.flush().await;
         let sessions = sm.get_all_sessions();
         let m = sessions[0]
             .metrics
@@ -213,8 +223,10 @@ mod tests {
         let mw = InspectionMiddleware::new(sm.clone());
         let mut rq = req("/sizes");
         mw.on_request(&mut rq).await;
+        sm.flush().await;
         let mut rs = res("/sizes", 200, "response-payload");
         mw.on_response(&mut rs).await;
+        sm.flush().await;
         let sessions = sm.get_all_sessions();
         let m = sessions[0].metrics.as_ref().unwrap();
         assert_eq!(m.request_size_bytes, "body12345".len());
@@ -227,9 +239,11 @@ mod tests {
         let mw = InspectionMiddleware::new(sm.clone());
         let mut rq = req("/binary");
         mw.on_request(&mut rq).await;
-        let mut rs = res("/binary", 200, "AQIDBA==");
-        rs.body_bytes = Some(bytes::Bytes::from_static(&[1, 2, 3, 4]));
+        sm.flush().await;
+        let mut rs = res("/binary", 200, "");
+        rs.body = bytes::Bytes::from_static(&[1, 2, 3, 4]);
         mw.on_response(&mut rs).await;
+        sm.flush().await;
         let sessions = sm.get_all_sessions();
         let m = sessions[0].metrics.as_ref().unwrap();
         assert_eq!(m.response_size_bytes, 4);
@@ -241,10 +255,12 @@ mod tests {
         let mw = InspectionMiddleware::new(sm.clone());
         let mut rq = req("/large");
         mw.on_request(&mut rq).await;
+        sm.flush().await;
         let mut rs = res("/large", 200, "");
         rs.headers
             .insert("Content-Length".to_string(), "614400".to_string());
         mw.on_response(&mut rs).await;
+        sm.flush().await;
         let sessions = sm.get_all_sessions();
         let m = sessions[0].metrics.as_ref().unwrap();
         assert_eq!(m.response_size_bytes, 614400);
@@ -256,12 +272,14 @@ mod tests {
         let mw = InspectionMiddleware::new(sm.clone());
         let mut rq = req("/mocked");
         mw.on_request(&mut rq).await;
+        sm.flush().await;
         let session_id = rq.session_id.clone().unwrap();
         let mut rs = res("/mocked", 200, "ok");
         rs.session_id = Some(session_id.clone());
         rs.tags = vec!["mock".to_string(), "replay".to_string()];
 
         mw.on_response(&mut rs).await;
+        sm.flush().await;
 
         let ex = sm.get_session(&session_id).unwrap();
         assert_eq!(ex.tags, vec!["mock".to_string(), "replay".to_string()]);
@@ -273,6 +291,7 @@ mod tests {
         let mw = InspectionMiddleware::new(sm.clone());
         let mut rq = req("/test");
         mw.on_request(&mut rq).await;
+        sm.flush().await;
         let mut rs = res("/test", 200, "");
         assert_eq!(mw.on_response(&mut rs).await, MiddlewareAction::Continue);
     }
@@ -284,6 +303,7 @@ mod tests {
         let mut ctx = req("/filtered");
         ctx.skip_recording = true;
         let action = mw.on_request(&mut ctx).await;
+        sm.flush().await;
         assert_eq!(action, MiddlewareAction::Continue);
         assert!(
             sm.get_all_sessions().is_empty(),
@@ -298,6 +318,7 @@ mod tests {
         let mut rs = res("/orphan", 200, "body");
         // Must not panic, sessions store must remain empty
         let action = mw.on_response(&mut rs).await;
+        sm.flush().await;
         assert_eq!(action, MiddlewareAction::Continue);
         assert!(sm.get_all_sessions().is_empty());
     }

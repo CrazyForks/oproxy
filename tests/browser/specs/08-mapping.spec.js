@@ -2,58 +2,77 @@
 const { test, expect } = require('@playwright/test');
 const { gotoRail } = require('./helpers');
 
-test.describe('Rules / routes and maps', () => {
+const location = (overrides = {}) => ({
+  host: null,
+  path: null,
+  port: null,
+  protocol: null,
+  query: null,
+  methods: [],
+  mode: 'glob',
+  ...overrides,
+});
+
+test.describe('Rules / mapping and access', () => {
   test.afterEach(async ({ request }) => {
-    const routes = await (await request.get('/admin/routes')).json();
-    let routesChanged = false;
-    for (const key of Object.keys(routes)) {
-      if (key.startsWith('ui-route-')) {
-        delete routes[key];
-        routesChanged = true;
+    for (const endpoint of ['map-remote-rules', 'map-local-rules', 'access-rules']) {
+      const rules = await (await request.get(`/admin/${endpoint}`)).json();
+      for (const rule of rules) {
+        if (String(rule.name || '').startsWith('ui-')) {
+          await request.delete(`/admin/${endpoint}/${rule.id}`);
+        }
       }
     }
-    if (routes['old.example.com']) {
-      delete routes['old.example.com'];
-      routesChanged = true;
-    }
-    if (routesChanged) await request.post('/admin/routes', { data: routes });
-    const headers = await (await request.get('/admin/header-maps')).json();
-    for (const h of headers) {
-      if (h.name === 'X-Test') await request.delete(`/admin/header-maps/${h.id}`);
-    }
   });
 
-  test('routes tab is active by default', async ({ page }) => {
+  test('rule sets tab is active by default', async ({ page }) => {
     await gotoRail(page, 'Rules');
-    await expect(page.getByRole('button', { name: /Routes/ })).toHaveClass(/on/);
-    await expect(page.getByText('Destination')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Rule sets', exact: true })).toHaveClass(/on/);
+    await expect(page.getByText('Rule sets match by location')).toBeVisible();
   });
 
-  test('can add a host route via API and see it', async ({ request, page }) => {
+  test('can add a Map Remote rule via API and see it', async ({ request, page }) => {
     const host = `ui-route-${Date.now()}.example.com`;
-    const existing = await (await request.get('/admin/routes')).json();
-    existing[host] = 'http://new.example.com';
-    await request.post('/admin/routes', { data: existing });
+    const res = await request.post('/admin/map-remote-rules', {
+      data: {
+        id: '',
+        name: 'ui-map-remote',
+        enabled: true,
+        location: location({ host }),
+        destination: 'http://new.example.com',
+      },
+    });
+    expect(res.ok()).toBeTruthy();
 
     await gotoRail(page, 'Rules');
+    await page.getByRole('button', { name: 'Map Remote', exact: true }).click();
     await expect(page.locator('.col-match').filter({ hasText: host })).toBeVisible();
     await expect(page.getByText('http://new.example.com')).toBeVisible();
   });
 
-  test('header maps and map local tabs switch view', async ({ page }) => {
+  test('Map Local and Access tabs switch view', async ({ page }) => {
     await gotoRail(page, 'Rules');
-    await page.getByRole('button', { name: /Header maps/ }).click();
-    await expect(page.getByText('Target')).toBeVisible();
-    await page.getByRole('button', { name: /Map local/ }).click();
-    await expect(page.getByText('Local file')).toBeVisible();
+    await page.getByRole('button', { name: 'Map Local', exact: true }).click();
+    await expect(page.getByText('No Map Local rules')).toBeVisible();
+    await page.getByRole('button', { name: 'Access', exact: true }).click();
+    await expect(page.getByText('Block rules 403 matching requests.')).toBeVisible();
   });
 
-  test('add header map rule via API appears in UI', async ({ request, page }) => {
-    await request.post('/admin/header-maps', {
-      data: { id: '', name: 'X-Test', enabled: true, scope: 'all', match: '.*', action: 'Set', value: 'hello' },
+  test('add Access rule via API appears in UI', async ({ request, page }) => {
+    const res = await request.post('/admin/access-rules', {
+      data: {
+        id: '',
+        name: 'ui-access-block',
+        enabled: true,
+        location: location({ host: 'blocked.example.com' }),
+        action: 'block',
+      },
     });
+    expect(res.ok()).toBeTruthy();
+
     await gotoRail(page, 'Rules');
-    await page.getByRole('button', { name: /Header maps/ }).click();
-    await expect(page.getByText('Set X-Test: hello')).toBeVisible();
+    await page.getByRole('button', { name: 'Access', exact: true }).click();
+    await expect(page.getByText('blocked.example.com')).toBeVisible();
+    await expect(page.locator('.rule-row', { hasText: 'blocked.example.com' }).getByText('BLOCK', { exact: true })).toBeVisible();
   });
 });

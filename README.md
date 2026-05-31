@@ -53,19 +53,20 @@ The included `docker-compose.yml` publishes:
 Requirements:
 
 - Rust 1.85 or newer
-- Node.js 22 or newer
+- Node.js 22.12 or newer
 
 ```bash
 git clone https://github.com/sauravrao637/oproxy.git
 cd oproxy
-npm install --prefix src/design
-npm run build --prefix src/design
+corepack enable
+yarn --cwd src/design install --frozen-lockfile
+yarn --cwd src/design build
 cargo run --release
 ```
 
 Open `http://127.0.0.1:8080`.
 
-Rust serves the built UI from `src/design/dist`. If the UI is blank or stale while developing, rebuild it with `npm run build --prefix src/design`.
+Rust serves the built UI from `src/design/dist`. If the UI is blank or stale while developing, rebuild it with `yarn --cwd src/design build`.
 
 ## Connecting Clients
 
@@ -266,11 +267,14 @@ Set `OPROXY_ADMIN_TOKEN` to require a shared secret for control-plane routes. Se
 | `/admin/sessions/export/har?raw=true` | `GET` | Export raw HAR |
 | `/admin/sessions/import/har?merge=false` | `POST` | Import HAR, optionally replacing the current session log |
 | `/admin/forward` | `POST` | Send a composed/replayed request |
-| `/admin/routes` | `GET/POST` | Routing rules |
-| `/admin/rewrites` | `GET/POST` | Rewrite rules |
-| `/admin/header-maps` | `GET/POST` | Header map rules |
-| `/admin/modifications` | `GET/POST` | Request modification rules |
-| `/admin/map-local` | `GET/POST` | Serve local files for mapped hosts |
+| `/admin/rule-sets` | `GET/POST` | Location-based rewrite/modification rule sets |
+| `/admin/rule-sets/:id` | `GET/PUT/DELETE` | Read, update, or delete one rule set |
+| `/admin/map-remote-rules` | `GET/POST` | Route matching requests to a different upstream origin |
+| `/admin/map-remote-rules/:id` | `PUT/DELETE` | Update or delete one Map Remote rule |
+| `/admin/map-local-rules` | `GET/POST` | Serve local files for matching requests |
+| `/admin/map-local-rules/:id` | `PUT/DELETE` | Update or delete one Map Local rule |
+| `/admin/access-rules` | `GET/POST` | Block or allow matching requests |
+| `/admin/access-rules/:id` | `PUT/DELETE` | Update or delete one Access rule |
 | `/admin/throttling` | `GET/POST` | Latency/bandwidth simulation |
 | `/admin/breakpoints` | `GET/POST` | Breakpoint rules |
 | `/admin/mock/rules` | `GET/POST` | Mock response rules |
@@ -379,8 +383,9 @@ If you trusted the CA, also remove it from your operating system, browser, mobil
 Build the UI:
 
 ```bash
-npm install --prefix src/design
-npm run build --prefix src/design
+corepack enable
+yarn --cwd src/design install --frozen-lockfile
+yarn --cwd src/design build
 ```
 
 Then restart oproxy. The server expects `src/design/dist/index.html`, `assets/app.js`, and `assets/app.css`.
@@ -421,8 +426,9 @@ Check Capture Filter. In allowlist mode, only matching hosts are recorded. In de
 Build the UI:
 
 ```bash
-npm install --prefix src/design
-npm run build --prefix src/design
+corepack enable
+yarn --cwd src/design install --frozen-lockfile
+yarn --cwd src/design build
 ```
 
 Run tests:
@@ -440,7 +446,7 @@ docker build -t oproxy:smoke .
 Recommended release checks:
 
 - `RUSTFLAGS="-D warnings" cargo test`
-- `npm run build --prefix src/design`
+- `yarn --cwd src/design build`
 - Docker build
 - Docker constrained smoke test for HTTP capture, metrics, bounded storage, and UI health
 - Browser smoke test against both the dev binary and the bundled Docker image
@@ -462,7 +468,7 @@ Before opening a pull request, run:
 
 ```bash
 RUSTFLAGS="-D warnings" cargo test
-npm run build --prefix src/design
+yarn --cwd src/design build
 ```
 
 Please do not include captured real secrets, private CA keys, or production traffic dumps in issues or fixtures.

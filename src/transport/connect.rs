@@ -57,9 +57,8 @@ pub async fn handle_connect(
                 method: "CONNECT".to_string(),
                 uri: format!("https://{}", host),
                 headers: HashMap::new(),
-                body: String::new(),
+                body: bytes::Bytes::new(),
                 host: host.clone(),
-                body_bytes: None,
                 ..Default::default()
             },
         );
@@ -96,16 +95,13 @@ pub async fn handle_connect(
                                 crate::middleware::ResponseContext {
                                     status: 200,
                                     headers: HashMap::new(),
-                                    body: format!(
+                                    body: bytes::Bytes::from(format!(
                                         "↑{} ↓{}",
                                         fmt_bytes(to_server),
                                         fmt_bytes(to_client)
-                                    ),
+                                    )),
                                     request_uri: format!("https://{}", host),
                                     session_id: Some(session_id),
-                                    ttfb_ms: 0,
-                                    body_ms: 0,
-                                    body_bytes: None,
                                     ..Default::default()
                                 },
                                 crate::session::InspectionMetrics {
@@ -126,12 +122,9 @@ pub async fn handle_connect(
                                 crate::middleware::ResponseContext {
                                     status: 502,
                                     headers: HashMap::new(),
-                                    body: format!("upstream unreachable: {}", e),
+                                    body: bytes::Bytes::from(format!("upstream unreachable: {}", e)),
                                     request_uri: format!("https://{}", host),
                                     session_id: Some(session_id),
-                                    ttfb_ms: 0,
-                                    body_ms: 0,
-                                    body_bytes: None,
                                     ..Default::default()
                                 },
                                 crate::session::InspectionMetrics {
@@ -152,12 +145,9 @@ pub async fn handle_connect(
                                 crate::middleware::ResponseContext {
                                     status: 504,
                                     headers: HashMap::new(),
-                                    body: "upstream connect timed out".to_string(),
+                                    body: bytes::Bytes::from_static(b"upstream connect timed out"),
                                     request_uri: format!("https://{}", host),
                                     session_id: Some(session_id),
-                                    ttfb_ms: 0,
-                                    body_ms: 0,
-                                    body_bytes: None,
                                     ..Default::default()
                                 },
                                 crate::session::InspectionMetrics {

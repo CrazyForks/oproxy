@@ -53,3 +53,5 @@ plans/
 PRD.md
 .mcp.json
 ROADMAP.md
+src/design/certs/root.crt
+src/design/certs/root.key
