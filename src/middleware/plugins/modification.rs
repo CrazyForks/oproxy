@@ -40,8 +40,7 @@ impl Middleware for ModificationMiddleware {
                     ctx.headers.insert(key.clone(), value.clone());
                 }
                 if let Some(ref body) = rule.body_replacement {
-                    ctx.body = body.clone();
-                    ctx.body_bytes = None;
+                    ctx.set_body_text(body.clone());
                     ctx.headers.remove("content-length");
                 }
             }
@@ -59,6 +58,7 @@ impl Middleware for ModificationMiddleware {
 mod tests {
     use super::*;
     use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
+    use bytes::Bytes;
     use std::collections::HashMap;
 
     fn req(uri: &str) -> RequestContext {
@@ -66,9 +66,8 @@ mod tests {
             method: "GET".to_string(),
             uri: uri.to_string(),
             headers: HashMap::new(),
-            body: "original".to_string(),
+            body: Bytes::from_static(b"original"),
             host: "localhost".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -93,7 +92,7 @@ mod tests {
             ctx.headers.get("x-modified").map(|s| s.as_str()),
             Some("yes")
         );
-        assert_eq!(ctx.body, "original");
+        assert_eq!(ctx.body_text(), "original");
     }
 
     #[tokio::test]
@@ -103,7 +102,7 @@ mod tests {
         ctx.headers
             .insert("content-length".to_string(), "8".to_string());
         mw.on_request(&mut ctx).await;
-        assert_eq!(ctx.body, "replaced");
+        assert_eq!(ctx.body_text(), "replaced");
         assert!(!ctx.headers.contains_key("content-length"));
     }
 
@@ -117,7 +116,7 @@ mod tests {
         let mut ctx = req("/api/resource");
         mw.on_request(&mut ctx).await;
         assert!(!ctx.headers.contains_key("x-admin"));
-        assert_eq!(ctx.body, "original");
+        assert_eq!(ctx.body_text(), "original");
     }
 
     #[tokio::test]
@@ -126,7 +125,7 @@ mod tests {
         let mut ctx = req("/any");
         let action = mw.on_request(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::Continue);
-        assert_eq!(ctx.body, "original");
+        assert_eq!(ctx.body_text(), "original");
     }
 
     #[tokio::test]
@@ -139,7 +138,7 @@ mod tests {
         mw.on_request(&mut ctx).await;
         assert_eq!(ctx.headers.get("x-first").map(|s| s.as_str()), Some("1"));
         assert_eq!(ctx.headers.get("x-second").map(|s| s.as_str()), Some("2"));
-        assert_eq!(ctx.body, "final");
+        assert_eq!(ctx.body_text(), "final");
     }
 
     #[tokio::test]
@@ -148,18 +147,15 @@ mod tests {
         let mut ctx = ResponseContext {
             status: 200,
             headers: HashMap::new(),
-            body: "resp".to_string(),
+            body: Bytes::from_static(b"resp"),
             request_uri: "/any".to_string(),
-            session_id: None,
-            ttfb_ms: 0,
-            body_ms: 0,
-            body_bytes: None,
             ..Default::default()
         };
         let action = mw.on_response(&mut ctx).await;
         assert_eq!(action, MiddlewareAction::Continue);
         assert_eq!(
-            ctx.body, "resp",
+            ctx.body_text(),
+            "resp",
             "response body must not be touched by ModificationMiddleware"
         );
     }

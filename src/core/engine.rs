@@ -1,6 +1,5 @@
 use crate::middleware::chain::MiddlewareChain;
 use crate::middleware::{MiddlewareAction, RequestContext, ResponseContext};
-use base64::Engine as _;
 use brotli::BrotliDecompress;
 use bytes::Bytes;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
@@ -68,10 +67,13 @@ fn decode_deflate(bytes: &[u8]) -> Option<Vec<u8>> {
         .or_else(|| read_decoder_to_bytes(DeflateDecoder::new(bytes)))
 }
 
+/// Returns the canonical response body bytes, transparently decompressing
+/// gzip/deflate/br. On success the `content-encoding`/`content-length` headers
+/// are stripped so they match the decoded body.
 fn decoded_response_body(
     res_headers: &mut std::collections::HashMap<String, String>,
     res_bytes: &Bytes,
-) -> (String, Bytes) {
+) -> Bytes {
     let encoding = header_value(res_headers, "content-encoding")
         .unwrap_or_default()
         .to_lowercase();
@@ -92,14 +94,10 @@ fn decoded_response_body(
     if let Some(out) = decoded {
         remove_header(res_headers, "content-encoding");
         remove_header(res_headers, "content-length");
-        let body = String::from_utf8_lossy(&out).to_string();
-        return (body, Bytes::from(out));
+        return Bytes::from(out);
     }
 
-    (
-        String::from_utf8_lossy(res_bytes).to_string(),
-        res_bytes.clone(),
-    )
+    res_bytes.clone()
 }
 
 pub struct ProxyEngine {
@@ -108,6 +106,7 @@ pub struct ProxyEngine {
     pub middleware_chain: Arc<RwLock<MiddlewareChain>>,
     pub ca: Option<Arc<crate::certs::CertificateAuthority>>,
     pub mitm_enabled: bool,
+    short_circuit_session_manager: Arc<RwLock<Option<crate::session::SharedSessionManager>>>,
     max_body_bytes: Arc<AtomicUsize>,
     /// Retained so hot-reload can rebuild clients with same base settings.
     timeout_secs: u64,
@@ -166,11 +165,19 @@ impl ProxyEngine {
             middleware_chain,
             ca,
             mitm_enabled,
+            short_circuit_session_manager: Arc::new(RwLock::new(None)),
             max_body_bytes: Arc::new(AtomicUsize::new(max_body_bytes)),
             timeout_secs,
             pool_max_idle_per_host,
             pool_idle_timeout_secs,
         }
+    }
+
+    pub async fn set_short_circuit_session_manager(
+        &self,
+        session_manager: crate::session::SharedSessionManager,
+    ) {
+        *self.short_circuit_session_manager.write().await = Some(session_manager);
     }
 
     /// Returns a clone of the HTTP client (cheap — reqwest::Client is Arc-wrapped internally).
@@ -198,6 +205,53 @@ impl ProxyEngine {
     /// Hot-updates the max body buffer size without restarting.
     pub fn set_max_body_bytes(&self, v: usize) {
         self.max_body_bytes.store(v, Ordering::Relaxed);
+    }
+
+    async fn record_short_circuit_response(&self, res_ctx: &ResponseContext) {
+        let Some(session_id) = res_ctx.session_id.clone() else {
+            return;
+        };
+        let Some(session_manager) = self.short_circuit_session_manager.read().await.clone() else {
+            return;
+        };
+        let Some(session) = session_manager.get_session(&session_id) else {
+            session_manager.record_response(session_id, res_ctx.clone());
+            return;
+        };
+        if session.response.is_some() {
+            return;
+        }
+
+        let latency_ms = (chrono::Utc::now() - session.timestamp).num_milliseconds() as u64;
+        let response_size_bytes = if res_ctx.body.is_empty() {
+            header_value(&res_ctx.headers, "content-length")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0)
+        } else {
+            res_ctx.body.len()
+        };
+        let metrics = crate::session::InspectionMetrics {
+            latency_ms,
+            request_size_bytes: session.request.body.len(),
+            response_size_bytes,
+            status_code: res_ctx.status,
+            ttfb_ms: res_ctx.ttfb_ms,
+            body_ms: res_ctx.body_ms,
+            ..Default::default()
+        };
+        let tags = res_ctx.tags.clone();
+        session_manager.record_response_with_metrics(session_id.clone(), res_ctx.clone(), metrics);
+        if !tags.is_empty() {
+            let mut merged = session.tags.clone();
+            for tag in tags {
+                if !merged.iter().any(|existing| existing == &tag) {
+                    merged.push(tag);
+                }
+            }
+            session_manager
+                .annotate(&session_id, None, Some(merged))
+                .await;
+        }
     }
 
     pub async fn handle_request(self: Arc<Self>, req: Request<Body>) -> Response {
@@ -248,16 +302,13 @@ impl ProxyEngine {
         let req_body_bytes = axum::body::to_bytes(req.into_body(), self.max_body_bytes())
             .await
             .unwrap_or_default();
-        let req_body = String::from_utf8_lossy(&req_body_bytes).to_string();
 
         let mut req_ctx = RequestContext {
             method: req_method.clone(),
             uri: display_uri.clone(),
             headers: req_headers,
-            body: req_body,
+            body: req_body_bytes,
             host: host.clone(),
-            // Store original bytes; middlewares clear this when they modify body.
-            body_bytes: Some(req_body_bytes.clone()),
             // MITM supplies the upstream target up front; routing/dns middleware may
             // still override it during the chain.
             destination: mitm_destination,
@@ -281,23 +332,16 @@ impl ProxyEngine {
                             body: raw_body,
                             tags,
                         } = intercepted;
-                        let content_type =
-                            header_value(&headers, "content-type").unwrap_or_default();
-                        let body = if is_binary_content_type(&content_type) {
-                            base64::engine::general_purpose::STANDARD.encode(&raw_body)
-                        } else {
-                            String::from_utf8_lossy(&raw_body).to_string()
-                        };
                         let mut res_ctx = ResponseContext {
                             status,
                             headers,
-                            body,
+                            body: raw_body,
                             request_uri: display_uri.clone(),
                             session_id: req_ctx.session_id.clone(),
-                            ttfb_ms: 0,
-                            body_ms: 0,
-                            body_bytes: Some(raw_body),
                             tags,
+                            request_host: host.clone(),
+                            request_method: req_method.clone(),
+                            ..Default::default()
                         };
                         {
                             let chain = self.middleware_chain.read().await.clone();
@@ -307,16 +351,13 @@ impl ProxyEngine {
                                     .into_response();
                             }
                         }
+                        self.record_short_circuit_response(&res_ctx).await;
                         let sc = StatusCode::from_u16(res_ctx.status).unwrap_or(StatusCode::OK);
                         let mut builder = Response::builder().status(sc);
                         for (k, v) in &res_ctx.headers {
                             builder = builder.header(k, v);
                         }
-                        let body = match res_ctx.body_bytes {
-                            Some(bytes) => Body::from(bytes),
-                            None => Body::from(res_ctx.body),
-                        };
-                        return builder.body(body).unwrap_or_else(|_| {
+                        return builder.body(Body::from(res_ctx.body)).unwrap_or_else(|_| {
                             (StatusCode::INTERNAL_SERVER_ERROR, "mock error").into_response()
                         });
                     }
@@ -458,19 +499,10 @@ impl ProxyEngine {
             )
             .headers(target_headers);
 
-        let body_is_empty = match &req_ctx.body_bytes {
-            Some(b) => b.is_empty(),
-            None => req_ctx.body.is_empty(),
-        };
-
         // Avoid attaching an empty body to methods like GET if the original request didn't specify one.
         // reqwest automatically adds `Content-Length: 0` if we call `.body()`, which strict servers reject.
-        if !body_is_empty || req_ctx.headers.contains_key("content-length") {
-            let forward_req_body = match req_ctx.body_bytes {
-                Some(b) => reqwest::Body::from(b),
-                None => reqwest::Body::from(req_ctx.body),
-            };
-            request_builder = request_builder.body(forward_req_body);
+        if !req_ctx.body.is_empty() || req_ctx.headers.contains_key("content-length") {
+            request_builder = request_builder.body(reqwest::Body::from(req_ctx.body));
         }
 
         let net_start = Instant::now();
@@ -508,12 +540,11 @@ impl ProxyEngine {
                     let mut res_ctx = ResponseContext {
                         status,
                         headers: res_headers.clone(),
-                        body: String::new(),
                         request_uri: display_uri.clone(),
                         session_id: oproxy_session_id,
                         ttfb_ms,
-                        body_ms: 0,
-                        body_bytes: None,
+                        request_host: host.clone(),
+                        request_method: req_method.clone(),
                         ..Default::default()
                     };
                     {
@@ -543,18 +574,9 @@ impl ProxyEngine {
 
                 // Decompress gzip/deflate if the upstream ignored our stripped Accept-Encoding.
                 // On success strip Content-Encoding and Content-Length so they match the decoded body.
-                // Also keep the canonical bytes (decoded if gzip, raw otherwise) so we can forward
-                // binary responses intact when no middleware modified the body.
-                let (res_body, res_body_bytes_canonical) =
-                    decoded_response_body(&mut res_headers, &res_bytes);
-
-                // For binary content types, replace the lossy UTF-8 string with a
-                // base64 representation so the UI can render it (e.g. display images).
-                let res_body = if is_binary_content_type(&content_type) {
-                    base64::engine::general_purpose::STANDARD.encode(&res_body_bytes_canonical)
-                } else {
-                    res_body
-                };
+                // The canonical decoded bytes are the single source of truth; binary vs. text
+                // presentation (base64 for the UI) is handled at serialisation time.
+                let res_body = decoded_response_body(&mut res_headers, &res_bytes);
 
                 let mut res_ctx = ResponseContext {
                     status,
@@ -564,7 +586,8 @@ impl ProxyEngine {
                     session_id: oproxy_session_id,
                     ttfb_ms,
                     body_ms,
-                    body_bytes: Some(res_body_bytes_canonical.clone()),
+                    request_host: host.clone(),
+                    request_method: req_method.clone(),
                     ..Default::default()
                 };
 
@@ -605,14 +628,8 @@ impl ProxyEngine {
                     builder = builder.header(name, value);
                 }
 
-                // If body_bytes is still Some, middleware didn't modify the body → forward intact bytes.
-                let forward_res_body = match res_ctx.body_bytes {
-                    Some(b) => Body::from(b),
-                    None => Body::from(res_ctx.body),
-                };
-
                 builder
-                    .body(forward_res_body)
+                    .body(Body::from(res_ctx.body))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             }
             Err(e) => {
@@ -622,12 +639,12 @@ impl ProxyEngine {
                 let mut err_ctx = crate::middleware::ResponseContext {
                     status: 502,
                     headers: std::collections::HashMap::new(),
-                    body: format!("Proxy error: {}", e),
+                    body: Bytes::from(format!("Proxy error: {}", e)),
                     request_uri: display_uri.clone(),
                     session_id: oproxy_session_id,
                     ttfb_ms: net_start.elapsed().as_millis() as u64,
-                    body_ms: 0,
-                    body_bytes: None,
+                    request_host: host.clone(),
+                    request_method: req_method.clone(),
                     ..Default::default()
                 };
                 {
@@ -709,9 +726,8 @@ mod tests {
         headers.insert("Content-Encoding".to_string(), "deflate".to_string());
         headers.insert("Content-Length".to_string(), compressed.len().to_string());
 
-        let (body, bytes) = decoded_response_body(&mut headers, &Bytes::from(compressed));
+        let bytes = decoded_response_body(&mut headers, &Bytes::from(compressed));
 
-        assert_eq!(body, "hello-deflate-body");
         assert_eq!(&bytes[..], b"hello-deflate-body");
         assert!(!headers.contains_key("Content-Encoding"));
         assert!(!headers.contains_key("Content-Length"));

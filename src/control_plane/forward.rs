@@ -90,8 +90,7 @@ pub(super) async fn forward_request(
         uri: display_uri.clone(),
         host: host.clone(),
         headers: req.headers.clone(),
-        body: req.body.clone().unwrap_or_default(),
-        body_bytes: None,
+        body: bytes::Bytes::from(req.body.clone().unwrap_or_default()),
         ..Default::default()
     };
     let request_size_bytes = req_ctx.body.len();
@@ -103,7 +102,8 @@ pub(super) async fn forward_request(
         state
             .api_handler
             .session_manager
-            .annotate(&session_id, req.note.clone(), req.tags.clone());
+            .annotate(&session_id, req.note.clone(), req.tags.clone())
+            .await;
     }
 
     // Build and send request using the proxy engine's http client
@@ -144,12 +144,11 @@ pub(super) async fn forward_request(
             let res_ctx = ResponseContext {
                 status,
                 headers: res_headers.clone(),
-                body: body.clone(),
+                body: bytes.clone(),
                 request_uri: display_uri,
                 session_id: Some(session_id.clone()),
                 ttfb_ms,
                 body_ms,
-                body_bytes: None,
                 ..Default::default()
             };
             let metrics = crate::session::InspectionMetrics {
@@ -178,7 +177,7 @@ pub(super) async fn forward_request(
         Err(e) => {
             let res_ctx = ResponseContext {
                 status: 502,
-                body: e.to_string(),
+                body: bytes::Bytes::from(e.to_string()),
                 request_uri: display_uri,
                 session_id: Some(session_id.clone()),
                 ..Default::default()

@@ -15,14 +15,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: src/design/package-lock.json
+          cache: yarn
+          cache-dependency-path: |
+            src/design/yarn.lock
+            tests/browser/yarn.lock
 
       - name: Install browser test dependencies
         working-directory: tests/browser
         run: |
-          npm ci
-          npx playwright install --with-deps chromium
+          corepack enable
+          yarn install --frozen-lockfile
+          yarn playwright install --with-deps chromium
 
       - name: Build and smoke Docker image
         run: |
@@ -60,7 +63,7 @@ jobs:
           docker exec oproxy-release-smoke sh -lc 'du -sh /app/storage /app/certs'
           pushd tests/browser
           OPROXY_BASE_URL=http://127.0.0.1:18081 OPROXY_SKIP_GLOBAL_SETUP=1 \
-            npx playwright test --config=playwright.config.js \
+            yarn test \
               specs/00-beta-smoke.spec.js \
               specs/10-ssl.spec.js
           popd

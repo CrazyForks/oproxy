@@ -57,7 +57,7 @@ pub(super) async fn create_webhook(
     }
     let mut hooks = state.webhooks.write().await;
     hooks.push(hook);
-    if let Err(e) = storage::save_webhooks(&state.storage_path, &hooks) {
+    if let Err(e) = storage::save_webhooks(&state.storage_path, &hooks).await {
         return storage_error_response(e);
     }
     axum::Json(serde_json::json!({ "ok": true })).into_response()
@@ -106,7 +106,7 @@ pub(super) async fn update_webhook(
     let mut hooks = state.webhooks.write().await;
     if let Some(h) = hooks.iter_mut().find(|h| h.id == id) {
         *h = updated;
-        if let Err(e) = storage::save_webhooks(&state.storage_path, &hooks) {
+        if let Err(e) = storage::save_webhooks(&state.storage_path, &hooks).await {
             return storage_error_response(e);
         }
         axum::Json(serde_json::json!({ "ok": true })).into_response()
@@ -123,7 +123,7 @@ pub(super) async fn delete_webhook(
     let before = hooks.len();
     hooks.retain(|h| h.id != id);
     if hooks.len() < before {
-        if let Err(e) = storage::save_webhooks(&state.storage_path, &hooks) {
+        if let Err(e) = storage::save_webhooks(&state.storage_path, &hooks).await {
             return storage_error_response(e);
         }
         axum::Json(serde_json::json!({ "ok": true })).into_response()

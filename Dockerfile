@@ -2,10 +2,10 @@
 FROM node:22-bookworm-slim AS ui-builder
 
 WORKDIR /ui
-COPY src/design/package.json src/design/package-lock.json ./
-RUN npm ci
+COPY src/design/package.json src/design/yarn.lock ./
+RUN corepack enable && yarn install --frozen-lockfile
 COPY src/design ./
-RUN npm run build
+RUN yarn build
 
 # ── Build stage ────────────────────────────────────────────────────────────────
 # edition 2024 requires Rust 1.85+

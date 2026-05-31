@@ -116,7 +116,7 @@ pub fn diff_exchanges(a: &Exchange, b: &Exchange) -> SessionDiff {
     let uri_diff = unified_diff(&req_a.uri, &req_b.uri);
     let (headers_added, headers_removed, headers_changed) =
         diff_headers(&req_a.headers, &req_b.headers);
-    let body_diff = unified_diff(&req_a.body, &req_b.body);
+    let body_diff = unified_diff(&req_a.body_text(), &req_b.body_text());
 
     let request_diff = ContextDiff {
         method_changed,
@@ -136,7 +136,7 @@ pub fn diff_exchanges(a: &Exchange, b: &Exchange) -> SessionDiff {
             };
             let (headers_added, headers_removed, headers_changed) =
                 diff_headers(&ra.headers, &rb.headers);
-            let body_diff = unified_diff(&ra.body, &rb.body);
+            let body_diff = unified_diff(&ra.body_text(), &rb.body_text());
             Some(ResponseDiff {
                 status_changed,
                 headers_added,
@@ -194,20 +194,18 @@ mod tests {
                 method: method.to_string(),
                 uri: uri.to_string(),
                 headers,
-                body: body.to_string(),
+                body: bytes::Bytes::from(body.to_string()),
                 host: "example.com".to_string(),
-                body_bytes: None,
                 ..Default::default()
             },
             response: Some(ResponseContext {
                 request_uri: uri.to_string(),
                 status,
                 headers: resp_headers,
-                body: resp_body.to_string(),
+                body: bytes::Bytes::from(resp_body.to_string()),
                 session_id: None,
                 ttfb_ms: 10,
                 body_ms: 5,
-                body_bytes: None,
                 ..Default::default()
             }),
             metrics: Some(InspectionMetrics {

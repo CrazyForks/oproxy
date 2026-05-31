@@ -142,8 +142,7 @@ mod tests {
             uri: uri.to_string(),
             host: host.to_string(),
             headers: HashMap::new(),
-            body: String::new(),
-            body_bytes: None,
+            body: bytes::Bytes::new(),
             ..Default::default()
         }
     }

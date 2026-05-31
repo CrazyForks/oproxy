@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WsDirection {
@@ -121,7 +121,8 @@ pub struct Exchange {
     pub inspector_data: Option<InspectorData>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionChangeKind {
     RequestCaptured,
     ResponseCaptured,
@@ -131,18 +132,64 @@ pub enum SessionChangeKind {
     WsFrameCaptured,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionChange {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub kind: SessionChangeKind,
 }
 
+// ── Write operations routed through the single writer task ────────────────────
+
+enum WriteOp {
+    RecordRequest {
+        id: String,
+        request: Box<RequestContext>,
+        source: SessionSource,
+    },
+    RecordResponse {
+        id: String,
+        response: ResponseContext,
+    },
+    RecordResponseWithMetrics {
+        id: String,
+        response: ResponseContext,
+        metrics: InspectionMetrics,
+    },
+    AppendWsFrame {
+        id: String,
+        frame: WsFrame,
+    },
+    Annotate {
+        id: String,
+        note: Option<String>,
+        tags: Option<Vec<String>>,
+        reply: oneshot::Sender<bool>,
+    },
+    ImportSessions {
+        exchanges: Vec<Exchange>,
+    },
+    ClearSessions,
+    UpdateInspectorData {
+        id: String,
+        data: InspectorData,
+    },
+    /// Replace the entire store with a pre-parsed map (used by load_from_file).
+    LoadData {
+        map: IndexMap<String, Exchange>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Drain all preceding ops; reply signals completion.
+    Flush(oneshot::Sender<()>),
+}
+
+// ── SessionManager ────────────────────────────────────────────────────────────
+
 pub struct SessionManager {
-    exchanges: RwLock<IndexMap<String, Exchange>>,
-    max_sessions: usize,
-    max_retained_body_bytes: usize,
-    // Fired whenever sessions change; SSE subscribers receive notifications.
+    /// Shared with the writer task; only the writer task acquires write locks.
+    exchanges: Arc<RwLock<IndexMap<String, Exchange>>>,
     change_tx: broadcast::Sender<SessionChange>,
+    write_tx: mpsc::UnboundedSender<WriteOp>,
 }
 
 impl SessionManager {
@@ -153,11 +200,21 @@ impl SessionManager {
 
     pub fn with_body_budget(max_sessions: usize, max_retained_body_bytes: usize) -> Self {
         let (change_tx, _) = broadcast::channel(64);
-        Self {
-            exchanges: RwLock::new(IndexMap::new()),
+        let exchanges = Arc::new(RwLock::new(IndexMap::new()));
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(writer_task(
+            write_rx,
+            Arc::clone(&exchanges),
             max_sessions,
             max_retained_body_bytes,
+            change_tx.clone(),
+        ));
+
+        Self {
+            exchanges,
             change_tx,
+            write_tx,
         }
     }
 
@@ -166,11 +223,98 @@ impl SessionManager {
         self.change_tx.subscribe()
     }
 
-    fn notify(&self, kind: SessionChangeKind, session_id: Option<String>) {
-        let _ = self.change_tx.send(SessionChange { session_id, kind });
+    /// Wait until all previously sent write ops have been processed.
+    pub async fn flush(&self) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.write_tx.send(WriteOp::Flush(tx));
+        let _ = rx.await;
     }
 
+    // ── Fire-and-forget write operations ──────────────────────────────────────
+
+    pub fn record_request(&self, id: String, request: RequestContext) {
+        self.record_request_with_source(id, request, SessionSource::Proxy);
+    }
+
+    pub fn record_request_with_source(
+        &self,
+        id: String,
+        request: RequestContext,
+        source: SessionSource,
+    ) {
+        let _ = self.write_tx.send(WriteOp::RecordRequest {
+            id,
+            request: Box::new(request),
+            source,
+        });
+    }
+
+    pub fn record_response(&self, id: String, response: ResponseContext) {
+        let _ = self.write_tx.send(WriteOp::RecordResponse { id, response });
+    }
+
+    pub fn record_response_with_metrics(
+        &self,
+        id: String,
+        response: ResponseContext,
+        metrics: InspectionMetrics,
+    ) {
+        let _ = self.write_tx.send(WriteOp::RecordResponseWithMetrics {
+            id,
+            response,
+            metrics,
+        });
+    }
+
+    pub fn import_sessions(&self, exchanges: Vec<Exchange>) {
+        let _ = self.write_tx.send(WriteOp::ImportSessions { exchanges });
+    }
+
+    pub fn append_ws_frame(&self, id: &str, frame: WsFrame) {
+        let _ = self.write_tx.send(WriteOp::AppendWsFrame {
+            id: id.to_string(),
+            frame,
+        });
+    }
+
+    pub fn clear_sessions(&self) {
+        let _ = self.write_tx.send(WriteOp::ClearSessions);
+    }
+
+    pub fn update_inspector_data(&self, id: &str, data: InspectorData) {
+        let _ = self.write_tx.send(WriteOp::UpdateInspectorData {
+            id: id.to_string(),
+            data,
+        });
+    }
+
+    // ── Write operations that need a reply ────────────────────────────────────
+
+    /// Update the note and/or tags on an existing session.
+    /// `note: Some(x)` replaces the note; `None` leaves it unchanged.
+    /// `tags: Some(v)` replaces the tag list; `None` leaves it unchanged.
+    /// Returns `false` if no session with `id` exists.
+    pub async fn annotate(
+        &self,
+        id: &str,
+        note: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.write_tx.send(WriteOp::Annotate {
+            id: id.to_string(),
+            note,
+            tags,
+            reply: tx,
+        });
+        rx.await.unwrap_or(false)
+    }
+
+    // ── Async file I/O ────────────────────────────────────────────────────────
+
     pub async fn save_to_file<P: AsRef<Path> + Send>(&self, path: P) -> Result<(), std::io::Error> {
+        // Flush pending writes before taking the read snapshot.
+        self.flush().await;
         let json = {
             let guard = self.exchanges.read().unwrap();
             serde_json::to_string_pretty(&*guard)
@@ -184,132 +328,15 @@ impl SessionManager {
         path: P,
     ) -> Result<(), std::io::Error> {
         let data = tokio::fs::read(path).await?;
-        let exchanges: IndexMap<String, Exchange> = serde_json::from_slice(&data)
+        let map: IndexMap<String, Exchange> = serde_json::from_slice(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        {
-            let mut guard = self.exchanges.write().unwrap();
-            *guard = exchanges;
-            self.enforce_body_budget(&mut guard);
-        }
-        self.notify(SessionChangeKind::SessionsImported, None);
-        Ok(())
+        let (tx, rx) = oneshot::channel();
+        let _ = self.write_tx.send(WriteOp::LoadData { map, reply: tx });
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer task closed"))
     }
 
-    pub fn record_request(&self, id: String, request: RequestContext) {
-        self.record_request_with_source(id, request, SessionSource::Proxy);
-    }
-
-    pub fn record_request_with_source(
-        &self,
-        id: String,
-        request: RequestContext,
-        source: SessionSource,
-    ) {
-        {
-            let mut exchanges = self.exchanges.write().unwrap();
-            if exchanges.len() >= self.max_sessions && !exchanges.contains_key(&id) {
-                // Evict the oldest entry (insertion order ≈ arrival order).
-                exchanges.shift_remove_index(0);
-            }
-            exchanges.insert(
-                id.clone(),
-                Exchange {
-                    id: id.clone(),
-                    timestamp: Utc::now(),
-                    updated_at: None,
-                    request,
-                    response: None,
-                    metrics: None,
-                    source,
-                    ws_frames: Vec::new(),
-                    note: None,
-                    tags: Vec::new(),
-                    inspector_data: None,
-                },
-            );
-            self.enforce_body_budget(&mut exchanges);
-        }
-        self.notify(SessionChangeKind::RequestCaptured, Some(id));
-    }
-
-    pub fn record_response(&self, id: String, response: ResponseContext) {
-        {
-            let mut exchanges = self.exchanges.write().unwrap();
-            if let Some(exchange) = exchanges.get_mut(&id) {
-                exchange.response = Some(response);
-                exchange.updated_at = Some(Utc::now());
-            }
-            self.enforce_body_budget(&mut exchanges);
-        }
-        self.notify(SessionChangeKind::ResponseCaptured, Some(id));
-    }
-
-    pub fn record_response_with_metrics(
-        &self,
-        id: String,
-        response: ResponseContext,
-        metrics: InspectionMetrics,
-    ) {
-        {
-            let mut exchanges = self.exchanges.write().unwrap();
-            if let Some(exchange) = exchanges.get_mut(&id) {
-                exchange.response = Some(response);
-                exchange.metrics = Some(metrics);
-                exchange.updated_at = Some(Utc::now());
-            }
-            self.enforce_body_budget(&mut exchanges);
-        }
-        self.notify(SessionChangeKind::ResponseCaptured, Some(id));
-    }
-
-    pub fn import_sessions(&self, exchanges: Vec<Exchange>) {
-        {
-            let mut store = self.exchanges.write().unwrap();
-            for e in exchanges {
-                if store.len() >= self.max_sessions && !store.contains_key(&e.id) {
-                    store.shift_remove_index(0);
-                }
-                store.insert(e.id.clone(), e);
-            }
-            self.enforce_body_budget(&mut store);
-        }
-        self.notify(SessionChangeKind::SessionsImported, None);
-    }
-
-    pub fn append_ws_frame(&self, id: &str, frame: WsFrame) {
-        {
-            let mut exchanges = self.exchanges.write().unwrap();
-            if let Some(exchange) = exchanges.get_mut(id) {
-                exchange.ws_frames.push(frame);
-            }
-            self.enforce_body_budget(&mut exchanges);
-        }
-        self.notify(SessionChangeKind::WsFrameCaptured, Some(id.to_string()));
-    }
-
-    /// Update the note and/or tags on an existing session.
-    /// `note: Some(x)` replaces the note; `None` leaves it unchanged.
-    /// `tags: Some(v)` replaces the tag list; `None` leaves it unchanged.
-    /// Returns `false` if no session with `id` exists.
-    pub fn annotate(&self, id: &str, note: Option<String>, tags: Option<Vec<String>>) -> bool {
-        {
-            let mut exchanges = self.exchanges.write().unwrap();
-            match exchanges.get_mut(id) {
-                None => return false,
-                Some(ex) => {
-                    if let Some(n) = note {
-                        ex.note = if n.is_empty() { None } else { Some(n) };
-                    }
-                    if let Some(t) = tags {
-                        ex.tags = t;
-                    }
-                    ex.updated_at = Some(Utc::now());
-                }
-            }
-        }
-        self.notify(SessionChangeKind::SessionUpdated, Some(id.to_string()));
-        true
-    }
+    // ── Read operations (acquire read lock directly) ───────────────────────────
 
     pub fn get_all_sessions(&self) -> Vec<Exchange> {
         let exchanges = self.exchanges.read().unwrap();
@@ -337,78 +364,26 @@ impl SessionManager {
         exchanges.get(id).cloned()
     }
 
-    pub fn clear_sessions(&self) {
-        {
-            let mut exchanges = self.exchanges.write().unwrap();
-            exchanges.clear();
-        }
-        self.notify(SessionChangeKind::SessionsCleared, None);
-    }
-
-    pub fn update_inspector_data(&self, id: &str, data: InspectorData) -> bool {
-        let mut exchanges = self.exchanges.write().unwrap();
-        if let Some(ex) = exchanges.get_mut(id) {
-            ex.inspector_data = Some(data);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn enforce_body_budget(&self, exchanges: &mut IndexMap<String, Exchange>) {
-        if self.max_retained_body_bytes == usize::MAX {
-            return;
-        }
-
-        let mut retained = exchanges
-            .values()
-            .map(Self::exchange_body_size)
-            .sum::<usize>();
-        if retained <= self.max_retained_body_bytes {
-            return;
-        }
-
-        for exchange in exchanges.values_mut() {
-            if retained <= self.max_retained_body_bytes {
-                break;
-            }
-            let before = Self::exchange_body_size(exchange);
-            if before == 0 {
-                continue;
-            }
-            Self::clear_exchange_bodies(exchange);
-            retained = retained.saturating_sub(before);
-        }
-    }
+    // ── Static helpers used by the writer task ────────────────────────────────
 
     fn exchange_body_size(exchange: &Exchange) -> usize {
-        let request_bytes = exchange.request.body.len()
-            + exchange
-                .request
-                .body_bytes
-                .as_ref()
-                .map_or(0, |bytes| bytes.len());
-        let response_bytes = exchange.response.as_ref().map_or(0, |response| {
-            response.body.len() + response.body_bytes.as_ref().map_or(0, |bytes| bytes.len())
-        });
+        let request_bytes = exchange.request.body.len();
+        let response_bytes = exchange.response.as_ref().map_or(0, |r| r.body.len());
         let ws_bytes = exchange
             .ws_frames
             .iter()
-            .map(|frame| {
-                frame.payload_text.as_ref().map_or(0, String::len)
-                    + frame.payload_hex.as_ref().map_or(0, String::len)
+            .map(|f| {
+                f.payload_text.as_ref().map_or(0, String::len)
+                    + f.payload_hex.as_ref().map_or(0, String::len)
             })
             .sum::<usize>();
-
         request_bytes + response_bytes + ws_bytes
     }
 
     fn clear_exchange_bodies(exchange: &mut Exchange) {
-        exchange.request.body.clear();
-        exchange.request.body_bytes = None;
+        exchange.request.body = bytes::Bytes::new();
         if let Some(response) = &mut exchange.response {
-            response.body.clear();
-            response.body_bytes = None;
+            response.body = bytes::Bytes::new();
         }
         for frame in &mut exchange.ws_frames {
             frame.payload_text = None;
@@ -418,6 +393,260 @@ impl SessionManager {
 }
 
 pub type SharedSessionManager = Arc<SessionManager>;
+
+// ── Writer task ───────────────────────────────────────────────────────────────
+
+async fn writer_task(
+    mut rx: mpsc::UnboundedReceiver<WriteOp>,
+    exchanges: Arc<RwLock<IndexMap<String, Exchange>>>,
+    max_sessions: usize,
+    max_retained_body_bytes: usize,
+    change_tx: broadcast::Sender<SessionChange>,
+) {
+    // Running tally of body bytes — updated inline so enforce_budget needs no O(n) scan.
+    let mut body_bytes: usize = 0;
+    while let Some(op) = rx.recv().await {
+        process_write_op(
+            op,
+            &exchanges,
+            max_sessions,
+            max_retained_body_bytes,
+            &mut body_bytes,
+            &change_tx,
+        );
+    }
+}
+
+fn process_write_op(
+    op: WriteOp,
+    exchanges: &RwLock<IndexMap<String, Exchange>>,
+    max_sessions: usize,
+    max_retained_body_bytes: usize,
+    body_bytes: &mut usize,
+    change_tx: &broadcast::Sender<SessionChange>,
+) {
+    match op {
+        WriteOp::RecordRequest {
+            id,
+            request,
+            source,
+        } => {
+            let added = request.body.len();
+            {
+                let mut store = exchanges.write().unwrap();
+                if store.len() >= max_sessions && !store.contains_key(&id)
+                    && let Some((_, evicted)) = store.shift_remove_index(0)
+                {
+                    *body_bytes =
+                        body_bytes.saturating_sub(SessionManager::exchange_body_size(&evicted));
+                }
+                *body_bytes += added;
+                store.insert(
+                    id.clone(),
+                    Exchange {
+                        id: id.clone(),
+                        timestamp: Utc::now(),
+                        updated_at: None,
+                        request: *request,
+                        response: None,
+                        metrics: None,
+                        source,
+                        ws_frames: Vec::new(),
+                        note: None,
+                        tags: Vec::new(),
+                        inspector_data: None,
+                    },
+                );
+                if max_retained_body_bytes != usize::MAX && *body_bytes > max_retained_body_bytes {
+                    enforce_budget(&mut store, max_retained_body_bytes, body_bytes);
+                }
+            }
+            let _ = change_tx.send(SessionChange {
+                session_id: Some(id),
+                kind: SessionChangeKind::RequestCaptured,
+            });
+        }
+
+        WriteOp::RecordResponse { id, response } => {
+            let added = response.body.len();
+            {
+                let mut store = exchanges.write().unwrap();
+                if let Some(ex) = store.get_mut(&id) {
+                    ex.response = Some(response);
+                    ex.updated_at = Some(Utc::now());
+                    *body_bytes += added;
+                }
+                if max_retained_body_bytes != usize::MAX && *body_bytes > max_retained_body_bytes {
+                    enforce_budget(&mut store, max_retained_body_bytes, body_bytes);
+                }
+            }
+            let _ = change_tx.send(SessionChange {
+                session_id: Some(id),
+                kind: SessionChangeKind::ResponseCaptured,
+            });
+        }
+
+        WriteOp::RecordResponseWithMetrics {
+            id,
+            response,
+            metrics,
+        } => {
+            let added = response.body.len();
+            {
+                let mut store = exchanges.write().unwrap();
+                if let Some(ex) = store.get_mut(&id) {
+                    ex.response = Some(response);
+                    ex.metrics = Some(metrics);
+                    ex.updated_at = Some(Utc::now());
+                    *body_bytes += added;
+                }
+                if max_retained_body_bytes != usize::MAX && *body_bytes > max_retained_body_bytes {
+                    enforce_budget(&mut store, max_retained_body_bytes, body_bytes);
+                }
+            }
+            let _ = change_tx.send(SessionChange {
+                session_id: Some(id),
+                kind: SessionChangeKind::ResponseCaptured,
+            });
+        }
+
+        WriteOp::AppendWsFrame { id, frame } => {
+            let added = frame.payload_text.as_ref().map_or(0, String::len)
+                + frame.payload_hex.as_ref().map_or(0, String::len);
+            {
+                let mut store = exchanges.write().unwrap();
+                if let Some(ex) = store.get_mut(&id) {
+                    ex.ws_frames.push(frame);
+                    *body_bytes += added;
+                }
+                if max_retained_body_bytes != usize::MAX && *body_bytes > max_retained_body_bytes {
+                    enforce_budget(&mut store, max_retained_body_bytes, body_bytes);
+                }
+            }
+            let _ = change_tx.send(SessionChange {
+                session_id: Some(id),
+                kind: SessionChangeKind::WsFrameCaptured,
+            });
+        }
+
+        WriteOp::Annotate {
+            id,
+            note,
+            tags,
+            reply,
+        } => {
+            let found = {
+                let mut store = exchanges.write().unwrap();
+                match store.get_mut(&id) {
+                    None => false,
+                    Some(ex) => {
+                        if let Some(n) = note {
+                            ex.note = if n.is_empty() { None } else { Some(n) };
+                        }
+                        if let Some(t) = tags {
+                            ex.tags = t;
+                        }
+                        ex.updated_at = Some(Utc::now());
+                        true
+                    }
+                }
+            };
+            if found {
+                let _ = change_tx.send(SessionChange {
+                    session_id: Some(id),
+                    kind: SessionChangeKind::SessionUpdated,
+                });
+            }
+            let _ = reply.send(found);
+        }
+
+        WriteOp::ImportSessions {
+            exchanges: new_exchanges,
+        } => {
+            {
+                let mut store = exchanges.write().unwrap();
+                for e in new_exchanges {
+                    if store.len() >= max_sessions && !store.contains_key(&e.id)
+                        && let Some((_, evicted)) = store.shift_remove_index(0)
+                    {
+                        *body_bytes = body_bytes
+                            .saturating_sub(SessionManager::exchange_body_size(&evicted));
+                    }
+                    *body_bytes += SessionManager::exchange_body_size(&e);
+                    store.insert(e.id.clone(), e);
+                }
+                if max_retained_body_bytes != usize::MAX && *body_bytes > max_retained_body_bytes {
+                    enforce_budget(&mut store, max_retained_body_bytes, body_bytes);
+                }
+            }
+            let _ = change_tx.send(SessionChange {
+                session_id: None,
+                kind: SessionChangeKind::SessionsImported,
+            });
+        }
+
+        WriteOp::ClearSessions => {
+            {
+                let mut store = exchanges.write().unwrap();
+                store.clear();
+                *body_bytes = 0;
+            }
+            let _ = change_tx.send(SessionChange {
+                session_id: None,
+                kind: SessionChangeKind::SessionsCleared,
+            });
+        }
+
+        WriteOp::UpdateInspectorData { id, data } => {
+            let mut store = exchanges.write().unwrap();
+            if let Some(ex) = store.get_mut(&id) {
+                ex.inspector_data = Some(data);
+            }
+        }
+
+        WriteOp::LoadData { map, reply } => {
+            // Recompute body_bytes from the incoming map (load is infrequent).
+            let new_body_bytes: usize = map.values().map(SessionManager::exchange_body_size).sum();
+            {
+                let mut store = exchanges.write().unwrap();
+                *store = map;
+                *body_bytes = new_body_bytes;
+                if max_retained_body_bytes != usize::MAX && *body_bytes > max_retained_body_bytes {
+                    enforce_budget(&mut store, max_retained_body_bytes, body_bytes);
+                }
+            }
+            let _ = change_tx.send(SessionChange {
+                session_id: None,
+                kind: SessionChangeKind::SessionsImported,
+            });
+            let _ = reply.send(());
+        }
+
+        WriteOp::Flush(reply) => {
+            let _ = reply.send(());
+        }
+    }
+}
+
+/// Evict body content from the oldest exchanges until the budget is satisfied.
+/// Called with the write lock already held by the writer task.
+fn enforce_budget(
+    store: &mut IndexMap<String, Exchange>,
+    max_retained_body_bytes: usize,
+    body_bytes: &mut usize,
+) {
+    for ex in store.values_mut() {
+        if *body_bytes <= max_retained_body_bytes {
+            break;
+        }
+        let freed = SessionManager::exchange_body_size(ex);
+        if freed == 0 {
+            continue;
+        }
+        SessionManager::clear_exchange_bodies(ex);
+        *body_bytes = body_bytes.saturating_sub(freed);
+    }
+}
 
 // ── Search ────────────────────────────────────────────────────────────────────
 
@@ -446,7 +675,7 @@ impl SearchTerm {
             SearchTerm::Text(t) => {
                 let t = t.as_str();
                 ex.request.uri.to_lowercase().contains(t)
-                    || ex.request.body.to_lowercase().contains(t)
+                    || ex.request.body_text().to_lowercase().contains(t)
                     || ex
                         .request
                         .headers
@@ -456,7 +685,7 @@ impl SearchTerm {
                         .response
                         .as_ref()
                         .map(|r| {
-                            r.body.to_lowercase().contains(t)
+                            r.body_text().to_lowercase().contains(t)
                                 || r.headers.iter().any(|(k, v)| {
                                     k.to_lowercase().contains(t) || v.to_lowercase().contains(t)
                                 })
@@ -505,9 +734,8 @@ mod tests {
             method: "GET".to_string(),
             uri: uri.to_string(),
             headers: HashMap::new(),
-            body: "body".to_string(),
+            body: bytes::Bytes::from_static(b"body"),
             host: "localhost".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -516,20 +744,20 @@ mod tests {
         ResponseContext {
             status,
             headers: HashMap::new(),
-            body: "response".to_string(),
+            body: bytes::Bytes::from_static(b"response"),
             request_uri: uri.to_string(),
             session_id: None,
             ttfb_ms: 0,
             body_ms: 0,
-            body_bytes: None,
             ..Default::default()
         }
     }
 
-    #[test]
-    fn record_request_creates_exchange() {
+    #[tokio::test]
+    async fn record_request_creates_exchange() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
+        sm.flush().await;
         let all = sm.get_all_sessions();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "id1");
@@ -538,24 +766,26 @@ mod tests {
         assert!(all[0].metrics.is_none());
     }
 
-    #[test]
-    fn record_response_attaches_to_existing_exchange() {
+    #[tokio::test]
+    async fn record_response_attaches_to_existing_exchange() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
         sm.record_response("id1".to_string(), res("/test", 200));
+        sm.flush().await;
         let session = sm.get_session("id1").unwrap();
         assert_eq!(session.response.unwrap().status, 200);
     }
 
-    #[test]
-    fn record_response_for_unknown_id_is_noop() {
+    #[tokio::test]
+    async fn record_response_for_unknown_id_is_noop() {
         let sm = SessionManager::new(10_000);
         sm.record_response("ghost".to_string(), res("/test", 200));
+        sm.flush().await;
         assert!(sm.get_all_sessions().is_empty());
     }
 
-    #[test]
-    fn record_response_with_metrics_stores_all_fields() {
+    #[tokio::test]
+    async fn record_response_with_metrics_stores_all_fields() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/x"));
         let metrics = InspectionMetrics {
@@ -568,6 +798,7 @@ mod tests {
             ..Default::default()
         };
         sm.record_response_with_metrics("id1".to_string(), res("/x", 404), metrics);
+        sm.flush().await;
         let session = sm.get_session("id1").unwrap();
         let m = session.metrics.unwrap();
         assert_eq!(m.latency_ms, 42);
@@ -576,19 +807,21 @@ mod tests {
         assert_eq!(m.response_size_bytes, 20);
     }
 
-    #[test]
-    fn get_session_returns_none_for_missing_id() {
+    #[tokio::test]
+    async fn get_session_returns_none_for_missing_id() {
         let sm = SessionManager::new(10_000);
         assert!(sm.get_session("does-not-exist").is_none());
     }
 
-    #[test]
-    fn clear_sessions_empties_store() {
+    #[tokio::test]
+    async fn clear_sessions_empties_store() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req("/a"));
         sm.record_request("b".to_string(), req("/b"));
+        sm.flush().await;
         assert_eq!(sm.get_all_sessions().len(), 2);
         sm.clear_sessions();
+        sm.flush().await;
         assert!(sm.get_all_sessions().is_empty());
     }
 
@@ -617,25 +850,28 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn duplicate_id_overwrites_previous_exchange() {
+    #[tokio::test]
+    async fn duplicate_id_overwrites_previous_exchange() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/first"));
         sm.record_request("id1".to_string(), req("/second"));
+        sm.flush().await;
         let all = sm.get_all_sessions();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].request.uri, "/second");
     }
 
-    #[test]
-    fn session_cap_evicts_oldest_when_full() {
+    #[tokio::test]
+    async fn session_cap_evicts_oldest_when_full() {
         let cap = 5;
         let sm = SessionManager::new(cap);
         for i in 0..cap {
             sm.record_request(format!("id-{}", i), req(&format!("/{}", i)));
         }
+        sm.flush().await;
         assert_eq!(sm.get_all_sessions().len(), cap);
         sm.record_request("id-new".to_string(), req("/new"));
+        sm.flush().await;
         let all = sm.get_all_sessions();
         assert_eq!(all.len(), cap, "must not grow past cap");
         assert!(
@@ -644,26 +880,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn body_budget_drops_oldest_bodies_but_keeps_metadata() {
+    #[tokio::test]
+    async fn body_budget_drops_oldest_bodies_but_keeps_metadata() {
         let sm = SessionManager::with_body_budget(10, 24);
         sm.record_request(
             "old".to_string(),
             RequestContext {
-                body: "old-request-body".to_string(),
-                body_bytes: Some(bytes::Bytes::from_static(b"old-request-body")),
+                body: bytes::Bytes::from_static(b"old-request-body"),
                 ..req("/old")
             },
         );
         sm.record_response(
             "old".to_string(),
             ResponseContext {
-                body: "old-response-body".to_string(),
-                body_bytes: Some(bytes::Bytes::from_static(b"old-response-body")),
+                body: bytes::Bytes::from_static(b"old-response-body"),
                 ..res("/old", 200)
             },
         );
         sm.record_request("new".to_string(), req("/new"));
+        sm.flush().await;
 
         let old = sm.get_session("old").unwrap();
         let new = sm.get_session("new").unwrap();
@@ -671,17 +906,16 @@ mod tests {
         assert_eq!(old.request.uri, "/old");
         assert_eq!(old.response.as_ref().unwrap().status, 200);
         assert!(old.request.body.is_empty());
-        assert!(old.request.body_bytes.is_none());
         assert!(old.response.as_ref().unwrap().body.is_empty());
-        assert!(old.response.as_ref().unwrap().body_bytes.is_none());
-        assert_eq!(new.request.body, "body");
+        assert_eq!(new.request.body_text(), "body");
     }
 
-    #[test]
-    fn subscribe_fires_on_record_request() {
+    #[tokio::test]
+    async fn subscribe_fires_on_record_request() {
         let sm = SessionManager::new(10_000);
         let mut rx = sm.subscribe();
         sm.record_request("id1".to_string(), req("/ping"));
+        sm.flush().await;
         let change = rx
             .try_recv()
             .expect("subscriber should receive notification");
@@ -689,22 +923,24 @@ mod tests {
         assert_eq!(change.session_id.as_deref(), Some("id1"));
     }
 
-    #[test]
-    fn get_all_sessions_returns_insertion_order() {
+    #[tokio::test]
+    async fn get_all_sessions_returns_insertion_order() {
         let sm = SessionManager::new(10_000);
         for i in 0..5u32 {
             sm.record_request(format!("id-{}", i), req(&format!("/{}", i)));
         }
+        sm.flush().await;
         let all = sm.get_all_sessions();
         for (i, e) in all.iter().enumerate() {
             assert_eq!(e.id, format!("id-{}", i));
         }
     }
 
-    #[test]
-    fn record_request_has_no_updated_at() {
+    #[tokio::test]
+    async fn record_request_has_no_updated_at() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
+        sm.flush().await;
         let session = sm.get_session("id1").unwrap();
         assert!(
             session.updated_at.is_none(),
@@ -712,12 +948,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn record_response_sets_updated_at() {
+    #[tokio::test]
+    async fn record_response_sets_updated_at() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
         let before = Utc::now();
         sm.record_response("id1".to_string(), res("/test", 200));
+        sm.flush().await;
         let after = Utc::now();
         let session = sm.get_session("id1").unwrap();
         let updated_at = session
@@ -729,8 +966,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn record_response_with_metrics_sets_updated_at() {
+    #[tokio::test]
+    async fn record_response_with_metrics_sets_updated_at() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
         let metrics = InspectionMetrics {
@@ -744,6 +981,7 @@ mod tests {
         };
         let before = Utc::now();
         sm.record_response_with_metrics("id1".to_string(), res("/test", 200), metrics);
+        sm.flush().await;
         let after = Utc::now();
         let session = sm.get_session("id1").unwrap();
         let updated_at = session
@@ -754,90 +992,98 @@ mod tests {
 
     // ── annotations ──────────────────────────────────────────────────────────
 
-    #[test]
-    fn annotate_stores_note_and_tags() {
+    #[tokio::test]
+    async fn annotate_stores_note_and_tags() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
-        let ok = sm.annotate(
-            "id1",
-            Some("auth bug".to_string()),
-            Some(vec!["auth".to_string(), "bug".to_string()]),
-        );
+        let ok = sm
+            .annotate(
+                "id1",
+                Some("auth bug".to_string()),
+                Some(vec!["auth".to_string(), "bug".to_string()]),
+            )
+            .await;
         assert!(ok);
         let ex = sm.get_session("id1").unwrap();
         assert_eq!(ex.note.as_deref(), Some("auth bug"));
         assert_eq!(ex.tags, vec!["auth", "bug"]);
     }
 
-    #[test]
-    fn annotate_partial_note_only_leaves_tags_unchanged() {
+    #[tokio::test]
+    async fn annotate_partial_note_only_leaves_tags_unchanged() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
-        sm.annotate("id1", None, Some(vec!["existing".to_string()]));
-        sm.annotate("id1", Some("new note".to_string()), None);
+        sm.annotate("id1", None, Some(vec!["existing".to_string()]))
+            .await;
+        sm.annotate("id1", Some("new note".to_string()), None).await;
         let ex = sm.get_session("id1").unwrap();
         assert_eq!(ex.note.as_deref(), Some("new note"));
         assert_eq!(ex.tags, vec!["existing"]);
     }
 
-    #[test]
-    fn annotate_partial_tags_only_leaves_note_unchanged() {
+    #[tokio::test]
+    async fn annotate_partial_tags_only_leaves_note_unchanged() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
-        sm.annotate("id1", Some("original".to_string()), None);
-        sm.annotate("id1", None, Some(vec!["new-tag".to_string()]));
+        sm.annotate("id1", Some("original".to_string()), None).await;
+        sm.annotate("id1", None, Some(vec!["new-tag".to_string()]))
+            .await;
         let ex = sm.get_session("id1").unwrap();
         assert_eq!(ex.note.as_deref(), Some("original"));
         assert_eq!(ex.tags, vec!["new-tag"]);
     }
 
-    #[test]
-    fn annotate_empty_string_clears_note() {
+    #[tokio::test]
+    async fn annotate_empty_string_clears_note() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
-        sm.annotate("id1", Some("note".to_string()), None);
-        sm.annotate("id1", Some(String::new()), None);
+        sm.annotate("id1", Some("note".to_string()), None).await;
+        sm.annotate("id1", Some(String::new()), None).await;
         let ex = sm.get_session("id1").unwrap();
         assert!(ex.note.is_none());
     }
 
-    #[test]
-    fn annotate_empty_tags_clears_tags() {
+    #[tokio::test]
+    async fn annotate_empty_tags_clears_tags() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
-        sm.annotate("id1", None, Some(vec!["tag".to_string()]));
-        sm.annotate("id1", None, Some(vec![]));
+        sm.annotate("id1", None, Some(vec!["tag".to_string()]))
+            .await;
+        sm.annotate("id1", None, Some(vec![])).await;
         let ex = sm.get_session("id1").unwrap();
         assert!(ex.tags.is_empty());
     }
 
-    #[test]
-    fn annotate_missing_session_returns_false() {
+    #[tokio::test]
+    async fn annotate_missing_session_returns_false() {
         let sm = SessionManager::new(10_000);
-        let ok = sm.annotate("nonexistent", Some("note".to_string()), None);
+        let ok = sm
+            .annotate("nonexistent", Some("note".to_string()), None)
+            .await;
         assert!(!ok);
     }
 
-    #[test]
-    fn annotate_sets_updated_at() {
+    #[tokio::test]
+    async fn annotate_sets_updated_at() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
         let before = Utc::now();
-        sm.annotate("id1", Some("note".to_string()), None);
+        sm.annotate("id1", Some("note".to_string()), None).await;
         let after = Utc::now();
         let ex = sm.get_session("id1").unwrap();
         let ua = ex.updated_at.unwrap();
         assert!(ua >= before && ua <= after);
     }
 
-    #[test]
-    fn annotate_triggers_sse_notification() {
+    #[tokio::test]
+    async fn annotate_triggers_sse_notification() {
         let sm = SessionManager::new(10_000);
-        sm.record_request("id1".to_string(), req("/test"));
         let mut rx = sm.subscribe();
-        // Drain the record_request notification.
-        let _ = rx.try_recv();
-        sm.annotate("id1", Some("note".to_string()), None);
+        sm.record_request("id1".to_string(), req("/test"));
+        // Flush so the record_request notification is in the broadcast buffer.
+        sm.flush().await;
+        let _ = rx.try_recv(); // drain record_request notification
+        sm.annotate("id1", Some("note".to_string()), None).await;
         let change = rx.try_recv().expect("annotate must fire SSE notification");
         assert_eq!(change.kind, SessionChangeKind::SessionUpdated);
         assert_eq!(change.session_id.as_deref(), Some("id1"));
@@ -851,7 +1097,8 @@ mod tests {
             "id1",
             Some("important".to_string()),
             Some(vec!["prod".to_string()]),
-        );
+        )
+        .await;
 
         let path = std::env::temp_dir().join("oproxy_annot_roundtrip_test.json");
         sm.save_to_file(&path).await.expect("save failed");
@@ -910,8 +1157,8 @@ mod tests {
         assert!(!json.contains("tls_ms"));
     }
 
-    #[test]
-    fn record_response_with_timing_metrics_stores_optional_fields() {
+    #[tokio::test]
+    async fn record_response_with_timing_metrics_stores_optional_fields() {
         let sm = SessionManager::new(10_000);
         sm.record_request("id1".to_string(), req("/test"));
         let metrics = InspectionMetrics {
@@ -926,6 +1173,7 @@ mod tests {
             tls_ms: Some(20),
         };
         sm.record_response_with_metrics("id1".to_string(), res("/test", 200), metrics);
+        sm.flush().await;
         let ex = sm.get_session("id1").unwrap();
         let m = ex.metrics.unwrap();
         assert_eq!(m.dns_ms, Some(5));
@@ -942,90 +1190,96 @@ mod tests {
             method: "GET".to_string(),
             uri: uri.to_string(),
             headers: h,
-            body: String::new(),
+            body: bytes::Bytes::new(),
             host: host.to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
 
-    #[test]
-    fn search_empty_query_returns_all() {
+    #[tokio::test]
+    async fn search_empty_query_returns_all() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req("/a"));
         sm.record_request("b".to_string(), req("/b"));
+        sm.flush().await;
         let results = sm.search_sessions("");
         assert_eq!(results.len(), 2);
     }
 
-    #[test]
-    fn search_text_matches_uri() {
+    #[tokio::test]
+    async fn search_text_matches_uri() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req("/api/users"));
         sm.record_request("b".to_string(), req("/health"));
+        sm.flush().await;
         let results = sm.search_sessions("users");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a");
     }
 
-    #[test]
-    fn search_host_prefix() {
+    #[tokio::test]
+    async fn search_host_prefix() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req_with_host("/x", "api.example.com"));
         sm.record_request("b".to_string(), req_with_host("/y", "static.example.com"));
+        sm.flush().await;
         let results = sm.search_sessions("host:api.example");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a");
     }
 
-    #[test]
-    fn search_tag_prefix() {
+    #[tokio::test]
+    async fn search_tag_prefix() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req("/a"));
         sm.record_request("b".to_string(), req("/b"));
-        sm.annotate("a", None, Some(vec!["auth".to_string()]));
+        sm.annotate("a", None, Some(vec!["auth".to_string()])).await;
         let results = sm.search_sessions("tag:auth");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a");
     }
 
-    #[test]
-    fn search_multiple_terms_and_semantics() {
+    #[tokio::test]
+    async fn search_multiple_terms_and_semantics() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req("/api/auth/login"));
         sm.record_request("b".to_string(), req("/api/users"));
+        sm.flush().await;
         // only "a" matches both "api" and "login"
         let results = sm.search_sessions("api login");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a");
     }
 
-    #[test]
-    fn search_status_prefix() {
+    #[tokio::test]
+    async fn search_status_prefix() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req("/a"));
         sm.record_request("b".to_string(), req("/b"));
         sm.record_response("a".to_string(), res("/a", 404));
         sm.record_response("b".to_string(), res("/b", 200));
+        sm.flush().await;
         let results = sm.search_sessions("status:404");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a");
     }
 
-    #[test]
-    fn search_note_matches_text() {
+    #[tokio::test]
+    async fn search_note_matches_text() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req("/a"));
         sm.record_request("b".to_string(), req("/b"));
-        sm.annotate("a", Some("critical bug".to_string()), None);
+        sm.annotate("a", Some("critical bug".to_string()), None)
+            .await;
         let results = sm.search_sessions("critical");
         assert_eq!(results.len(), 1);
     }
 
-    #[test]
-    fn search_no_match_returns_empty() {
+    #[tokio::test]
+    async fn search_no_match_returns_empty() {
         let sm = SessionManager::new(10_000);
         sm.record_request("a".to_string(), req("/api"));
+        sm.flush().await;
         let results = sm.search_sessions("zzz_no_match");
         assert!(results.is_empty());
     }
@@ -1034,11 +1288,18 @@ mod tests {
     fn parse_search_query_tag_term() {
         let terms = parse_search_query("tag:auth");
         assert_eq!(terms.len(), 1);
-        let mut ex = Exchange {
+        let ex = Exchange {
             id: "x".to_string(),
             timestamp: Utc::now(),
             updated_at: None,
-            request: req("/x"),
+            request: RequestContext {
+                method: "GET".to_string(),
+                uri: "/x".to_string(),
+                headers: HashMap::new(),
+                body: bytes::Bytes::new(),
+                host: "localhost".to_string(),
+                ..Default::default()
+            },
             response: None,
             metrics: None,
             source: SessionSource::Proxy,
@@ -1048,12 +1309,12 @@ mod tests {
             inspector_data: None,
         };
         assert!(terms[0].matches(&ex));
-        ex.tags = vec![];
-        assert!(!terms[0].matches(&ex));
+        let ex2 = Exchange { tags: vec![], ..ex };
+        assert!(!terms[0].matches(&ex2));
     }
 
-    #[test]
-    fn import_sessions_preserves_existing_updated_at() {
+    #[tokio::test]
+    async fn import_sessions_preserves_existing_updated_at() {
         let sm = SessionManager::new(10_000);
         let fixed_time = Utc::now() - chrono::Duration::hours(2);
         let exchange = Exchange {
@@ -1070,6 +1331,7 @@ mod tests {
             inspector_data: None,
         };
         sm.import_sessions(vec![exchange]);
+        sm.flush().await;
         let session = sm.get_session("imported").unwrap();
         assert_eq!(session.updated_at, Some(fixed_time));
     }

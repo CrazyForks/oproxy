@@ -1,6 +1,54 @@
 import React from 'react';
-const { Icon, Toggle, SurfaceShell, fetchJson, sendJson, notifyError, ask, formDialog, confirmAction, nonEmpty } = window;
+const { Icon, Toggle, SurfaceShell, fetchJson, sendJson, notifyError, ask, formDialog, confirmAction, nonEmpty, Modal, LocationEditor } = window;
 /* Additional surfaces: Mock / Lua / Webhooks / Settings / DNS / Capture / Shortcuts modal */
+
+// ─── Mock modal ────────────────────────────────────────────────────────
+
+const EMPTY_MOCK_LOC = { host: null, path: null, port: null, protocol: null, query: null, methods: [], mode: 'glob' };
+
+function MockModal({ rule, onClose, onSave }) {
+  const isNew = !rule;
+  const first = rule?.responses?.[0] || { status: 200, headers: {}, body: '', delay_ms: 0 };
+  const [name, setName] = React.useState(rule?.name || '');
+  const [loc, setLoc] = React.useState(rule?.location || EMPTY_MOCK_LOC);
+  const [status, setStatus] = React.useState(String(first.status || 200));
+  const [ct, setCt] = React.useState(first.headers?.['content-type'] || first.headers?.['Content-Type'] || 'application/json');
+  const [body, setBody] = React.useState(first.body || '{"ok":true}');
+  const lbl = { fontSize: 12, color: 'var(--text-faint)', whiteSpace: 'nowrap' };
+  const save = async () => {
+    try { await onSave({ name, loc, status: Number(status || 200), contentType: ct, body }); }
+    catch (e) { notifyError(e.message || e); }
+  };
+  return (
+    <Modal title={isNew ? 'Add mock response' : `Edit — ${rule.name}`} onClose={onClose} onSave={save}>
+      {/* Name row — full width */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+        <input className="cmp-input" style={{ flex: 1 }} value={name} onChange={e => setName(e.target.value)}
+               placeholder={isNew ? 'Name (optional)' : 'Name'} autoFocus />
+      </div>
+      {/* Location — shown for new rules; on edit, location is kept as-is */}
+      {isNew
+        ? <LocationEditor loc={loc} onChange={setLoc} />
+        : <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 8 }}>
+            Scope: {[rule.location?.host, rule.location?.path].filter(Boolean).join(' ') || 'any'}
+          </div>
+      }
+      {/* Status + Content-Type */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'max-content 80px max-content 1fr', gap: '6px 8px', alignItems: 'center', marginBottom: 8 }}>
+        <span style={lbl}>Status</span>
+        <input className="cmp-input" type="number" min="100" max="599" value={status} onChange={e => setStatus(e.target.value)} />
+        <span style={lbl}>Content-Type</span>
+        <input className="cmp-input" value={ct} onChange={e => setCt(e.target.value)} placeholder="application/json" />
+      </div>
+      {/* Body */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr', gap: '6px 8px', alignItems: 'start' }}>
+        <span style={{ ...lbl, paddingTop: 5 }}>Body</span>
+        <textarea className="cmp-input" rows={6} value={body} onChange={e => setBody(e.target.value)}
+                  placeholder='{"ok": true}' style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12 }} />
+      </div>
+    </Modal>
+  );
+}
 
 // ─── Mock Server ───────────────────────────────────────────────────────
 const INITIAL_MOCK_RULES = [];
@@ -8,6 +56,7 @@ const INITIAL_MOCK_RULES = [];
 function MockSurface() {
   const [rules, setRules] = React.useState(INITIAL_MOCK_RULES);
   const [expanded, setExpanded] = React.useState(null);
+  const [mockEdit, setMockEdit] = React.useState(undefined); // undefined=closed, null=new, obj=editing
   const load = React.useCallback(() => fetchJson('/admin/mock/rules', []).then(setRules), []);
   React.useEffect(() => { load(); }, [load]);
   const toggle = async (id) => {
@@ -16,43 +65,28 @@ function MockSurface() {
     await sendJson(`/admin/mock/rules/${encodeURIComponent(id)}`, 'PUT', { ...rule, enabled: !rule.enabled }).catch(e => notifyError(e.message || e));
     await load();
   };
-  const addMock = async () => {
-    const form = await formDialog('Add mock response', [
-      { name: 'name', label: 'Name', value: '' },
-      { name: 'path', label: 'Path regex', value: '/mock' },
-      { name: 'method', label: 'Method', type: 'select', value: 'GET', options: ['GET','POST','PUT','PATCH','DELETE','*'].map(v => ({ value: v, label: v })) },
-      { name: 'status', label: 'HTTP status', value: '200' },
-      { name: 'contentType', label: 'Content-Type', value: 'application/json' },
-      { name: 'body', label: 'Response body', value: '{"ok":true}', type: 'textarea', rows: 5 },
-    ]);
-    if (!form || !nonEmpty(form.path)) return;
-    const status = Number(form.status || 200);
-    await sendJson('/admin/mock/rules', 'POST', {
-      id: '',
-      name: form.name || `Mock ${form.path}`,
-      enabled: true,
-      method: form.method === '*' ? null : form.method,
-      host: null,
-      path_pattern: form.path,
-      responses: [{ status, headers: { 'content-type': form.contentType || 'application/json' }, body: form.body || '', delay_ms: 0 }],
-      call_count: 0,
-    }).catch(e => notifyError(e.message || e));
-    await load();
-  };
-  const editMock = async (rule) => {
-    const first = rule.responses?.[0] || { status: 200, headers: {}, body: '', delay_ms: 0 };
-    const form = await formDialog('Edit mock response', [
-      { name: 'name', label: 'Name', value: rule.name || '' },
-      { name: 'status', label: 'HTTP status', value: String(first.status || 200) },
-      { name: 'contentType', label: 'Content-Type', value: first.headers?.['content-type'] || first.headers?.['Content-Type'] || 'application/json' },
-      { name: 'body', label: 'Response body', value: first.body || '', type: 'textarea', rows: 5 },
-    ]);
-    if (!form) return;
-    await sendJson(`/admin/mock/rules/${encodeURIComponent(rule.id)}`, 'PUT', {
-      ...rule,
-      name: form.name || rule.name,
-      responses: [{ ...first, status: Number(form.status || 200), headers: { ...(first.headers || {}), 'content-type': form.contentType || 'application/json' }, body: form.body }],
-    }).catch(e => notifyError(e.message || e));
+  const saveMock = async ({ name, loc, status, contentType, body }) => {
+    if (mockEdit) {
+      // Edit existing — update first response; location unchanged
+      const first = mockEdit.responses?.[0] || { status: 200, headers: {}, body: '', delay_ms: 0 };
+      await sendJson(`/admin/mock/rules/${encodeURIComponent(mockEdit.id)}`, 'PUT', {
+        ...mockEdit,
+        name: name || mockEdit.name,
+        responses: [{ ...first, status, headers: { ...(first.headers || {}), 'content-type': contentType }, body }],
+      }).catch(e => notifyError(e.message || e));
+    } else {
+      // New — send full Location struct
+      const location = loc || EMPTY_MOCK_LOC;
+      await sendJson('/admin/mock/rules', 'POST', {
+        id: '',
+        name: name || `Mock ${location.path || '*'}`,
+        enabled: true,
+        location,
+        responses: [{ status, headers: { 'content-type': contentType }, body, delay_ms: 0 }],
+        call_count: 0,
+      }).catch(e => notifyError(e.message || e));
+    }
+    setMockEdit(undefined);
     await load();
   };
   const deleteMock = async (rule) => {
@@ -69,22 +103,26 @@ function MockSurface() {
     <SurfaceShell title="Mock Server"
                   sub={`${rules.filter(r => r.enabled).length} active · ${totalCalls} mock responses served`}
                   actions={<>
-                    <button className="btn primary" onClick={addMock}>＋ Add mock</button>
+                    <button className="btn primary" onClick={() => setMockEdit(null)}>＋ Add mock</button>
                   </>}>
       <div className="rule-head" style={{ gridTemplateColumns: '36px 1fr 80px 220px 120px 80px 100px' }}>
-        <div></div><div>Name / scope</div><div>Method</div><div>Pattern</div><div>Responses</div><div style={{ textAlign: 'right' }}>Calls</div><div></div>
+        <div></div><div>Name / scope</div><div>Methods</div><div>Path</div><div>Responses</div><div style={{ textAlign: 'right' }}>Calls</div><div></div>
       </div>
       {rules.length === 0 && <div className="empty">No mock rules are configured.</div>}
-      {rules.map(r => (
+      {rules.map(r => {
+        const loc = r.location || {};
+        const methods = loc.methods?.length ? loc.methods.join(', ') : '*';
+        const firstMethod = loc.methods?.[0] || 'GET';
+        return (
         <React.Fragment key={r.id}>
           <div className={'rule-row' + (r.enabled ? '' : ' off')} style={{ gridTemplateColumns: '36px 1fr 80px 220px 120px 80px 100px' }}>
             <div className="col-toggle"><Toggle label={`Toggle mock rule ${r.name}`} on={r.enabled} onChange={() => toggle(r.id)} /></div>
             <div className="col-match">
               <div style={{ color: 'var(--text-hi)', fontFamily: 'var(--font-sans)', fontSize: 12, fontWeight: 500 }}>{r.name}</div>
-              <div className="dim" style={{ fontSize: 11 }}>{r.host || 'any host'}</div>
+              <div className="dim" style={{ fontSize: 11 }}>{loc.host || 'any host'}</div>
             </div>
-            <div><span className="cell-method" data-m={r.method || 'GET'}>{r.method || '*'}</span></div>
-            <div className="col-match" style={{ color: 'var(--c-3xx)' }}>{r.path_pattern}</div>
+            <div><span className="cell-method" data-m={firstMethod}>{methods}</span></div>
+            <div className="col-match" style={{ color: 'var(--c-3xx)' }}>{loc.path || '.*'}</div>
             <div className="col-meta">
               {r.responses.length} response{r.responses.length === 1 ? '' : 's'}
               {r.responses.length > 1 && <span className="mute"> · weighted</span>}
@@ -94,7 +132,7 @@ function MockSurface() {
               <button className="copy-btn" onClick={() => setExpanded(expanded === r.id ? null : r.id)} aria-expanded={expanded === r.id} aria-label={`${expanded === r.id ? 'Hide' : 'Show'} mock responses for ${r.name}`}>
                 {expanded === r.id ? 'hide' : 'show'}
               </button>
-              <button className="copy-btn" onClick={() => editMock(r)} aria-label={`Edit mock rule ${r.name}`}>edit</button>
+              <button className="copy-btn" onClick={() => setMockEdit(r)} aria-label={`Edit mock rule ${r.name}`}>edit</button>
               <button className="copy-btn" onClick={() => deleteMock(r)} aria-label={`Delete mock rule ${r.name}`}>×</button>
             </div>
           </div>
@@ -111,7 +149,10 @@ function MockSurface() {
             </div>
           )}
         </React.Fragment>
-      ))}
+      ); })}
+      {mockEdit !== undefined && (
+        <MockModal rule={mockEdit} onClose={() => setMockEdit(undefined)} onSave={saveMock} />
+      )}
     </SurfaceShell>
   );
 }

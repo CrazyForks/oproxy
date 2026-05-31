@@ -10,8 +10,9 @@ cargo build
 cargo build --release
 
 # Build the React UI assets required by Rust include_str! routes
-npm ci --prefix src/design
-npm run build --prefix src/design
+corepack enable
+yarn --cwd src/design install --frozen-lockfile
+yarn --cwd src/design build
 
 # Run all Rust tests with release warning policy
 RUSTFLAGS="-D warnings" cargo test
@@ -26,7 +27,7 @@ cargo test middleware::plugins::jwt_inspector
 cargo clippy -- -D warnings
 
 # Run the proxy. A clean checkout will build src/design/dist automatically
-# if Node/npm are available; explicit UI build is still faster in CI.
+# if Node/Yarn are available; explicit UI build is still faster in CI.
 cargo run
 ```
 
@@ -125,7 +126,7 @@ routing_table       Arc<RwLock<HashMap<...>>>
 
 ### Persistence
 
-`storage.rs` contains `load_*` / `save_*` pairs for each persisted type. All write synchronously via `std::fs::write`. Session data is **in-memory only** (lost on restart unless explicitly saved via `POST /admin/sessions/save`).
+`storage.rs` contains `load_*` / `save_*` pairs for each persisted type. The `save_*` functions are **async** and write via `tokio::fs` (atomic tmp-write + rename) so config persistence from axum handlers never blocks a Tokio worker thread. The `load_*` functions remain synchronous — they only run once at startup (`runtime/state.rs`), before the server accepts connections. Session data is **in-memory only** (lost on restart unless explicitly saved via `POST /admin/sessions/save`).
 
 Storage files in `./storage/` (default):
 

@@ -1,5 +1,26 @@
 // @ts-check
 const { test, expect } = require('@playwright/test');
+const http = require('http');
+
+function proxyGet(baseURL, targetUrl) {
+  const proxy = new URL(baseURL);
+  const target = new URL(targetUrl);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: proxy.hostname,
+      port: proxy.port || 80,
+      method: 'GET',
+      path: targetUrl,
+      headers: { Host: target.host },
+    }, res => {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
 
 test.describe('roadmap fixes', () => {
   test('forward rejects invalid method before recording a session', async ({ request }) => {
@@ -33,15 +54,21 @@ test.describe('roadmap fixes', () => {
     expect(body.error).toContain('start with curl');
   });
 
-  test('mock responses are recorded as completed sessions', async ({ request }) => {
+  test('mock responses are recorded as completed sessions', async ({ request, baseURL }) => {
     const create = await request.post('/admin/mock/rules', {
       data: {
         id: '',
         name: 'roadmap-mock-complete',
         enabled: true,
-        method: 'GET',
-        path_pattern: '^/roadmap-mock$',
-        host: null,
+        location: {
+          host: null,
+          path: '^/roadmap-mock$',
+          port: null,
+          protocol: null,
+          query: null,
+          methods: ['GET'],
+          mode: 'regex',
+        },
         responses: [{
           status: 203,
           headers: { 'content-type': 'text/plain' },
@@ -56,9 +83,9 @@ test.describe('roadmap fixes', () => {
     const rule = rules.find(r => r.name === 'roadmap-mock-complete');
     expect(rule).toBeTruthy();
 
-    const proxied = await request.get('/roadmap-mock');
-    expect(proxied.status()).toBe(203);
-    expect(await proxied.text()).toBe('mocked from roadmap test');
+    const proxied = await proxyGet(baseURL, 'http://roadmap-mock.example.com/roadmap-mock');
+    expect(proxied.status).toBe(203);
+    expect(proxied.body).toBe('mocked from roadmap test');
 
     await expect.poll(async () => {
       const list = await (await request.get('/api/sessions')).json();
@@ -107,13 +134,15 @@ test.describe('roadmap fixes', () => {
 
   test('status and settings distinguish client proxy from bind address', async ({ page }) => {
     await page.goto('/');
-    await expect(page.getByRole('button', { name: /PROXY (127\.0\.0\.1|localhost):18080/ })).toBeVisible();
+    const port = new URL(process.env.OPROXY_BASE_URL || 'http://localhost:18080').port || '80';
+    const proxyPattern = new RegExp(`PROXY (127\\\\.0\\\\.0\\\\.1|localhost):${port}`);
+    await expect(page.getByRole('button', { name: proxyPattern })).toBeVisible();
 
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
     const listener = page.locator('.insp-card').filter({ hasText: 'Listener' });
     await expect(listener).toContainText('Client proxy');
-    await expect(listener).toContainText(/(127\.0\.0\.1|localhost):18080/);
+    await expect(listener).toContainText(new RegExp(`(127\\\\.0\\\\.0\\\\.1|localhost):${port}`));
     await expect(listener).toContainText('tunnel-only');
   });
 });

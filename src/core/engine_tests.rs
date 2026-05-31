@@ -2,8 +2,9 @@
 mod tests {
     use crate::core::engine::ProxyEngine;
     use crate::middleware::chain::MiddlewareChain;
+    use crate::middleware::matcher::Location;
     use crate::middleware::plugins::inspection::InspectionMiddleware;
-    use crate::middleware::plugins::routing::RoutingMiddleware;
+    use crate::middleware::plugins::map_remote::{MapRemoteMiddleware, MapRemoteRule};
     use crate::middleware::{Middleware, RequestContext, ResponseContext};
     use crate::session::SessionManager;
     use axum::body::Body;
@@ -18,9 +19,8 @@ mod tests {
             method: "GET".to_string(),
             uri: uri.to_string(),
             headers: HashMap::new(),
-            body: "".to_string(),
+            body: bytes::Bytes::new(),
             host: host.to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -63,34 +63,42 @@ mod tests {
 
         let mut req_ctx = req("http://example.com", "example.com");
         middleware.on_request(&mut req_ctx).await;
+        session_manager.flush().await;
 
         let mut resp_ctx = ResponseContext {
             request_uri: "http://example.com".to_string(),
             status: 200,
             headers: Default::default(),
-            body: "".to_string(),
+            body: bytes::Bytes::new(),
             session_id: None,
             ttfb_ms: 0,
             body_ms: 0,
-            body_bytes: None,
             ..Default::default()
         };
         middleware.on_response(&mut resp_ctx).await;
+        session_manager.flush().await;
 
         let sessions = session_manager.get_all_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].metrics.as_ref().unwrap().status_code, 200);
     }
 
-    /// RoutingMiddleware must set the typed `destination` on the request context
-    /// when a matching route is registered.
+    /// MapRemoteMiddleware must set the typed `destination` on the request context
+    /// when a matching rule is found.
     #[tokio::test]
-    async fn routing_middleware_sets_destination() {
-        let mut table = HashMap::new();
-        table.insert("api.local".to_string(), "http://10.0.0.2:8000".to_string());
-        let routing = RoutingMiddleware::new(Arc::new(RwLock::new(table)));
+    async fn map_remote_middleware_sets_destination() {
+        let mw = MapRemoteMiddleware::new(vec![MapRemoteRule {
+            id: "r1".into(),
+            name: "staging".into(),
+            enabled: true,
+            location: Location {
+                host: Some("api.local".into()),
+                ..Default::default()
+            },
+            destination: "http://10.0.0.2:8000".into(),
+        }]);
         let mut ctx = req("/data", "api.local");
-        routing.on_request(&mut ctx).await;
+        mw.on_request(&mut ctx).await;
         assert_eq!(ctx.destination.as_deref(), Some("http://10.0.0.2:8000"));
         assert!(
             !ctx.headers.contains_key("x-oproxy-destination"),

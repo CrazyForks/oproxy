@@ -277,9 +277,8 @@ pub async fn handle_websocket(
             method: "WS".to_string(),
             uri: format!("ws://{}:{}{}", target_host, port, path_and_query),
             headers: req_headers_map,
-            body: String::new(),
+            body: bytes::Bytes::new(),
             host: target_host.clone(),
-            body_bytes: None,
             ..Default::default()
         },
     );

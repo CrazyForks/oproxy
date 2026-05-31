@@ -1,3 +1,4 @@
+use crate::core::engine::is_binary_content_type;
 use crate::middleware::{RequestContext, ResponseContext};
 /// HAR 1.2 (HTTP Archive) serialisation/deserialisation.
 /// Spec: http://www.softwareishard.com/blog/har-12-spec/
@@ -5,10 +6,34 @@ use crate::middleware::{RequestContext, ResponseContext};
 /// oproxy-specific extension fields are prefixed with `_oproxy_` and are
 /// preserved on import so sessions roundtrip without data loss.
 use crate::session::{Exchange, InspectionMetrics, SessionSource};
+use base64::Engine as _;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Render body bytes for the HAR `text` field: base64 for binary content types
+/// (matching how binary bodies are presented elsewhere) and lossy UTF-8 otherwise.
+fn har_body_text(body: &Bytes, mime_type: &str) -> String {
+    if is_binary_content_type(mime_type) {
+        base64::engine::general_purpose::STANDARD.encode(body)
+    } else {
+        String::from_utf8_lossy(body).into_owned()
+    }
+}
+
+/// Inverse of [`har_body_text`]: decode the HAR `text` field back into raw bytes.
+fn har_body_bytes(text: String, mime_type: &str) -> Bytes {
+    if is_binary_content_type(mime_type) {
+        base64::engine::general_purpose::STANDARD
+            .decode(text.as_bytes())
+            .map(Bytes::from)
+            .unwrap_or_else(|_| Bytes::from(text.into_bytes()))
+    } else {
+        Bytes::from(text.into_bytes())
+    }
+}
 
 // ── HAR types ─────────────────────────────────────────────────────────────────
 
@@ -191,7 +216,7 @@ pub fn exchange_to_har_entry(ex: &Exchange) -> HarEntry {
             .unwrap_or_else(|| "application/octet-stream".to_string());
         Some(HarPostData {
             mime_type,
-            text: req.body.clone(),
+            text: req.body_text().into_owned(),
         })
     };
 
@@ -232,11 +257,11 @@ pub fn exchange_to_har_entry(ex: &Exchange) -> HarEntry {
             headers: har_res_headers,
             content: HarContent {
                 size: res.body.len() as i64,
-                mime_type,
+                mime_type: mime_type.clone(),
                 text: if res.body.is_empty() {
                     None
                 } else {
-                    Some(res.body.clone())
+                    Some(har_body_text(&res.body, &mime_type))
                 },
             },
             redirect_url: res.headers.get("location").cloned().unwrap_or_default(),
@@ -344,7 +369,19 @@ pub fn har_entry_to_exchange(entry: &HarEntry) -> Exchange {
             .iter()
             .map(|nv| (nv.name.clone(), nv.value.clone()))
             .collect();
-        let body = entry.response.content.text.clone().unwrap_or_default();
+        let res_mime = entry
+            .response
+            .content
+            .mime_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let body = har_body_bytes(
+            entry.response.content.text.clone().unwrap_or_default(),
+            &res_mime,
+        );
         Some(ResponseContext {
             status: entry.response.status,
             headers: res_headers,
@@ -353,7 +390,6 @@ pub fn har_entry_to_exchange(entry: &HarEntry) -> Exchange {
             session_id: Some(id.clone()),
             ttfb_ms,
             body_ms: entry.timings.receive as u64,
-            body_bytes: None,
             ..Default::default()
         })
     } else {
@@ -385,9 +421,8 @@ pub fn har_entry_to_exchange(entry: &HarEntry) -> Exchange {
             method: entry.request.method.clone(),
             uri: entry.request.url.clone(),
             headers,
-            body,
+            body: Bytes::from(body.into_bytes()),
             host,
-            body_bytes: None,
             ..Default::default()
         },
         response,
@@ -443,15 +478,17 @@ pub fn har_to_exchanges(har: &Har) -> Vec<Exchange> {
 
 fn redact_exchange_for_export(mut ex: Exchange) -> Exchange {
     let sensitive_values =
-        crate::redaction::sensitive_values(&ex.request.headers, &ex.request.body);
+        crate::redaction::sensitive_values(&ex.request.headers, &ex.request.body_text());
     ex.request.headers = crate::redaction::redact_headers(&ex.request.headers);
     strip_har_headers(&mut ex.request.headers);
-    ex.request.body = crate::redaction::redact_body_text(&ex.request.body);
+    let redacted_req = crate::redaction::redact_body_text(&ex.request.body_text());
+    ex.request.set_body_text(redacted_req);
     if let Some(response) = &mut ex.response {
         response.headers = crate::redaction::redact_headers(&response.headers);
         strip_har_headers(&mut response.headers);
-        response.body = crate::redaction::redact_body_text(&response.body);
-        response.body = crate::redaction::redact_known_values(&response.body, &sensitive_values);
+        let redacted = crate::redaction::redact_body_text(&response.body_text());
+        let redacted = crate::redaction::redact_known_values(&redacted, &sensitive_values);
+        response.set_body_text(redacted);
     }
     ex
 }
@@ -591,12 +628,11 @@ mod tests {
             Some(ResponseContext {
                 status,
                 headers: res_headers,
-                body: body.to_string(),
+                body: Bytes::from(body.to_string()),
                 request_uri: uri.to_string(),
                 session_id: Some("test-id".to_string()),
                 ttfb_ms: 80,
                 body_ms: 20,
-                body_bytes: None,
                 ..Default::default()
             })
         } else {
@@ -623,9 +659,8 @@ mod tests {
                 method: method.to_string(),
                 uri: uri.to_string(),
                 headers: req_headers,
-                body: req_body.to_string(),
+                body: Bytes::from(req_body.to_string()),
                 host: "example.com".to_string(),
-                body_bytes: None,
                 ..Default::default()
             },
             response,
@@ -838,7 +873,7 @@ mod tests {
         let ex = make_exchange("POST", "https://example.com/", 201, "", r#"{"k":"v"}"#);
         let entry = exchange_to_har_entry(&ex);
         let ex2 = har_entry_to_exchange(&entry);
-        assert!(ex2.request.body.contains("k"));
+        assert!(ex2.request.body_text().contains("k"));
     }
 
     #[test]

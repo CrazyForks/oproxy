@@ -32,9 +32,8 @@ mod tests {
                     method: "GET".to_string(),
                     uri: "/".to_string(),
                     headers: std::collections::HashMap::new(),
-                    body: "".to_string(),
+                    body: bytes::Bytes::new(),
                     host: "example.com".to_string(),
-                    body_bytes: None,
                     ..Default::default()
                 })
                 .await;

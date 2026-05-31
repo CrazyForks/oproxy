@@ -85,9 +85,8 @@ mod tests {
             method: "GET".to_string(),
             uri: format!("http://{}/", host),
             headers: HashMap::new(),
-            body: String::new(),
+            body: bytes::Bytes::new(),
             host: host.to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }

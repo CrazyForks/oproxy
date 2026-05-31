@@ -20,13 +20,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: src/design/package-lock.json
+          cache: yarn
+          cache-dependency-path: src/design/yarn.lock
 
       - name: Build UI
         run: |
-          npm ci --prefix src/design
-          npm run build --prefix src/design
+          corepack enable
+          yarn --cwd src/design install --frozen-lockfile
+          yarn --cwd src/design build
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable

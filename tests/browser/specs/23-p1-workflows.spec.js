@@ -159,22 +159,22 @@ test.describe('P1 developer workflows', () => {
 
     await page.getByRole('button', { name: 'Rules', exact: true }).click();
     await page.getByRole('button', { name: 'Add rule' }).click();
-    await expect(page.locator('.ui-dialog')).toContainText('Add route');
-    await expect(page.locator('.ui-dialog')).toContainText('Source host');
-    await expect(page.locator('.ui-dialog')).toContainText('Destination base URL');
+    await expect(page.locator('.ui-dialog')).toContainText('New rule set');
+    await expect(page.locator('.ui-dialog')).toContainText('Host');
+    await expect(page.locator('.ui-dialog')).toContainText('Actions');
     await page.getByRole('button', { name: 'Cancel' }).click();
 
     await page.getByRole('button', { name: 'Breakpoints', exact: true }).click();
     await page.getByRole('button', { name: 'Add breakpoint' }).click();
-    await expect(page.locator('.ui-dialog')).toContainText('URI/body regex');
-    await expect(page.locator('.ui-dialog')).toContainText('Pause on');
+    await expect(page.locator('.ui-dialog')).toContainText('Host');
+    await expect(page.locator('.ui-dialog')).toContainText('Pause');
     await page.getByRole('button', { name: 'Cancel' }).click();
 
     await page.getByRole('button', { name: 'Mock Server', exact: true }).click();
     await page.getByRole('button', { name: 'Add mock' }).click();
-    await expect(page.locator('.ui-dialog')).toContainText('Path regex');
-    await expect(page.locator('.ui-dialog')).toContainText('HTTP status');
-    await expect(page.locator('.ui-dialog')).toContainText('Response body');
+    await expect(page.locator('.ui-dialog')).toContainText('Path');
+    await expect(page.locator('.ui-dialog')).toContainText('Status');
+    await expect(page.locator('.ui-dialog')).toContainText('Body');
     await page.getByRole('button', { name: 'Cancel' }).click();
 
     await page.getByRole('button', { name: 'DNS Override', exact: true }).click();

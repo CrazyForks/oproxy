@@ -76,7 +76,7 @@ impl RewriteMiddleware {
             }
             MatchCriteria::Body(pattern) => {
                 if let Ok(re) = Regex::new(pattern) {
-                    re.is_match(&req.body)
+                    re.is_match(&req.body_text())
                 } else {
                     false
                 }
@@ -95,7 +95,7 @@ impl RewriteMiddleware {
             }
             MatchCriteria::Body(pattern) => {
                 if let Ok(re) = Regex::new(pattern) {
-                    re.is_match(&res.body)
+                    re.is_match(&res.body_text())
                 } else {
                     false
                 }
@@ -104,7 +104,8 @@ impl RewriteMiddleware {
         }
     }
 
-    fn apply_body_action(&self, rule: &RewriteRule, body: &mut String) -> bool {
+    /// Returns the rewritten body text if the rule changed it, else `None`.
+    fn apply_body_action(&self, rule: &RewriteRule, body: &str) -> Option<String> {
         if let RewriteAction::ReplaceBody {
             pattern,
             replacement,
@@ -112,12 +113,11 @@ impl RewriteMiddleware {
             && let Ok(re) = Regex::new(pattern)
         {
             let rewritten = re.replace_all(body, replacement).to_string();
-            if rewritten != *body {
-                *body = rewritten;
-                return true;
+            if rewritten != body {
+                return Some(rewritten);
             }
         }
-        false
+        None
     }
 
     fn apply_action_header(
@@ -205,8 +205,8 @@ impl Middleware for RewriteMiddleware {
                     }
                     _ => {
                         self.apply_action_header(rule, &mut ctx.headers);
-                        if self.apply_body_action(rule, &mut ctx.body) {
-                            ctx.body_bytes = None;
+                        if let Some(new_body) = self.apply_body_action(rule, &ctx.body_text()) {
+                            ctx.set_body_text(new_body);
                             remove_header(&mut ctx.headers, "content-length");
                         }
                     }
@@ -221,8 +221,8 @@ impl Middleware for RewriteMiddleware {
         for rule in rules.iter().filter(|r| r.enabled) {
             if self.matches_res(rule, ctx) {
                 self.apply_action_header(rule, &mut ctx.headers);
-                if self.apply_body_action(rule, &mut ctx.body) {
-                    ctx.body_bytes = None;
+                if let Some(new_body) = self.apply_body_action(rule, &ctx.body_text()) {
+                    ctx.set_body_text(new_body);
                     // Content-Length from upstream is now stale - remove it so hyper
                     // doesn't panic on a length mismatch when we serve the modified body.
                     remove_header(&mut ctx.headers, "content-length");
@@ -245,9 +245,8 @@ mod tests {
             method: "GET".to_string(),
             uri: uri.to_string(),
             headers,
-            body: body.to_string(),
+            body: Bytes::from(body.to_string()),
             host: host.to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -256,12 +255,8 @@ mod tests {
         ResponseContext {
             status: 200,
             headers: HashMap::new(),
-            body: body.to_string(),
+            body: Bytes::from(body.to_string()),
             request_uri: uri.to_string(),
-            session_id: None,
-            ttfb_ms: 0,
-            body_ms: 0,
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -412,7 +407,7 @@ mod tests {
         ctx.headers
             .insert("content-length".to_string(), "14".to_string());
         mw.on_request(&mut ctx).await;
-        assert_eq!(ctx.body, "my REDACTED data");
+        assert_eq!(ctx.body_text(), "my REDACTED data");
         assert!(!ctx.headers.contains_key("content-length"));
     }
 
@@ -443,13 +438,13 @@ mod tests {
             },
             true,
         )]);
-        let mut ctx = req("h", "/", "binary-as-text");
-        ctx.body_bytes = Some(Bytes::from_static(b"\x00\xff"));
+        let mut ctx = req("h", "/", "");
+        ctx.body = Bytes::from_static(b"\x00\xff");
 
         mw.on_request(&mut ctx).await;
 
         assert_eq!(ctx.headers.get("x-added").map(|s| s.as_str()), Some("v"));
-        assert_eq!(ctx.body_bytes.as_deref(), Some(&b"\x00\xff"[..]));
+        assert_eq!(ctx.body.as_ref(), b"\x00\xff");
     }
 
     #[tokio::test]
@@ -463,14 +458,12 @@ mod tests {
             true,
         )]);
         let mut ctx = req("h", "/", "secret");
-        ctx.body_bytes = Some(Bytes::from_static(b"secret"));
         ctx.headers
             .insert("Content-Length".to_string(), "6".to_string());
 
         mw.on_request(&mut ctx).await;
 
-        assert_eq!(ctx.body, "public");
-        assert!(ctx.body_bytes.is_none());
+        assert_eq!(ctx.body_text(), "public");
         assert!(header_value(&ctx.headers, "content-length").is_none());
     }
 
@@ -592,7 +585,7 @@ mod tests {
         )]);
         let mut ctx = res("/api/test", "foo baz foo");
         mw.on_response(&mut ctx).await;
-        assert_eq!(ctx.body, "bar baz bar");
+        assert_eq!(ctx.body_text(), "bar baz bar");
     }
 
     #[tokio::test]

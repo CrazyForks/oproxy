@@ -85,7 +85,7 @@ impl PlaybackEngine {
                         req_ctx,
                         SessionSource::Playback,
                     );
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = resp.bytes().await.unwrap_or_default();
                     self.session_manager.record_response(
                         new_id,
                         crate::middleware::ResponseContext {
@@ -93,10 +93,6 @@ impl PlaybackEngine {
                             headers: std::collections::HashMap::new(),
                             body,
                             request_uri: uri.clone(),
-                            session_id: None,
-                            ttfb_ms: 0,
-                            body_ms: 0,
-                            body_bytes: None,
                             ..Default::default()
                         },
                     );

@@ -30,9 +30,9 @@ fn export_as_curl_with_redaction(ex: &Exchange, redact: bool) -> String {
 
     if !req.body.is_empty() {
         let body = if redact {
-            crate::redaction::redact_body_text(&req.body)
+            crate::redaction::redact_body_text(&req.body_text())
         } else {
-            req.body.clone()
+            req.body_text().into_owned()
         };
         let escaped = body.replace('\'', "'\\''");
         parts.push(format!("--data '{}'", escaped));
@@ -71,9 +71,9 @@ fn export_as_fetch_with_redaction(ex: &Exchange, redact: bool) -> String {
 
     if !req.body.is_empty() {
         let body = if redact {
-            crate::redaction::redact_body_text(&req.body)
+            crate::redaction::redact_body_text(&req.body_text())
         } else {
-            req.body.clone()
+            req.body_text().into_owned()
         };
         opts_parts.push(format!("  body: {}", js_string(&body)));
     }
@@ -113,9 +113,9 @@ fn export_as_python_with_redaction(ex: &Exchange, redact: bool) -> String {
         String::new()
     } else {
         let body = if redact {
-            crate::redaction::redact_body_text(&req.body)
+            crate::redaction::redact_body_text(&req.body_text())
         } else {
-            req.body.clone()
+            req.body_text().into_owned()
         };
         format!("\ndata = {}\n", python_string(&body))
     };
@@ -323,13 +323,8 @@ impl From<ParsedCurl> for RequestContext {
             method: p.method,
             uri: p.url,
             headers: p.headers,
-            body: p.body.clone(),
+            body: bytes::Bytes::from(p.body.into_bytes()),
             host,
-            body_bytes: if p.body.is_empty() {
-                None
-            } else {
-                Some(bytes::Bytes::from(p.body.into_bytes()))
-            },
             ..Default::default()
         }
     }
@@ -367,9 +362,8 @@ mod tests {
                 method: method.to_string(),
                 uri: uri.to_string(),
                 headers: hmap,
-                body: body.to_string(),
+                body: bytes::Bytes::from(body.to_string()),
                 host: "example.com".to_string(),
-                body_bytes: None,
                 ..Default::default()
             },
             response: None,

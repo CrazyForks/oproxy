@@ -2,9 +2,6 @@ use crate::core::playback::PlaybackEngine;
 use crate::middleware::plugins::breakpoints::{
     BreakpointContext, BreakpointManager, BreakpointResolution, BreakpointRule, BreakpointType,
 };
-use crate::middleware::plugins::header_map::{HeaderMapMiddleware, HeaderMapRule};
-use crate::middleware::plugins::modification::{ModificationMiddleware, ModificationRule};
-use crate::middleware::plugins::rewrite::{RewriteMiddleware, RewriteRule};
 use crate::session::Exchange;
 use crate::session::SharedSessionManager;
 use serde::{Deserialize, Serialize};
@@ -37,29 +34,20 @@ pub struct PendingBreakpointInfo {
 
 pub struct ApiHandler {
     pub session_manager: SharedSessionManager,
-    rewrite_middleware: Arc<RewriteMiddleware>,
     breakpoint_manager: Arc<BreakpointManager>,
-    header_map_middleware: Arc<HeaderMapMiddleware>,
-    modification_middleware: Arc<ModificationMiddleware>,
     playback_engine: PlaybackEngine,
 }
 
 impl ApiHandler {
     pub fn new(
         session_manager: SharedSessionManager,
-        rewrite_middleware: Arc<RewriteMiddleware>,
         breakpoint_manager: Arc<BreakpointManager>,
-        header_map_middleware: Arc<HeaderMapMiddleware>,
-        modification_middleware: Arc<ModificationMiddleware>,
         egress_policy: crate::security::AdminEgressPolicy,
     ) -> Self {
         let playback_engine = PlaybackEngine::new(session_manager.clone(), egress_policy);
         Self {
             session_manager,
-            rewrite_middleware,
             breakpoint_manager,
-            header_map_middleware,
-            modification_middleware,
             playback_engine,
         }
     }
@@ -122,11 +110,9 @@ impl ApiHandler {
 
         if !include_bodies {
             for exchange in &mut paged {
-                exchange.request.body.clear();
-                exchange.request.body_bytes = None;
+                exchange.request.body = bytes::Bytes::new();
                 if let Some(response) = &mut exchange.response {
-                    response.body.clear();
-                    response.body_bytes = None;
+                    response.body = bytes::Bytes::new();
                 }
                 for frame in &mut exchange.ws_frames {
                     frame.payload_text = None;
@@ -151,55 +137,7 @@ impl ApiHandler {
 
     pub async fn clear_sessions(&self) {
         self.session_manager.clear_sessions();
-    }
-
-    pub async fn add_rewrite_rule(&self, rule: RewriteRule) {
-        let mut rules = self.rewrite_middleware.rules.write().await;
-        rules.push(rule);
-    }
-
-    pub async fn list_rewrite_rules(&self) -> Vec<RewriteRule> {
-        self.rewrite_middleware.rules.read().await.clone()
-    }
-
-    pub async fn delete_rewrite_rule(&self, index: usize) {
-        let mut rules = self.rewrite_middleware.rules.write().await;
-        if index < rules.len() {
-            rules.remove(index);
-        }
-    }
-
-    pub async fn update_rewrite_rule(&self, index: usize, rule: RewriteRule) {
-        let mut rules = self.rewrite_middleware.rules.write().await;
-        if index < rules.len() {
-            rules[index] = rule;
-        }
-    }
-
-    pub async fn replace_all_rewrite_rules(&self, new_rules: Vec<RewriteRule>) {
-        let mut rules = self.rewrite_middleware.rules.write().await;
-        *rules = new_rules;
-    }
-
-    pub async fn list_header_maps(&self) -> Vec<HeaderMapRule> {
-        self.header_map_middleware.rules.read().await.clone()
-    }
-
-    pub async fn add_header_map(&self, rule: HeaderMapRule) {
-        let mut rules = self.header_map_middleware.rules.write().await;
-        rules.push(rule);
-    }
-
-    pub async fn update_header_map(&self, id: &str, updated: HeaderMapRule) {
-        let mut rules = self.header_map_middleware.rules.write().await;
-        if let Some(r) = rules.iter_mut().find(|r| r.id == id) {
-            *r = updated;
-        }
-    }
-
-    pub async fn delete_header_map(&self, id: &str) {
-        let mut rules = self.header_map_middleware.rules.write().await;
-        rules.retain(|r| r.id != id);
+        self.session_manager.flush().await;
     }
 
     pub async fn resolve_breakpoint(
@@ -240,28 +178,13 @@ impl ApiHandler {
             .collect()
     }
 
-    pub async fn list_modifications(&self) -> Vec<ModificationRule> {
-        self.modification_middleware.rules.read().await.clone()
-    }
-
-    pub async fn add_modification(&self, rule: ModificationRule) {
-        self.modification_middleware.rules.write().await.push(rule);
-    }
-
-    pub async fn delete_modification(&self, index: usize) {
-        let mut rules = self.modification_middleware.rules.write().await;
-        if index < rules.len() {
-            rules.remove(index);
-        }
-    }
-
     pub async fn annotate_session(
         &self,
         id: &str,
         note: Option<String>,
         tags: Option<Vec<String>>,
     ) -> bool {
-        self.session_manager.annotate(id, note, tags)
+        self.session_manager.annotate(id, note, tags).await
     }
 }
 
@@ -282,9 +205,6 @@ pub fn pretty_body(body: &str, content_type: &str) -> String {
 mod tests {
     use super::*;
     use crate::middleware::plugins::breakpoints::BreakpointManager;
-    use crate::middleware::plugins::header_map::HeaderMapMiddleware;
-    use crate::middleware::plugins::modification::ModificationMiddleware;
-    use crate::middleware::plugins::rewrite::RewriteMiddleware;
     use crate::middleware::{RequestContext, ResponseContext};
     use crate::session::SessionManager;
     use std::collections::HashMap;
@@ -294,10 +214,7 @@ mod tests {
         let sm = Arc::new(SessionManager::new(10_000));
         ApiHandler::new(
             sm,
-            Arc::new(RewriteMiddleware::new(vec![])),
             Arc::new(BreakpointManager::new()),
-            Arc::new(HeaderMapMiddleware::new(vec![])),
-            Arc::new(ModificationMiddleware::new(vec![])),
             crate::security::AdminEgressPolicy::default(),
         )
     }
@@ -307,9 +224,8 @@ mod tests {
             method: "GET".to_string(),
             uri: uri.to_string(),
             headers: HashMap::new(),
-            body: String::new(),
+            body: bytes::Bytes::new(),
             host: "localhost".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -321,6 +237,7 @@ mod tests {
         let h = make_handler();
         h.session_manager.record_request("a".to_string(), req("/a"));
         h.session_manager.record_request("b".to_string(), req("/b"));
+        h.session_manager.flush().await;
         let r = h.list_sessions(None, None, None, None, true).await;
         assert_eq!(r.total, 2);
         assert_eq!(r.sessions.len(), 2);
@@ -336,15 +253,12 @@ mod tests {
             ResponseContext {
                 status: 200,
                 headers: HashMap::new(),
-                body: String::new(),
+                body: bytes::Bytes::new(),
                 request_uri: "/a".to_string(),
-                session_id: None,
-                ttfb_ms: 0,
-                body_ms: 0,
-                body_bytes: None,
                 ..Default::default()
             },
         );
+        h.session_manager.flush().await;
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let r = h.list_sessions(Some(future), None, None, None, true).await;
         assert_eq!(r.total, 1);
@@ -359,6 +273,7 @@ mod tests {
     async fn list_sessions_since_past_returns_all() {
         let h = make_handler();
         h.session_manager.record_request("a".to_string(), req("/a"));
+        h.session_manager.flush().await;
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         let r = h.list_sessions(Some(past), None, None, None, true).await;
         assert_eq!(r.sessions.len(), 1);
@@ -373,6 +288,7 @@ mod tests {
             h.session_manager
                 .record_request(format!("id-{i}"), req(&format!("/{i}")));
         }
+        h.session_manager.flush().await;
         let r = h.list_sessions(None, Some(2), None, None, true).await;
         assert_eq!(r.total, 5);
         assert_eq!(r.sessions.len(), 2);
@@ -383,34 +299,38 @@ mod tests {
     async fn list_sessions_can_return_bodyless_summaries() {
         let h = make_handler();
         let mut request = req("/large");
-        request.body = "request-body".to_string();
+        request.body = bytes::Bytes::from_static(b"request-body");
         h.session_manager.record_request("id1".to_string(), request);
         h.session_manager.record_response(
             "id1".to_string(),
             ResponseContext {
                 status: 200,
                 headers: HashMap::new(),
-                body: "response-body".to_string(),
+                body: bytes::Bytes::from_static(b"response-body"),
                 request_uri: "/large".to_string(),
-                session_id: None,
-                ttfb_ms: 0,
-                body_ms: 0,
-                body_bytes: None,
                 ..Default::default()
             },
         );
+        h.session_manager.flush().await;
 
         let summary = h.list_sessions(None, None, None, None, false).await;
-        assert_eq!(summary.sessions[0].request.body, "");
-        assert_eq!(
-            summary.sessions[0].response.as_ref().unwrap().body,
-            "",
+        assert!(summary.sessions[0].request.body.is_empty());
+        assert!(
+            summary.sessions[0]
+                .response
+                .as_ref()
+                .unwrap()
+                .body
+                .is_empty(),
             "list summaries must not ship full bodies"
         );
 
         let detail = h.get_session_details("id1").await.unwrap();
-        assert_eq!(detail.exchange.request.body, "request-body");
-        assert_eq!(detail.exchange.response.unwrap().body, "response-body");
+        assert_eq!(detail.exchange.request.body_text(), "request-body");
+        assert_eq!(
+            detail.exchange.response.unwrap().body_text(),
+            "response-body"
+        );
     }
 
     #[tokio::test]
@@ -420,6 +340,7 @@ mod tests {
             h.session_manager
                 .record_request(format!("id-{i}"), req(&format!("/{i}")));
         }
+        h.session_manager.flush().await;
         let r = h.list_sessions(None, None, Some(3), None, true).await;
         assert_eq!(r.total, 5);
         assert_eq!(r.sessions.len(), 2); // 5 - skip 3
@@ -433,6 +354,7 @@ mod tests {
             h.session_manager
                 .record_request(format!("id-{i}"), req(&format!("/{i}")));
         }
+        h.session_manager.flush().await;
         let r = h.list_sessions(None, Some(3), Some(4), None, true).await;
         assert_eq!(r.total, 10);
         assert_eq!(r.sessions.len(), 3);
@@ -443,6 +365,7 @@ mod tests {
         let h = make_handler();
         h.session_manager
             .record_request("id1".to_string(), req("/a"));
+        h.session_manager.flush().await;
         let r = h.list_sessions(None, None, Some(100), None, true).await;
         assert_eq!(r.total, 1);
         assert_eq!(r.sessions.len(), 0);
@@ -455,6 +378,7 @@ mod tests {
         let h = make_handler();
         h.session_manager
             .record_request("x".to_string(), req("/detail"));
+        h.session_manager.flush().await;
         let detail = h.get_session_details("x").await;
         assert!(detail.is_some());
         assert_eq!(detail.unwrap().exchange.request.uri, "/detail");
@@ -473,7 +397,7 @@ mod tests {
         let h = make_handler();
         h.session_manager.record_request("a".to_string(), req("/a"));
         h.session_manager.record_request("b".to_string(), req("/b"));
-        h.clear_sessions().await;
+        h.clear_sessions().await; // already flushes internally
         let r = h.list_sessions(None, None, None, None, true).await;
         assert_eq!(r.total, 0);
     }

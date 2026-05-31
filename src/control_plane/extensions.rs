@@ -31,7 +31,7 @@ pub(super) async fn create_mock_rule(
     }
     let mut rules = state.mock_rules.write().await;
     rules.push(rule);
-    if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules) {
+    if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules).await {
         return storage_error_response(e);
     }
     axum::Json(serde_json::json!({ "ok": true })).into_response()
@@ -47,7 +47,7 @@ pub(super) async fn update_mock_rule(
         let preserved_count = r.call_count;
         *r = updated;
         r.call_count = preserved_count;
-        if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules) {
+        if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules).await {
             return storage_error_response(e);
         }
         axum::Json(serde_json::json!({ "ok": true })).into_response()
@@ -64,7 +64,7 @@ pub(super) async fn delete_mock_rule(
     let before = rules.len();
     rules.retain(|r| r.id != id);
     if rules.len() < before {
-        if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules) {
+        if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules).await {
             return storage_error_response(e);
         }
         axum::Json(serde_json::json!({ "ok": true })).into_response()
@@ -80,7 +80,7 @@ pub(super) async fn reset_mock_rule(
     let mut rules = state.mock_rules.write().await;
     if let Some(r) = rules.iter_mut().find(|r| r.id == id) {
         r.call_count = 0;
-        if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules) {
+        if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules).await {
             return storage_error_response(e);
         }
         axum::Json(serde_json::json!({ "ok": true })).into_response()
@@ -102,7 +102,7 @@ pub(super) async fn create_script(
     }
     let mut scripts = state.lua_scripts.write().await;
     scripts.push(script);
-    if let Err(e) = storage::save_lua_scripts(&state.storage_path, &scripts) {
+    if let Err(e) = storage::save_lua_scripts(&state.storage_path, &scripts).await {
         return storage_error_response(e);
     }
     axum::Json(serde_json::json!({ "ok": true })).into_response()
@@ -116,7 +116,7 @@ pub(super) async fn update_script(
     let mut scripts = state.lua_scripts.write().await;
     if let Some(s) = scripts.iter_mut().find(|s| s.id == id) {
         *s = updated;
-        if let Err(e) = storage::save_lua_scripts(&state.storage_path, &scripts) {
+        if let Err(e) = storage::save_lua_scripts(&state.storage_path, &scripts).await {
             return storage_error_response(e);
         }
         axum::Json(serde_json::json!({ "ok": true })).into_response()
@@ -133,7 +133,7 @@ pub(super) async fn delete_script(
     let before = scripts.len();
     scripts.retain(|s| s.id != id);
     if scripts.len() < before {
-        if let Err(e) = storage::save_lua_scripts(&state.storage_path, &scripts) {
+        if let Err(e) = storage::save_lua_scripts(&state.storage_path, &scripts).await {
             return storage_error_response(e);
         }
         axum::Json(serde_json::json!({ "ok": true })).into_response()

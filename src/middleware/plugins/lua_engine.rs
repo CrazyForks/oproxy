@@ -98,7 +98,7 @@ fn inject_request(lua: &Lua, ctx: &RequestContext) -> mlua::Result<()> {
     let request = lua.create_table()?;
     request.set("method", ctx.method.clone())?;
     request.set("uri", ctx.uri.clone())?;
-    request.set("body", ctx.body.clone())?;
+    request.set("body", ctx.body_text().into_owned())?;
 
     let headers = lua.create_table()?;
     for (k, v) in &ctx.headers {
@@ -114,8 +114,7 @@ fn extract_request(lua: &Lua, ctx: &mut RequestContext) -> mlua::Result<()> {
     let request: mlua::Table = lua.globals().get("request")?;
 
     if let Ok(body) = request.get::<String>("body") {
-        ctx.body = body;
-        ctx.body_bytes = None; // body was modified
+        ctx.set_body_text(body);
     }
     let headers: mlua::Table = request.get("headers")?;
     for (k, v) in headers.pairs::<String, String>().flatten() {
@@ -128,7 +127,7 @@ fn extract_request(lua: &Lua, ctx: &mut RequestContext) -> mlua::Result<()> {
 fn inject_response(lua: &Lua, ctx: &ResponseContext) -> mlua::Result<()> {
     let response = lua.create_table()?;
     response.set("status", ctx.status)?;
-    response.set("body", ctx.body.clone())?;
+    response.set("body", ctx.body_text().into_owned())?;
 
     let headers = lua.create_table()?;
     for (k, v) in &ctx.headers {
@@ -146,8 +145,7 @@ fn extract_response(lua: &Lua, ctx: &mut ResponseContext) -> mlua::Result<()> {
         ctx.status = status;
     }
     if let Ok(body) = response.get::<String>("body") {
-        ctx.body = body;
-        ctx.body_bytes = None;
+        ctx.set_body_text(body);
     }
     let headers: mlua::Table = response.get("headers")?;
     for (k, v) in headers.pairs::<String, String>().flatten() {
@@ -277,9 +275,8 @@ mod tests {
             method: method.to_string(),
             uri: uri.to_string(),
             headers: HashMap::new(),
-            body: body.to_string(),
+            body: Bytes::from(body.to_string()),
             host: "example.com".to_string(),
-            body_bytes: None,
             ..Default::default()
         }
     }
@@ -311,7 +308,7 @@ mod tests {
         let mw = LuaEngineMiddleware::new(scripts);
         let mut ctx = make_req("POST", "/api", "original");
         mw.on_request(&mut ctx).await;
-        assert_eq!(ctx.body, "modified");
+        assert_eq!(ctx.body_text(), "modified");
     }
 
     #[tokio::test]

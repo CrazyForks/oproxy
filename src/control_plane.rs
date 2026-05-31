@@ -33,11 +33,12 @@ use forward::forward_request;
 pub(crate) use metrics::{SharedEndpointMetrics, new_endpoint_metrics};
 use metrics::{build_metrics_payload, endpoint_timing_payload, record_endpoint_timing};
 use policy::{
-    add_header_map, add_modification, add_rewrite, delete_dns, delete_header_map, delete_map_local,
-    delete_modification, delete_rewrite, get_capture_filter, get_throttling, list_dns,
-    list_header_maps, list_map_local, list_modifications, list_rewrites, list_routes,
-    replace_all_rewrites, set_map_local, update_capture_filter, update_dns, update_header_map,
-    update_rewrite, update_routes, update_throttling,
+    create_access_rule, create_map_local_rule, create_map_remote_rule, create_rule_set,
+    delete_access_rule, delete_dns, delete_map_local_rule, delete_map_remote_rule, delete_rule_set,
+    get_capture_filter, get_rule_set, get_throttling, list_access_rules, list_dns,
+    list_map_local_rules, list_map_remote_rules, list_rule_sets, update_access_rule,
+    update_capture_filter, update_dns, update_map_local_rule, update_map_remote_rule,
+    update_rule_set, update_throttling,
 };
 use sessions::{
     annotate_session, clear_sessions, diff_sessions, export_har, export_session, get_session,
@@ -68,7 +69,6 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/diff", get(diff_sessions))
         .route("/api/sessions/{id}/ws-frames", get(get_ws_frames))
         .route("/api/import/curl", axum::routing::post(import_curl))
-        .route("/admin/routes", get(list_routes).post(update_routes))
         .route("/admin/sessions", get(list_sessions).delete(clear_sessions))
         .route("/admin/sessions/save", axum::routing::post(save_sessions))
         .route("/admin/sessions/load", axum::routing::post(load_sessions))
@@ -85,22 +85,23 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
             "/admin/throttling",
             get(get_throttling).post(update_throttling),
         )
-        .route("/admin/rewrites", get(list_rewrites).post(add_rewrite))
         .route(
-            "/admin/rewrites/replace-all",
-            axum::routing::post(replace_all_rewrites),
+            "/admin/access-rules",
+            get(list_access_rules).post(create_access_rule),
         )
         .route(
-            "/admin/rewrites/{index}",
-            axum::routing::delete(delete_rewrite).put(update_rewrite),
+            "/admin/access-rules/{id}",
+            axum::routing::put(update_access_rule).delete(delete_access_rule),
         )
         .route(
-            "/admin/header-maps",
-            get(list_header_maps).post(add_header_map),
+            "/admin/rule-sets",
+            get(list_rule_sets).post(create_rule_set),
         )
         .route(
-            "/admin/header-maps/{id}",
-            axum::routing::put(update_header_map).delete(delete_header_map),
+            "/admin/rule-sets/{id}",
+            get(get_rule_set)
+                .put(update_rule_set)
+                .delete(delete_rule_set),
         )
         .route("/admin/ca", get(get_ca_cert))
         .route("/admin/metrics", get(get_metrics))
@@ -119,23 +120,26 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
         .route("/admin/config/reload", axum::routing::post(reload_config))
         .route("/admin/config", get(get_config))
         .route(
-            "/admin/modifications",
-            get(list_modifications).post(add_modification),
-        )
-        .route(
-            "/admin/modifications/{index}",
-            axum::routing::delete(delete_modification),
-        )
-        .route(
             "/admin/capture-filter",
             get(get_capture_filter).post(update_capture_filter),
         )
         .route("/admin/dns", get(list_dns).post(update_dns))
         .route("/admin/dns/{host}", axum::routing::delete(delete_dns))
-        .route("/admin/map-local", get(list_map_local).post(set_map_local))
         .route(
-            "/admin/map-local/{host}",
-            axum::routing::delete(delete_map_local),
+            "/admin/map-local-rules",
+            get(list_map_local_rules).post(create_map_local_rule),
+        )
+        .route(
+            "/admin/map-local-rules/{id}",
+            axum::routing::put(update_map_local_rule).delete(delete_map_local_rule),
+        )
+        .route(
+            "/admin/map-remote-rules",
+            get(list_map_remote_rules).post(create_map_remote_rule),
+        )
+        .route(
+            "/admin/map-remote-rules/{id}",
+            axum::routing::put(update_map_remote_rule).delete(delete_map_remote_rule),
         )
         .route("/admin/forward", axum::routing::post(forward_request))
         .route(
@@ -214,6 +218,10 @@ async fn proxy_fallback(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
 ) -> impl IntoResponse {
+    if matches!(req.uri().path(), path if path.starts_with("/admin/") || path.starts_with("/api/"))
+    {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
     state.proxy_engine.clone().handle_request(req).await
 }
 
