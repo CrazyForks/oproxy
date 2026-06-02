@@ -102,6 +102,8 @@ mod tests {
             Arc::new(RwLock::new(crate::middleware::chain::MiddlewareChain::new())),
             None,
             false,
+            8080,
+            "127.0.0.1".to_string(),
             30,
             10 * 1024 * 1024,
             10,

@@ -148,6 +148,8 @@ pub(super) async fn build_runtime_services(
         middleware_chain.clone(),
         Some(ca.clone()),
         config.mitm.enabled,
+        config.port,
+        config.bind_host.clone(),
         config.timeout_secs,
         effective_max_body,
         config.pool_max_idle_per_host,

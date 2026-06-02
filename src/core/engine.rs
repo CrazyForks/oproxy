@@ -112,6 +112,8 @@ pub struct ProxyEngine {
     timeout_secs: u64,
     pool_max_idle_per_host: usize,
     pool_idle_timeout_secs: u64,
+    pub(crate) bind_port: u16,
+    pub(crate) bind_host: String,
 }
 
 impl ProxyEngine {
@@ -147,6 +149,8 @@ impl ProxyEngine {
         middleware_chain: Arc<RwLock<MiddlewareChain>>,
         ca: Option<Arc<crate::certs::CertificateAuthority>>,
         mitm_enabled: bool,
+        bind_port: u16,
+        bind_host: String,
         timeout_secs: u64,
         max_body_bytes: usize,
         pool_max_idle_per_host: usize,
@@ -170,6 +174,8 @@ impl ProxyEngine {
             timeout_secs,
             pool_max_idle_per_host,
             pool_idle_timeout_secs,
+            bind_port,
+            bind_host,
         }
     }
 
@@ -205,6 +211,60 @@ impl ProxyEngine {
     /// Hot-updates the max body buffer size without restarting.
     pub fn set_max_body_bytes(&self, v: usize) {
         self.max_body_bytes.store(v, Ordering::Relaxed);
+    }
+
+    fn is_self_proxy(&self, target_url: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(target_url) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let host_clean = host.to_ascii_lowercase();
+
+        let target_port = url
+            .port()
+            .unwrap_or_else(|| if url.scheme() == "https" { 443 } else { 80 });
+
+        if target_port != self.bind_port {
+            return false;
+        }
+
+        // 1. Loopback and wildcard hosts
+        if matches!(
+            host_clean.as_str(),
+            "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "[::]"
+        ) {
+            return true;
+        }
+
+        // 2. Direct match with configured bind_host
+        let bind_host_clean = self
+            .bind_host
+            .split(':')
+            .next()
+            .unwrap_or(&self.bind_host)
+            .trim()
+            .to_ascii_lowercase();
+        if host_clean == bind_host_clean {
+            return true;
+        }
+        // 3. If bound to wildcard, check matching LAN hosts
+        if matches!(bind_host_clean.as_str(), "0.0.0.0" | "::" | "[::]") {
+            let lan_hosts = [
+                crate::setup::public_lan_ip_for_setup(),
+                crate::setup::detect_lan_ip(),
+            ];
+            if lan_hosts
+                .into_iter()
+                .flatten()
+                .any(|lan_host| host_clean == lan_host.to_ascii_lowercase())
+            {
+                return true;
+            }
+        }
+
+        false
     }
 
     async fn record_short_circuit_response(&self, res_ctx: &ResponseContext) {
@@ -462,6 +522,32 @@ impl ProxyEngine {
             None => format!("http://{}{}", req_ctx.host, path_and_query),
         };
         debug!(url = %target_url, "Forwarding request");
+
+        if self.is_self_proxy(&target_url) {
+            tracing::warn!(url = %target_url, "Proxy loop detected: request forwarded to the proxy itself");
+            let mut err_ctx = crate::middleware::ResponseContext {
+                status: 502,
+                headers: std::collections::HashMap::new(),
+                body: bytes::Bytes::from(
+                    "Proxy error: Proxy loop detected (request forwarded to the proxy itself)",
+                ),
+                request_uri: display_uri.clone(),
+                session_id: oproxy_session_id,
+                ttfb_ms: 0,
+                request_host: host.clone(),
+                request_method: req_method.clone(),
+                ..Default::default()
+            };
+            {
+                let chain = self.middleware_chain.read().await.clone();
+                chain.execute_response(&mut err_ctx).await;
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                "Proxy error: Proxy loop detected (request forwarded to the proxy itself)",
+            )
+                .into_response();
+        }
 
         let mut target_headers = reqwest::header::HeaderMap::new();
         for (name, value) in &req_ctx.headers {

@@ -5,5 +5,16 @@ use tokio::sync::RwLock;
 
 pub async fn create_test_engine() -> ProxyEngine {
     let chain = Arc::new(RwLock::new(MiddlewareChain::new()));
-    ProxyEngine::new(chain, None, false, 30, 10 * 1024 * 1024, 10, 30, None)
+    ProxyEngine::new(
+        chain,
+        None,
+        false,
+        8080,
+        "127.0.0.1".to_string(),
+        30,
+        10 * 1024 * 1024,
+        10,
+        30,
+        None,
+    )
 }
