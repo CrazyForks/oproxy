@@ -343,22 +343,6 @@ impl SessionManager {
         exchanges.values().cloned().collect()
     }
 
-    /// Full-text search across URI, headers, body, notes, and tags.
-    /// Supports `tag:x`, `host:x`, `method:GET`, `status:200` prefix syntax.
-    /// Multiple terms use AND semantics. Empty query returns all sessions.
-    pub fn search_sessions(&self, query: &str) -> Vec<Exchange> {
-        if query.trim().is_empty() {
-            return self.get_all_sessions();
-        }
-        let terms = parse_search_query(query);
-        let exchanges = self.exchanges.read().unwrap();
-        exchanges
-            .values()
-            .filter(|ex| terms.iter().all(|t| t.matches(ex)))
-            .cloned()
-            .collect()
-    }
-
     pub fn get_session(&self, id: &str) -> Option<Exchange> {
         let exchanges = self.exchanges.read().unwrap();
         exchanges.get(id).cloned()
@@ -1181,109 +1165,6 @@ mod tests {
         assert_eq!(m.dns_ms, Some(5));
         assert_eq!(m.tcp_connect_ms, Some(10));
         assert_eq!(m.tls_ms, Some(20));
-    }
-
-    // ── search_sessions ───────────────────────────────────────────────────────
-
-    fn req_with_host(uri: &str, host: &str) -> RequestContext {
-        let mut h = HashMap::new();
-        h.insert("host".to_string(), host.to_string());
-        RequestContext {
-            method: "GET".to_string(),
-            uri: uri.to_string(),
-            headers: h,
-            body: bytes::Bytes::new(),
-            host: host.to_string(),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn search_empty_query_returns_all() {
-        let sm = SessionManager::new(10_000);
-        sm.record_request("a".to_string(), req("/a"));
-        sm.record_request("b".to_string(), req("/b"));
-        sm.flush().await;
-        let results = sm.search_sessions("");
-        assert_eq!(results.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn search_text_matches_uri() {
-        let sm = SessionManager::new(10_000);
-        sm.record_request("a".to_string(), req("/api/users"));
-        sm.record_request("b".to_string(), req("/health"));
-        sm.flush().await;
-        let results = sm.search_sessions("users");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "a");
-    }
-
-    #[tokio::test]
-    async fn search_host_prefix() {
-        let sm = SessionManager::new(10_000);
-        sm.record_request("a".to_string(), req_with_host("/x", "api.example.com"));
-        sm.record_request("b".to_string(), req_with_host("/y", "static.example.com"));
-        sm.flush().await;
-        let results = sm.search_sessions("host:api.example");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "a");
-    }
-
-    #[tokio::test]
-    async fn search_tag_prefix() {
-        let sm = SessionManager::new(10_000);
-        sm.record_request("a".to_string(), req("/a"));
-        sm.record_request("b".to_string(), req("/b"));
-        sm.annotate("a", None, Some(vec!["auth".to_string()])).await;
-        let results = sm.search_sessions("tag:auth");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "a");
-    }
-
-    #[tokio::test]
-    async fn search_multiple_terms_and_semantics() {
-        let sm = SessionManager::new(10_000);
-        sm.record_request("a".to_string(), req("/api/auth/login"));
-        sm.record_request("b".to_string(), req("/api/users"));
-        sm.flush().await;
-        // only "a" matches both "api" and "login"
-        let results = sm.search_sessions("api login");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "a");
-    }
-
-    #[tokio::test]
-    async fn search_status_prefix() {
-        let sm = SessionManager::new(10_000);
-        sm.record_request("a".to_string(), req("/a"));
-        sm.record_request("b".to_string(), req("/b"));
-        sm.record_response("a".to_string(), res("/a", 404));
-        sm.record_response("b".to_string(), res("/b", 200));
-        sm.flush().await;
-        let results = sm.search_sessions("status:404");
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "a");
-    }
-
-    #[tokio::test]
-    async fn search_note_matches_text() {
-        let sm = SessionManager::new(10_000);
-        sm.record_request("a".to_string(), req("/a"));
-        sm.record_request("b".to_string(), req("/b"));
-        sm.annotate("a", Some("critical bug".to_string()), None)
-            .await;
-        let results = sm.search_sessions("critical");
-        assert_eq!(results.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn search_no_match_returns_empty() {
-        let sm = SessionManager::new(10_000);
-        sm.record_request("a".to_string(), req("/api"));
-        sm.flush().await;
-        let results = sm.search_sessions("zzz_no_match");
-        assert!(results.is_empty());
     }
 
     #[test]

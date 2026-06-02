@@ -1,0 +1,990 @@
+response_guidance:
+  - For general how-to, where-is, setup, and troubleshooting questions, answer with UI steps first.
+  - If a matching feature has ui_steps, list those steps before mentioning API endpoints or assistant automation.
+  - After UI steps, briefly explain what the feature does and offer to prepare a confirmed action when the request would change oproxy state.
+  - For HTTPS setup questions, include proxy address, CA trust, and verification guidance before advanced details.
+
+workspace_actions:
+  - name: navigation.open_surface
+    category: ui
+    risk: ui_safe
+    description: Navigate the authenticated admin UI to a known oproxy surface.
+    refreshed_resources: []
+    openai_spec:
+      type: function
+      function:
+        name: workspace_navigation_open_surface
+        description: Safely switch the oproxy UI to a surface/page. Use for requests like open rules, go to sessions, show settings, or where is the CA screen.
+        parameters:
+          type: object
+          required: [surface]
+          properties:
+            surface:
+              type: string
+              enum: [sessions, compose, rules, breakpoints, mock, lua, inspector, dns, capture, webhooks, ca, settings]
+
+  - name: sessions.apply_filter
+    category: ui
+    risk: ui_safe
+    description: Update the visible Sessions filters and switch the UI to Sessions.
+    refreshed_resources: [sessions]
+    openai_spec:
+      type: function
+      function:
+        name: workspace_sessions_apply_filter
+        description: Safely update visible Sessions filters. Use when the user asks to show, filter, focus, find, or list captured traffic.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: string
+              description: Search expression such as host:api.test.com, method:GET, status:500, tag:auth, graphql, grpc, or free text.
+            regex:
+              type: boolean
+            methods:
+              type: array
+              items:
+                type: string
+                enum: [GET, POST, PUT, PATCH, DELETE, CONNECT, OPTIONS, HEAD]
+            status_buckets:
+              type: array
+              items:
+                type: string
+                enum: ["2", "3", "4", "5", "-"]
+              description: Use '-' for pending or paused sessions.
+            host_focus:
+              type: array
+              items:
+                type: string
+            host_filter:
+              type: string
+            sort:
+              type: object
+              properties:
+                key:
+                  type: string
+                  enum: [idx, method, status, host, path, type, reqSize, total, ts]
+                dir:
+                  type: string
+                  enum: [asc, desc]
+            view_mode:
+              type: string
+              enum: [sequence, structure]
+            selected_session_id:
+              type: string
+
+  - name: sessions.clear_filter
+    category: ui
+    risk: ui_safe
+    description: Clear visible Sessions filters and switch the UI to Sessions.
+    refreshed_resources: [sessions]
+    openai_spec:
+      type: function
+      function:
+        name: workspace_sessions_clear_filter
+        description: Safely clear all visible Sessions filters.
+        parameters:
+          type: object
+          properties: {}
+
+  - name: sessions.select
+    category: ui
+    risk: ui_sensitive
+    description: Select a captured session in the Sessions UI.
+    refreshed_resources: [sessions]
+    openai_spec:
+      type: function
+      function:
+        name: workspace_sessions_select
+        description: Select a specific session by id and open Sessions.
+        parameters:
+          type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+
+  - name: sessions.set_view_mode
+    category: ui
+    risk: ui_safe
+    description: Switch Sessions between sequence and structure view.
+    refreshed_resources: []
+    openai_spec:
+      type: function
+      function:
+        name: workspace_sessions_set_view_mode
+        description: Safely switch Sessions view mode.
+        parameters:
+          type: object
+          required: [view_mode]
+          properties:
+            view_mode:
+              type: string
+              enum: [sequence, structure]
+
+  - name: rules.open_tab
+    category: ui
+    risk: ui_safe
+    description: Open the Rules surface and focus a specific tab.
+    refreshed_resources: []
+    openai_spec:
+      type: function
+      function:
+        name: workspace_rules_open_tab
+        description: Safely open the Rules surface and focus a tab such as rules, map_remote, map_local, access, or throttling.
+        parameters:
+          type: object
+          required: [tab]
+          properties:
+            tab:
+              type: string
+
+features:
+  - id: sessions
+    title: Sessions and Traffic Capture
+    category: observe
+    purpose: Capture, search, inspect, annotate, diff, export, save, load, and clear HTTP/HTTPS sessions.
+    ui_steps:
+      - Open the Sessions rail item.
+      - Use the top search/filter bar to find requests by method, host, path, status, tag, or text.
+      - Select a session to inspect request, response, timing, websocket frames, exports, and replay options.
+    use_when:
+      - The user asks what happened, why a request failed, or wants to inspect captured traffic.
+      - The user wants HAR/JSON export, cURL generation, session import, or saved sessions.
+    read_tools: [list_sessions, get_session]
+    action_endpoints:
+      - /admin/sessions
+      - /admin/sessions/save
+      - /admin/sessions/load
+      - /admin/sessions/import
+      - /admin/sessions/export/har
+      - /admin/sessions/import/har
+    examples:
+      - show failed requests
+      - summarize calls to api.example.com
+      - clear captured sessions
+      - export these sessions as HAR
+    notes:
+      - Session reads are automatic; clearing, importing, loading, saving, and exporting require confirmation.
+      - Bodies and sensitive headers must be redacted before model context.
+
+  - id: rewrite_rules
+    title: Rewrite Rule Sets
+    category: modify
+    purpose: Modify matching request/response headers, query params, paths, bodies, hosts, statuses, redirects, or blocks.
+    ui_steps:
+      - Open the Rules rail item.
+      - Choose the Rules tab.
+      - Click Add rule.
+      - Set Location matching fields such as host, path, method, protocol, query, or port.
+      - Add actions such as set/remove header, rewrite path/body, set status, redirect, block, or host change, then save.
+    use_when:
+      - The user wants to add/remove/change headers, query params, paths, status codes, or body text.
+      - The user wants to redirect or block matching traffic with rule logic.
+    read_tools: [get_rules]
+    action_endpoints: [/admin/rule-sets]
+    examples:
+      - add header x-debug=true for /api/*
+      - remove authorization from requests to staging
+      - rewrite /v1/users to /v2/users
+      - block requests to /checkout with 503
+    notes:
+      - Use location to match host/path/method/protocol/query/port; mode is usually glob.
+      - Use applies_to=request for request-only actions and response for response-only actions.
+      - Prefer propose_rewrite_rule for creating new rewrite rules.
+
+  - id: map_remote
+    title: Map Remote
+    category: route
+    purpose: Route matching traffic to a different upstream origin while preserving the original path and query.
+    ui_steps:
+      - Open the Rules rail item.
+      - Choose the Map Remote tab.
+      - Click Add rule.
+      - Set the source Location, usually the original host/path to match.
+      - Set Destination URL to the upstream origin, then save.
+    use_when:
+      - The user says map, route, proxy, or forward traffic from one host/service to another.
+      - The user wants a frontend to hit production-looking URLs while traffic goes to staging/local.
+    read_tools: [get_rules]
+    action_endpoints: [/admin/map-remote-rules]
+    examples:
+      - map api.test.com to google.com
+      - route /api traffic from app.local to http://localhost:3000
+      - send staging.example.com traffic to https://api.dev.example.com
+    notes:
+      - Prefer propose_map_remote for host-to-host mapping.
+      - Destination is an origin such as https://google.com; path/query are preserved.
+
+  - id: map_local
+    title: Map Local
+    category: mock
+    purpose: Serve matching requests from a local file or directory instead of contacting upstream.
+    ui_steps:
+      - Open the Rules rail item.
+      - Choose the Map Local tab.
+      - Click Add rule.
+      - Set the source Location and the absolute local file or directory path, then save.
+    use_when:
+      - The user wants fixture files, static JSON, images, or local assets returned for matching traffic.
+      - The user wants offline frontend testing against local responses.
+    read_tools: [get_rules]
+    action_endpoints: [/admin/map-local-rules]
+    examples:
+      - serve /api/config from /tmp/config.json
+      - map static assets to a local directory
+    notes:
+      - file_path must be an absolute file or directory path accessible to the oproxy process/container.
+      - For dynamic responses or sequences, use mock_server instead.
+
+  - id: access_rules
+    title: Access Rules
+    category: guard
+    purpose: Allow or block matching requests before they reach upstream.
+    ui_steps:
+      - Open the Rules rail item.
+      - Choose the Access tab.
+      - Click Add rule.
+      - Set the Location and choose Block or Allow, then save.
+    use_when:
+      - The user wants to denylist, allowlist, or block hosts/paths/methods.
+      - The user wants to test client behavior when traffic is forbidden.
+    read_tools: [get_rules]
+    action_endpoints: [/admin/access-rules]
+    examples:
+      - block analytics.example.com
+      - allow only api.example.com
+    notes:
+      - Block rules return 403 immediately.
+      - If allow rules exist, non-matching traffic is blocked.
+      - Prefer propose_access_rule for new allow/block rules.
+
+  - id: breakpoints
+    title: Breakpoints
+    category: debug
+    purpose: Pause matching requests or responses so the user can inspect, modify, continue, or drop them.
+    ui_steps:
+      - Open the Breakpoints rail item.
+      - Create a request or response breakpoint with matching Location fields.
+      - When traffic is held, inspect it in Pending breakpoints and continue, modify, or drop it.
+    use_when:
+      - The user wants to hold traffic at request/response time.
+      - The user wants interactive debugging before forwarding or returning a response.
+    read_tools: [get_rules]
+    action_endpoints:
+      - /admin/breakpoints
+      - /admin/breakpoints/pending/{id}/resolve
+    examples:
+      - pause POST /login requests
+      - break on 500 responses from api.example.com
+    notes:
+      - Creating breakpoints requires confirmation.
+      - Resolving a held breakpoint changes live traffic and requires confirmation.
+
+  - id: mock_server
+    title: Mock Responses
+    category: mock
+    purpose: Return configured mock responses, including response rotation and optional delay, for matching requests.
+    ui_steps:
+      - Open the Mock Server rail item.
+      - Click Add rule.
+      - Set the Location matcher and one or more mock responses with status, headers, body, and optional delay.
+      - Save the rule and send matching traffic through the proxy.
+    use_when:
+      - The user wants a fake response body/status/headers for an API.
+      - The user wants deterministic or sequential mock behavior.
+    read_tools: [get_rules]
+    action_endpoints:
+      - /admin/mock/rules
+      - /admin/mock/rules/{id}/reset
+    examples:
+      - mock GET /users with a 200 JSON response
+      - return 429 for /checkout with retry-after header
+    notes:
+      - Use mock_server for synthetic HTTP responses; use map_local for filesystem fixtures.
+      - Resetting call count requires confirmation.
+      - Prefer propose_mock_rule for creating new mock response rules.
+
+  - id: compose_forward
+    title: Compose and Forward
+    category: network
+    purpose: Send manually composed HTTP requests through the admin forward endpoint and capture the result.
+    ui_steps:
+      - Open the Compose rail item.
+      - Enter method, URL, headers, and optional body.
+      - Send the request; the result is captured as an admin-forward session.
+      - From Sessions, you can also open a captured request in Compose or replay it.
+    use_when:
+      - The user wants to send a new request manually.
+      - The user wants to replay or tweak a captured request outside the original client.
+    read_tools: [list_sessions, get_session]
+    action_endpoints: [/admin/forward, /admin/playback]
+    examples:
+      - send a POST to https://api.example.com/login
+      - replay all captured traffic
+    notes:
+      - Forwarding and playback are outbound network actions and require confirmation.
+      - Admin egress policy may block private or loopback targets when remote admin is enabled.
+
+  - id: dns_overrides
+    title: DNS Overrides
+    category: route
+    purpose: Resolve configured hostnames to fixed IP addresses before forwarding.
+    ui_steps:
+      - Open the DNS Override rail item.
+      - Add or edit hostname-to-IP mappings.
+      - Save the overrides and send matching traffic through the proxy.
+    use_when:
+      - The user wants a hostname to resolve to a specific IP.
+      - The user is testing DNS cutovers or routing without editing /etc/hosts.
+    read_tools: [get_dns]
+    action_endpoints:
+      - /admin/dns
+      - "/admin/dns/{host}"
+    examples:
+      - resolve api.test.com to 10.0.0.5
+      - delete DNS override for api.test.com
+    notes:
+      - DNS override changes routing but keeps the request host unless other rules modify it.
+      - Deleting one host uses DELETE /admin/dns/{host}.
+      - Prefer propose_dns_override so one-host changes preserve existing overrides.
+
+  - id: capture_filter
+    title: Capture Filter
+    category: observe
+    purpose: Control which hosts are recorded while proxying continues.
+    ui_steps:
+      - Open the Capture Filter rail item.
+      - Choose allowlist or denylist behavior.
+      - Add host patterns and save to control what gets recorded.
+    use_when:
+      - The user wants to hide noisy hosts from the session list.
+      - The user wants to record only selected hosts.
+    read_tools: [get_capture_filter]
+    action_endpoints: [/admin/capture-filter]
+    examples:
+      - only capture api.example.com
+      - stop recording analytics hosts
+    notes:
+      - Capture filter affects recording, not forwarding.
+      - Use access_rules to block traffic instead.
+      - Prefer propose_capture_filter for capture filter changes.
+
+  - id: throttling
+    title: Throttling
+    category: simulate
+    purpose: Add latency and bandwidth limits to simulate slow networks.
+    ui_steps:
+      - Open the Rules rail item.
+      - Choose the Throttling tab.
+      - Enable throttling, set latency and bandwidth, then save.
+    use_when:
+      - The user wants slow response, bandwidth constrained, or poor-network testing.
+    read_tools: [get_throttling]
+    action_endpoints: [/admin/throttling]
+    examples:
+      - add 500ms latency
+      - limit bandwidth to 128 kbps
+    notes:
+      - Throttle config is global for matching proxy behavior.
+      - Prefer propose_throttling so omitted fields preserve the current throttling config.
+
+  - id: lua_scripts
+    title: Lua Scripts
+    category: extend
+    purpose: Run sandboxed Lua scripts for advanced request/response customization.
+    ui_steps:
+      - Open the Lua Scripts rail item.
+      - Create or edit a script.
+      - Enable it and save; use built-in rules instead when they can express the change.
+    use_when:
+      - The requested transformation is too custom for built-in rewrite rules.
+      - The user needs programmable logic inside the proxy.
+    read_tools: [get_rules]
+    action_endpoints: [/admin/scripts]
+    examples:
+      - add a Lua script that injects a correlation id
+    notes:
+      - Scripts are sandboxed and time-limited.
+      - Use built-in rules first when they can express the behavior.
+
+  - id: webhooks
+    title: Webhooks
+    category: integrate
+    purpose: Send request_captured or response_captured events to an external URL.
+    ui_steps:
+      - Open the Webhooks rail item.
+      - Add a webhook URL.
+      - Choose request_captured and/or response_captured events, optionally set a secret, then save.
+    use_when:
+      - The user wants oproxy events delivered to another system.
+      - The user wants capture notifications or lightweight automation.
+    read_tools: [get_webhooks]
+    action_endpoints: [/admin/webhooks]
+    examples:
+      - send request captured webhooks to https://example.com/hook
+    notes:
+      - Webhook URLs are outbound network destinations and require confirmation.
+      - Only request_captured and response_captured are dispatchable events.
+
+  - id: upstream_proxy
+    title: Upstream Proxy
+    category: route
+    purpose: Chain oproxy's outgoing requests through another HTTP proxy.
+    ui_steps:
+      - Open the Settings rail item.
+      - Find Upstream Proxy.
+      - Enter the upstream proxy URL or clear it, then save.
+    use_when:
+      - The user needs corporate proxy chaining, another debugging proxy, or an upstream gateway.
+    read_tools: [get_upstream_proxy]
+    action_endpoints: [/admin/upstream-proxy]
+    examples:
+      - set upstream proxy to http://proxy.local:3128
+      - clear upstream proxy
+    notes:
+      - This affects outbound proxy traffic globally.
+      - Prefer propose_upstream_proxy for upstream proxy changes.
+
+  - id: https_mitm_ca
+    title: HTTPS MITM and Root CA
+    category: setup
+    purpose: Enable HTTPS inspection by trusting oproxy's generated root CA in the client.
+    ui_steps:
+      - Configure the client or browser to use oproxy as the HTTP and HTTPS proxy, usually 127.0.0.1:8080 unless your status bar shows a different address.
+      - Open the Root CA rail item or visit /admin/ca to download the oproxy CA certificate.
+      - Install and trust the CA in the browser, OS, or device trust store.
+      - Reload the target app and confirm HTTPS sessions show decrypted request/response details in Sessions.
+    use_when:
+      - The user cannot see HTTPS bodies.
+      - The user asks how to set up browser, mobile, or CLI HTTPS capture.
+    read_tools: [get_config]
+    action_endpoints: [/admin/ca, /admin/config/reload]
+    examples:
+      - why are HTTPS bodies empty
+      - download the CA certificate
+    notes:
+      - CA download is a setup/read action; trusting the CA happens on the client/OS.
+      - Without client trust, CONNECT traffic may be visible but decrypted HTTP details are not.
+
+  - id: inspectors
+    title: Protocol Inspectors
+    category: observe
+    purpose: Extract useful metadata from JWTs, GraphQL, gRPC, and WebSocket frames.
+    ui_steps:
+      - Open the Sessions rail item.
+      - Select a captured session.
+      - Review inspector sections for JWT, GraphQL, gRPC, or WebSocket metadata when present.
+    use_when:
+      - The user asks about JWT claims, GraphQL operations, gRPC methods, or WebSocket messages.
+    read_tools: [list_sessions, get_session]
+    action_endpoints: []
+    examples:
+      - show GraphQL operations
+      - inspect websocket frames
+      - decode JWT claims
+    notes:
+      - Inspector data is captured from matching traffic and is read-only.
+
+  - id: socks5
+    title: SOCKS5 Listener
+    category: setup
+    purpose: Accept SOCKS5 CONNECT traffic when configured.
+    ui_steps:
+      - Open the Settings rail item to review runtime config.
+      - Check SOCKS5 status if configured.
+      - Configure the client to use the SOCKS5 host and port from your oproxy config.
+    use_when:
+      - The client can use SOCKS but not HTTP proxy settings.
+      - The user asks whether SOCKS5 is running.
+    read_tools: [get_config]
+    action_endpoints: [/admin/socks5/status]
+    examples:
+      - is SOCKS5 enabled
+      - how do I proxy a CLI through SOCKS5
+    notes:
+      - SOCKS5 status is read-only; listener configuration comes from runtime config.
+
+  - id: settings
+    title: Runtime Settings
+    category: setup
+    purpose: Read config, reload configuration, and explain listener/auth/storage state.
+    ui_steps:
+      - Open the Settings rail item.
+      - Review listener, auth, MITM, storage, upstream proxy, and runtime state.
+      - Use reload config only when you intentionally want to re-read configuration.
+    use_when:
+      - The user asks how oproxy is running, where data is stored, or whether auth/MITM is enabled.
+    read_tools: [get_config]
+    action_endpoints: [/admin/config/reload]
+    examples:
+      - show current config
+      - reload config
+      - is admin auth enabled
+    notes:
+      - Reloading config is a mutation and requires confirmation.
+
+tools:
+  - name: get_feature_catalog
+    category: read
+    description: Read the product capability catalog, including features, use cases, read tools, action endpoints, examples, and safety notes.
+    openai_spec:
+      type: function
+      function:
+        name: get_feature_catalog
+        description: Read oproxy's feature catalog. Use this when deciding which feature, tool, or confirmed action endpoint should satisfy a user request.
+        parameters:
+          type: object
+          properties:
+            feature_id:
+              type: string
+              description: Optional exact feature id, for example map_remote, rewrite_rules, mock_server, dns_overrides, compose_forward, or sessions.
+            query:
+              type: string
+              description: Optional free-text query such as route traffic, block host, mock response, throttle, websocket, or CA.
+
+  - name: list_sessions
+    category: read
+    description: List captured sessions with optional search and limit.
+    openai_spec:
+      type: function
+      function:
+        name: list_sessions
+        description: List captured sessions. Bodies are omitted.
+        parameters:
+          type: object
+          properties:
+            q:
+              type: string
+              description: Optional session search query.
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 50
+
+  - name: get_session
+    category: read
+    description: Read one session detail with redacted headers and body previews.
+    openai_spec:
+      type: function
+      function:
+        name: get_session
+        description: Get one captured session by id with redacted previews.
+        parameters:
+          type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+
+  - name: get_config
+    category: read
+    description: Read runtime configuration summary.
+    openai_spec:
+      type: function
+      function:
+        name: get_config
+        description: Read runtime configuration.
+        parameters:
+          type: object
+          properties: {}
+
+  - name: get_rules
+    category: read
+    description: Read rule sets, map rules, access rules, breakpoints, mocks, and scripts.
+    openai_spec:
+      type: function
+      function:
+        name: get_rules
+        description: Read oproxy rule resources.
+        parameters:
+          type: object
+          properties:
+            resource:
+              type: string
+              enum: [all, rule_sets, map_remote, map_local, access, breakpoints, mock, scripts]
+
+  - name: get_throttling
+    category: read
+    description: Read throttling config.
+    openai_spec:
+      type: function
+      function:
+        name: get_throttling
+        description: Read throttling config.
+        parameters:
+          type: object
+          properties: {}
+
+  - name: get_dns
+    category: read
+    description: Read DNS overrides.
+    openai_spec:
+      type: function
+      function:
+        name: get_dns
+        description: Read DNS overrides.
+        parameters:
+          type: object
+          properties: {}
+
+  - name: get_capture_filter
+    category: read
+    description: Read capture filter config.
+    openai_spec:
+      type: function
+      function:
+        name: get_capture_filter
+        description: Read capture filter.
+        parameters:
+          type: object
+          properties: {}
+
+  - name: get_webhooks
+    category: read
+    description: Read redacted webhooks.
+    openai_spec:
+      type: function
+      function:
+        name: get_webhooks
+        description: Read redacted webhooks.
+        parameters:
+          type: object
+          properties: {}
+
+  - name: get_upstream_proxy
+    category: read
+    description: Read upstream proxy config.
+    openai_spec:
+      type: function
+      function:
+        name: get_upstream_proxy
+        description: Read upstream proxy config.
+        parameters:
+          type: object
+          properties: {}
+
+  - name: propose_map_remote
+    category: mutate
+    description: Prepare a Map Remote rule for routing one source host to a destination origin.
+    openai_spec:
+      type: function
+      function:
+        name: propose_map_remote
+        description: Prepare a confirmed Map Remote rule. Use when the user asks to map, route, proxy, or forward all traffic from one host to another. This creates POST /admin/map-remote-rules, replacing only the upstream origin and preserving path/query.
+        parameters:
+          type: object
+          required: [source_host, destination]
+          properties:
+            source_host:
+              type: string
+              description: Original request host to match, for example api.test.com. Do not include a path.
+            destination:
+              type: string
+              description: Destination origin, for example https://google.com or http://localhost:3000.
+            name:
+              type: string
+              description: Optional friendly rule name.
+
+  - name: propose_dns_override
+    category: mutate
+    description: Prepare a confirmed DNS override change for one host while preserving other overrides.
+    openai_spec:
+      type: function
+      function:
+        name: propose_dns_override
+        description: Prepare a confirmed DNS override change. Use when the user asks to resolve a hostname to an IP address or delete one DNS override. For set/update, this preserves existing overrides and changes only the requested host.
+        parameters:
+          type: object
+          required: [operation, host]
+          properties:
+            operation:
+              type: string
+              enum: [set, delete]
+            host:
+              type: string
+              description: Hostname whose DNS override should be changed, for example api.test.com.
+            ip:
+              type: string
+              description: IP address to use for operation=set, for example 10.0.0.5 or 2001:db8::1.
+
+  - name: propose_throttling
+    category: mutate
+    description: Prepare a confirmed throttling config change.
+    openai_spec:
+      type: function
+      function:
+        name: propose_throttling
+        description: Prepare a confirmed throttling change. Use when the user asks to enable, disable, add latency, or set bandwidth throttling. Omitted fields preserve the current throttling config.
+        parameters:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              description: Whether throttling should be enabled. If omitted while latency or bandwidth is set, throttling is enabled.
+            latency_ms:
+              type: integer
+              minimum: 0
+              description: Added request latency in milliseconds.
+            bandwidth_limit_kbps:
+              type: integer
+              minimum: 0
+              description: Response bandwidth limit in kilobits per second. Use 0 for no bandwidth limit.
+
+  - name: propose_rewrite_rule
+    category: mutate
+    description: Prepare a confirmed rewrite rule with typed matcher and action fields.
+    openai_spec:
+      type: function
+      function:
+        name: propose_rewrite_rule
+        description: Prepare a confirmed rewrite rule. Use for header/query/path/body/status/redirect/block transformations instead of broad propose_action.
+        parameters:
+          type: object
+          required: [actions]
+          properties:
+            name:
+              type: string
+            enabled:
+              type: boolean
+            applies_to:
+              type: string
+              enum: [request, response, both]
+            host:
+              type: string
+            path:
+              type: string
+            methods:
+              type: array
+              items:
+                type: string
+                enum: [GET, POST, PUT, PATCH, DELETE, CONNECT, OPTIONS, HEAD]
+            protocol:
+              type: string
+              enum: [http, https]
+            port:
+              type: integer
+              minimum: 0
+              maximum: 65535
+            query:
+              type: string
+            mode:
+              type: string
+              enum: [glob, regex]
+            location:
+              type: object
+              description: Optional full Location object; top-level matcher fields override matching fields inside this object.
+            actions:
+              type: array
+              minItems: 1
+              items:
+                type: object
+                required: [type]
+                properties:
+                  type:
+                    type: string
+                    enum: [set_header, append_header, remove_header, set_query_param, remove_query_param, set_host, set_path, set_status, replace_body, redirect, block]
+                  name:
+                    type: string
+                  value:
+                    type: string
+                  pattern:
+                    type: string
+                  replacement:
+                    type: string
+                  code:
+                    type: integer
+                    minimum: 100
+                    maximum: 599
+                  status:
+                    type: integer
+                    minimum: 100
+                    maximum: 599
+                  location:
+                    type: string
+                    description: Redirect destination for redirect actions.
+
+  - name: propose_mock_rule
+    category: mutate
+    description: Prepare a confirmed mock response rule.
+    openai_spec:
+      type: function
+      function:
+        name: propose_mock_rule
+        description: Prepare a confirmed mock response rule. Use when the user asks to return fake/synthetic HTTP responses.
+        parameters:
+          type: object
+          properties:
+            name:
+              type: string
+            enabled:
+              type: boolean
+            host:
+              type: string
+            path:
+              type: string
+            methods:
+              type: array
+              items:
+                type: string
+                enum: [GET, POST, PUT, PATCH, DELETE, CONNECT, OPTIONS, HEAD]
+            protocol:
+              type: string
+              enum: [http, https]
+            port:
+              type: integer
+              minimum: 0
+              maximum: 65535
+            query:
+              type: string
+            mode:
+              type: string
+              enum: [glob, regex]
+            location:
+              type: object
+              description: Optional full Location object; top-level matcher fields override matching fields inside this object.
+            status:
+              type: integer
+              minimum: 100
+              maximum: 599
+              description: Single mock response status when responses is omitted.
+            headers:
+              type: object
+              additionalProperties:
+                type: string
+            content_type:
+              type: string
+              description: Convenience content-type header when responses is omitted.
+            body:
+              type: string
+              description: Single mock response body when responses is omitted.
+            delay_ms:
+              type: integer
+              minimum: 0
+            responses:
+              type: array
+              minItems: 1
+              items:
+                type: object
+                required: [status, headers, body, delay_ms]
+                properties:
+                  status:
+                    type: integer
+                    minimum: 100
+                    maximum: 599
+                  headers:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  body:
+                    type: string
+                  delay_ms:
+                    type: integer
+                    minimum: 0
+
+  - name: propose_access_rule
+    category: mutate
+    description: Prepare a confirmed access allow/block rule.
+    openai_spec:
+      type: function
+      function:
+        name: propose_access_rule
+        description: Prepare a confirmed access rule. Use when the user asks to block, deny, allow, or allowlist matching traffic.
+        parameters:
+          type: object
+          required: [action]
+          properties:
+            action:
+              type: string
+              enum: [block, allow]
+            name:
+              type: string
+            enabled:
+              type: boolean
+            host:
+              type: string
+            path:
+              type: string
+            methods:
+              type: array
+              items:
+                type: string
+                enum: [GET, POST, PUT, PATCH, DELETE, CONNECT, OPTIONS, HEAD]
+            protocol:
+              type: string
+              enum: [http, https]
+            port:
+              type: integer
+              minimum: 0
+              maximum: 65535
+            query:
+              type: string
+            mode:
+              type: string
+              enum: [glob, regex]
+            location:
+              type: object
+              description: Optional full Location object; top-level matcher fields override matching fields inside this object.
+
+  - name: propose_capture_filter
+    category: mutate
+    description: Prepare a confirmed capture filter config change.
+    openai_spec:
+      type: function
+      function:
+        name: propose_capture_filter
+        description: Prepare a confirmed capture filter change. Use when the user asks to record only certain hosts, stop recording certain hosts, or record all traffic again.
+        parameters:
+          type: object
+          required: [mode]
+          properties:
+            mode:
+              type: string
+              enum: [disabled, allowlist, denylist]
+              description: disabled records all traffic; allowlist records only hosts; denylist skips matching hosts.
+            hosts:
+              type: array
+              items:
+                type: string
+              description: Host substrings/patterns used by allowlist or denylist mode.
+
+  - name: propose_upstream_proxy
+    category: mutate
+    description: Prepare a confirmed upstream proxy change.
+    openai_spec:
+      type: function
+      function:
+        name: propose_upstream_proxy
+        description: Prepare a confirmed upstream proxy change. Use when the user asks to chain oproxy through another proxy or clear proxy chaining.
+        parameters:
+          type: object
+          properties:
+            upstream_proxy:
+              type: string
+              description: Proxy URL such as http://proxy.local:3128. Use null to clear.
+            proxy:
+              type: string
+              description: Alias for upstream_proxy.
+
+  - name: propose_action
+    category: mutate
+    description: Prepare an allowlisted admin action that must be confirmed by the user.
+    openai_spec:
+      type: function
+      function:
+        name: propose_action
+        description: Prepare an allowlisted admin action that needs user confirmation. Use this for mutations that do not have a specialized propose_* tool. Prefer propose_map_remote for host-to-host traffic mapping, propose_dns_override for DNS changes, propose_throttling for throttling changes, propose_rewrite_rule for rewrite rules, propose_mock_rule for mock responses, propose_access_rule for access rules, propose_capture_filter for capture filtering, and propose_upstream_proxy for upstream proxy changes.
+        parameters:
+          type: object
+          required: [method, endpoint, summary, payload]
+          properties:
+            method:
+              type: string
+              enum: [POST, PUT, DELETE]
+            endpoint:
+              type: string
+              description: "Allowlisted oproxy admin endpoint path. Allowed bases: /admin/rule-sets, /admin/map-remote-rules, /admin/map-local-rules, /admin/access-rules, /admin/throttling, /admin/breakpoints, /admin/mock/rules, /admin/scripts, /admin/dns, /admin/capture-filter, /admin/upstream-proxy, /admin/webhooks, /admin/forward, /admin/playback, /admin/sessions. PUT/DELETE may append /{id}."
+            summary:
+              type: string
+            payload:
+              type: object

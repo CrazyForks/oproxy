@@ -31,6 +31,8 @@ mod tests {
             Arc::new(RwLock::new(MiddlewareChain::new())),
             None,
             false,
+            8080,
+            "127.0.0.1".to_string(),
             30,
             10 * 1024 * 1024,
             10,
@@ -47,6 +49,8 @@ mod tests {
             Arc::new(RwLock::new(MiddlewareChain::new())),
             None,
             true,
+            8080,
+            "127.0.0.1".to_string(),
             30,
             10 * 1024 * 1024,
             10,
@@ -241,6 +245,8 @@ mod tests {
             Arc::new(RwLock::new(MiddlewareChain::new())),
             None,
             false,
+            8080,
+            "127.0.0.1".to_string(),
             30,
             10 * 1024 * 1024,
             10,
@@ -266,5 +272,37 @@ mod tests {
         );
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("proxy-body-regression-guard"));
+    }
+
+    #[tokio::test]
+    async fn engine_detects_self_proxy_loops() {
+        let engine = Arc::new(ProxyEngine::new(
+            Arc::new(RwLock::new(MiddlewareChain::new())),
+            None,
+            false,
+            8080,
+            "0.0.0.0".to_string(),
+            30,
+            10 * 1024 * 1024,
+            10,
+            30,
+            None,
+        ));
+
+        // Target: http://0.0.0.0:8080/
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://0.0.0.0:8080/")
+            .header("host", "0.0.0.0:8080")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = engine.handle_request(req).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("Proxy loop detected"));
     }
 }

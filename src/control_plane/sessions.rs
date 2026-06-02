@@ -12,11 +12,14 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
-use crate::api::SessionFileRequest;
+use crate::api::{
+    SessionFileRequest, SessionListFilter, SessionListOptions, SessionSort, SessionSortDirection,
+};
 use crate::diff::diff_exchanges;
 
 use super::metrics::record_endpoint_timing;
 use super::storage_paths::{resolve_storage_file_for_read, resolve_storage_file_for_write};
+use super::workspace::{SessionsViewState, SortDirection as WorkspaceSortDirection};
 
 #[derive(serde::Deserialize, Default)]
 pub(super) struct SessionQuery {
@@ -24,6 +27,14 @@ pub(super) struct SessionQuery {
     limit: Option<usize>,
     offset: Option<usize>,
     q: Option<String>,
+    regex: Option<bool>,
+    methods: Option<String>,
+    status_buckets: Option<String>,
+    host_focus: Option<String>,
+    host_filter: Option<String>,
+    sort_key: Option<String>,
+    sort_dir: Option<String>,
+    workspace_view: Option<String>,
     include_bodies: Option<bool>,
 }
 
@@ -36,16 +47,29 @@ pub(super) async fn list_sessions(
         .since
         .as_deref()
         .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
-    let sessions = state
-        .api_handler
-        .list_sessions(
-            since,
-            q.limit,
-            q.offset,
-            q.q.as_deref(),
-            q.include_bodies.unwrap_or(false),
-        )
-        .await;
+    let mut options = SessionListOptions {
+        since,
+        limit: q.limit,
+        offset: q.offset,
+        include_bodies: q.include_bodies.unwrap_or(false),
+        filter: SessionListFilter {
+            query: q.q.unwrap_or_default(),
+            regex: q.regex.unwrap_or(false),
+            methods: q.methods.as_deref().map(split_csv),
+            status_buckets: q.status_buckets.as_deref().map(split_csv),
+            host_focus: q.host_focus.as_deref().map(split_csv).unwrap_or_default(),
+            host_filter: q.host_filter.filter(|host| !host.trim().is_empty()),
+            sort: SessionSort {
+                key: q.sort_key.unwrap_or_else(|| "ts".to_string()),
+                dir: parse_sort_dir(q.sort_dir.as_deref()),
+            },
+        },
+    };
+    if q.workspace_view.as_deref() == Some("current") {
+        let workspace = state.workspace.read().await;
+        options.filter = session_filter_from_workspace(&workspace.sessions_view);
+    }
+    let sessions = state.api_handler.list_sessions(options).await;
     record_endpoint_timing(
         &state.endpoint_metrics,
         "/api/sessions",
@@ -53,6 +77,40 @@ pub(super) async fn list_sessions(
         sessions.total,
     );
     axum::Json(sessions)
+}
+
+fn session_filter_from_workspace(view: &SessionsViewState) -> SessionListFilter {
+    SessionListFilter {
+        query: view.query.clone(),
+        regex: view.regex,
+        methods: Some(view.methods.clone()),
+        status_buckets: Some(view.status_buckets.clone()),
+        host_focus: view.host_focus.clone(),
+        host_filter: view.host_filter.clone(),
+        sort: SessionSort {
+            key: view.sort.key.clone(),
+            dir: match view.sort.dir {
+                WorkspaceSortDirection::Asc => SessionSortDirection::Asc,
+                WorkspaceSortDirection::Desc => SessionSortDirection::Desc,
+            },
+        },
+    }
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_sort_dir(value: Option<&str>) -> SessionSortDirection {
+    match value {
+        Some("asc") => SessionSortDirection::Asc,
+        _ => SessionSortDirection::Desc,
+    }
 }
 
 /// Server-Sent Events stream: fires a `{"type":"update"}` event whenever

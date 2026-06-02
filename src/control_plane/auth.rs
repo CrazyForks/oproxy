@@ -39,9 +39,39 @@ pub(super) async fn admin_auth_layer(
     req: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
-    if is_auth_exempt_request(&req) {
+    let peer_ip = downstream_peer_ip(&req);
+    let remote_admin_token_configured = configured_admin_token(&state.config).is_some();
+    let is_admin_target = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|h| {
+            is_management_host(
+                h,
+                &state.config.bind_host,
+                state.config.allow_remote_admin,
+                remote_admin_token_configured,
+                peer_ip,
+            )
+        })
+        .unwrap_or_else(|| peer_ip.is_some_and(|ip| ip.is_loopback()));
+
+    let is_public_path = matches!(
+        req.uri().path(),
+        "/health"
+            | "/robots.txt"
+            | "/favicon.ico"
+            | "/admin/ca"
+            | "/setup"
+            | "/setup/mobile"
+            | "/admin/setup/network-info"
+    );
+
+    let is_exempt = is_public_path || (req.uri().scheme().is_some() && !is_admin_target);
+
+    if is_exempt {
         return next.run(req).await;
-    };
+    }
 
     let expected_token = configured_admin_token(&state.config);
     let header_token_authenticated =
@@ -86,20 +116,6 @@ fn configured_admin_token(config: &crate::config::Config) -> Option<&str> {
         .as_deref()
         .map(str::trim)
         .filter(|token| !token.is_empty())
-}
-
-fn is_auth_exempt_request(req: &axum::extract::Request) -> bool {
-    req.uri().scheme().is_some()
-        || matches!(
-            req.uri().path(),
-            "/health"
-                | "/robots.txt"
-                | "/favicon.ico"
-                | "/admin/ca"
-                | "/setup"
-                | "/setup/mobile"
-                | "/admin/setup/network-info"
-        )
 }
 
 fn request_has_admin_token(req: &axum::extract::Request, expected: &str) -> bool {
@@ -483,6 +499,6 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
 
-        assert!(is_auth_exempt_request(&req));
+        assert!(req.uri().scheme().is_some());
     }
 }
