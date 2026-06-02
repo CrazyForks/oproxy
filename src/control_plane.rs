@@ -5,6 +5,17 @@ use std::time::Instant;
 use crate::AppState;
 
 mod assets;
+mod assistant;
+mod assistant_action_contracts;
+mod assistant_actions;
+mod assistant_context;
+mod assistant_contracts;
+mod assistant_payload_repair;
+mod assistant_prompt;
+mod assistant_provider;
+mod assistant_redaction;
+mod assistant_registry;
+mod assistant_tools;
 mod auth;
 mod breakpoints;
 mod extensions;
@@ -15,10 +26,15 @@ mod sessions;
 mod settings;
 mod storage_paths;
 mod webhooks;
+mod workspace;
 
 use assets::{
     not_found, robots_txt, serve_design_app_css, serve_design_app_js, serve_icon, serve_index,
     serve_manifest, serve_setup_wizard, serve_sw,
+};
+pub(crate) use assistant::{SharedAssistantState, new_assistant_state};
+use assistant::{
+    cancel_assistant_action, chat_assistant, execute_assistant_action, get_assistant_tools,
 };
 pub use auth::proxy_dispatch_layer;
 use auth::{admin_auth_layer, security_headers};
@@ -50,6 +66,8 @@ use settings::{
     set_upstream_proxy_handler,
 };
 use webhooks::{create_webhook, delete_webhook, list_webhooks, update_webhook};
+pub(crate) use workspace::{SharedWorkspaceState, new_workspace_state};
+use workspace::{execute_workspace_action, get_workspace, patch_workspace};
 
 /// Builds the control-plane router: UI, admin API, static assets, and proxy fallback.
 /// The caller is responsible for applying the proxy-dispatch layer on top.
@@ -150,6 +168,24 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
         .route(
             "/admin/webhooks/{id}",
             axum::routing::put(update_webhook).delete(delete_webhook),
+        )
+        .route("/admin/assistant/tools", get(get_assistant_tools))
+        .route("/admin/assistant/chat", axum::routing::post(chat_assistant))
+        .route(
+            "/admin/assistant/actions/execute",
+            axum::routing::post(execute_assistant_action),
+        )
+        .route(
+            "/admin/assistant/actions/cancel",
+            axum::routing::post(cancel_assistant_action),
+        )
+        .route(
+            "/admin/workspace",
+            get(get_workspace).patch(patch_workspace),
+        )
+        .route(
+            "/admin/workspace/actions",
+            axum::routing::post(execute_workspace_action),
         )
         .route(
             "/admin/mock/rules",

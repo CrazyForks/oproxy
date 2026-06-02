@@ -1,0 +1,134 @@
+cases:
+  - id: dns_set_single_host
+    prompt: resolve api.test.com to 10.0.0.5
+    expected_tool: propose_dns_override
+    current_dns:
+      old.test.com: 10.0.0.1
+    args:
+      operation: set
+      host: api.test.com
+      ip: 10.0.0.5
+    expected_action:
+      method: POST
+      endpoint: /admin/dns
+      payload:
+        old.test.com: 10.0.0.1
+        api.test.com: 10.0.0.5
+
+  - id: dns_delete_single_host
+    prompt: delete DNS override for api.test.com
+    expected_tool: propose_dns_override
+    args:
+      operation: delete
+      host: api.test.com
+    expected_action:
+      method: DELETE
+      endpoint: /admin/dns/api.test.com
+      payload: null
+
+  - id: throttling_latency_only
+    prompt: add 500ms latency
+    expected_tool: propose_throttling
+    current_throttling:
+      enabled: false
+      latency_ms: 0
+      bandwidth_limit_kbps: 128
+    args:
+      latency_ms: 500
+    expected_action:
+      method: POST
+      endpoint: /admin/throttling
+      payload:
+        enabled: true
+        latency_ms: 500
+        bandwidth_limit_kbps: 128
+
+  - id: rewrite_set_header
+    prompt: add header x-debug=yes for GET /api/*
+    expected_tool: propose_rewrite_rule
+    args:
+      path: /api/*
+      methods: [GET]
+      applies_to: request
+      actions:
+        - type: set_header
+          name: x-debug
+          value: yes
+    expected_action:
+      method: POST
+      endpoint: /admin/rule-sets
+      payload:
+        location:
+          path: /api/*
+          methods: [GET]
+        applies_to: request
+        actions:
+          - type: set_header
+            name: x-debug
+            value: yes
+
+  - id: mock_users_success
+    prompt: mock GET /users with a 200 JSON response
+    expected_tool: propose_mock_rule
+    args:
+      path: /users
+      methods: [GET]
+      status: 200
+      content_type: application/json
+      body: "[]"
+    expected_action:
+      method: POST
+      endpoint: /admin/mock/rules
+      payload:
+        location:
+          path: /users
+          methods: [GET]
+        responses:
+          - status: 200
+            headers:
+              content-type: application/json
+            body: "[]"
+            delay_ms: 0
+
+  - id: access_block_analytics
+    prompt: block traffic to analytics.example.com
+    expected_tool: propose_access_rule
+    args:
+      action: block
+      host: analytics.example.com
+    expected_action:
+      method: POST
+      endpoint: /admin/access-rules
+      payload:
+        location:
+          host: analytics.example.com
+        action: block
+
+  - id: capture_allowlist_api
+    prompt: only capture api.example.com
+    expected_tool: propose_capture_filter
+    current_capture_filter:
+      mode: disabled
+      hosts: []
+    args:
+      mode: allowlist
+      hosts: [api.example.com]
+    expected_action:
+      method: POST
+      endpoint: /admin/capture-filter
+      payload:
+        mode: allowlist
+        hosts: [api.example.com]
+
+  - id: upstream_proxy_set
+    prompt: set upstream proxy to http://proxy.local:3128
+    expected_tool: propose_upstream_proxy
+    current_upstream_proxy:
+      upstream_proxy: null
+    args:
+      upstream_proxy: http://proxy.local:3128
+    expected_action:
+      method: POST
+      endpoint: /admin/upstream-proxy
+      payload:
+        upstream_proxy: http://proxy.local:3128

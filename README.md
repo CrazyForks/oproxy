@@ -12,6 +12,7 @@ It is for developers testing browsers, CLIs, mobile apps, API clients, services,
 - Build manual requests with headers, query params, auth, raw bodies, variables, collections, and cURL export.
 - Export captures as HAR or generated cURL, Fetch, and Python snippets.
 - Modify traffic with rule sets, map-remote, map-local, access rules, throttling, breakpoints, mock responses, DNS overrides, capture filters, Lua scripts, and upstream proxy chaining.
+- Use the authenticated Assistant to inspect state and prepare confirmed proxy changes through an OpenAI-compatible chat model.
 - Run from source or Docker with persistent volumes for CA material and local state.
 
 ## Demo
@@ -121,6 +122,7 @@ For browser HTTPS capture, install the CA from `http://127.0.0.1:8080/admin/ca` 
 - [Docker](docs/docker.md)
 - [HTTPS MITM](docs/https-mitm.md)
 - [Compose](docs/compose.md)
+- [Assistant](docs/assistant.md)
 - [DNS overrides](docs/dns-overrides.md)
 - [SOCKS5](docs/socks5.md)
 - [Configuration](docs/configuration.md)

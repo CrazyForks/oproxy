@@ -4,7 +4,7 @@ const {
   Icon, SessionsTable, DetailPanel, RulesSurface, BreakpointsSurface,
   InspectorsSurface, CertSurface, ComposeSurface, MockSurface, LuaSurface,
   WebhooksSurface, DnsSurface, CaptureFilterSurface, SettingsSurface,
-  ShortcutsModal, confirmAction,
+  AssistantSurface, ShortcutsModal, confirmAction,
 } = window;
 /* Main app shell — top bar, left rail, master/detail split, status bar, tweaks */
 
@@ -24,8 +24,10 @@ const ACCENT_OPTIONS = [
 ];
 
 const METHODS = ['GET','POST','PUT','PATCH','DELETE','CONNECT','OPTIONS','HEAD'];
+const STATUS_BUCKETS = ['2','3','4','5','-'];
+const WORKSPACE_SURFACES = new Set(['sessions','compose','rules','breakpoints','mock','lua','inspector','dns','capture','webhooks','ca','settings']);
+const SESSION_SORT_KEYS = new Set(['idx','method','status','host','path','type','reqSize','total','ts']);
 
-const RAIL_ORDER = ['sessions','compose','rules','breakpoints','mock','lua','inspector','dns','capture','webhooks','ca','settings'];
 const SESSION_LIST_LIMIT = 10000;
 const SESSION_RENDER_PAGE_SIZE = 250;
 
@@ -376,6 +378,59 @@ function sessionMatchesTerms(s, terms) {
   });
 }
 
+function normalizeWorkspaceMethods(methods) {
+  const allowed = new Set(METHODS);
+  const picked = new Set((methods || []).map(m => String(m).toUpperCase()).filter(m => allowed.has(m)));
+  return METHODS.filter(m => picked.has(m));
+}
+
+function normalizeWorkspaceStatusBuckets(buckets) {
+  const allowed = new Set(STATUS_BUCKETS);
+  const picked = new Set((buckets || []).map(b => String(b)).filter(b => allowed.has(b)));
+  return STATUS_BUCKETS.filter(b => picked.has(b));
+}
+
+function normalizeWorkspaceSort(sort) {
+  const key = SESSION_SORT_KEYS.has(sort?.key) ? sort.key : 'idx';
+  const dir = sort?.dir === 'desc' ? 'desc' : 'asc';
+  return { key, dir };
+}
+
+function workspaceViewSnapshot({ activeRail, search, regexMode, methodFilter, statusFilter, hostFocus, hostFilter, sort, viewMode, selectedId }) {
+  return {
+    active_surface: WORKSPACE_SURFACES.has(activeRail) ? activeRail : 'sessions',
+    sessions_view: {
+      query: search || '',
+      regex: !!regexMode,
+      methods: METHODS.filter(m => methodFilter.has(m)),
+      status_buckets: STATUS_BUCKETS.filter(b => statusFilter.has(b)),
+      host_focus: Array.isArray(hostFocus) ? hostFocus : [],
+      host_filter: hostFilter || null,
+      sort: normalizeWorkspaceSort(sort),
+      view_mode: viewMode === 'structure' ? 'structure' : 'sequence',
+      selected_session_id: selectedId || null,
+    },
+  };
+}
+
+function workspaceSnapshotFromState(workspace) {
+  const view = workspace?.sessions_view || {};
+  return {
+    active_surface: WORKSPACE_SURFACES.has(workspace?.active_surface) ? workspace.active_surface : 'sessions',
+    sessions_view: {
+      query: view.query || '',
+      regex: !!view.regex,
+      methods: normalizeWorkspaceMethods(view.methods).length ? normalizeWorkspaceMethods(view.methods) : METHODS,
+      status_buckets: normalizeWorkspaceStatusBuckets(view.status_buckets).length ? normalizeWorkspaceStatusBuckets(view.status_buckets) : STATUS_BUCKETS,
+      host_focus: Array.isArray(view.host_focus) ? view.host_focus : [],
+      host_filter: view.host_filter || null,
+      sort: normalizeWorkspaceSort(view.sort),
+      view_mode: view.view_mode === 'structure' ? 'structure' : 'sequence',
+      selected_session_id: view.selected_session_id || null,
+    },
+  };
+}
+
 function App() {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
 
@@ -397,6 +452,7 @@ function App() {
   const [liveRefresh, setLiveRefresh] = React.useState(true);
   const [sort, setSort] = React.useState({ key: 'idx', dir: 'asc' });
   const [activeRail, setActiveRail] = React.useState('sessions');
+  const [assistantOpen, setAssistantOpen] = React.useState(false);
   const [regexMode, setRegexMode] = React.useState(false);
   const [showShortcuts, setShowShortcuts] = React.useState(false);
   const [tinyViewport, setTinyViewport] = React.useState(false);
@@ -405,31 +461,78 @@ function App() {
   const [composeRequest, setComposeRequest] = React.useState(null);
   const [runtime, setRuntime] = React.useState({ config: null, throttle: null, socks5: null, caBytes: 0, breakpointHeld: 0, errors: {} });
   const [sessionsError, setSessionsError] = React.useState(null);
+  const [sessionMeta, setSessionMeta] = React.useState({ total: 0, filtered_total: 0, facets: null });
   const [renderLimit, setRenderLimit] = React.useState(SESSION_RENDER_PAGE_SIZE);
   const [detailById, setDetailById] = React.useState({});
+  const [workspaceHydrated, setWorkspaceHydrated] = React.useState(false);
+  const [workspaceError, setWorkspaceError] = React.useState(null);
   const mainRef = React.useRef(null);
   const [splitSize, setSplitSize] = React.useState({ detailW: 560, detailH: 360 });
   const lastFetchRef = React.useRef(null);    // Date of last full or incremental session fetch
   const sessionsRef = React.useRef([]);        // always-current sessions array (no stale closure)
   const selectedIdRef = React.useRef(null);    // always-current selectedId
+  const workspaceVersionRef = React.useRef(null);
+  const workspaceSnapshotRef = React.useRef(null);
   const [detailVersion, setDetailVersion] = React.useState(0); // bumped to force detail re-fetch
   // Keep refs in sync on every render (standard "latest-value ref" pattern).
   sessionsRef.current = sessions;
   selectedIdRef.current = selectedId;
 
+  const applyWorkspaceState = React.useCallback((workspace) => {
+    const snapshot = workspaceSnapshotFromState(workspace);
+    workspaceVersionRef.current = Number.isFinite(workspace?.version) ? workspace.version : null;
+    workspaceSnapshotRef.current = JSON.stringify(snapshot);
+    setWorkspaceError(null);
+    setActiveRail(snapshot.active_surface);
+    setSearch(snapshot.sessions_view.query);
+    setRegexMode(snapshot.sessions_view.regex);
+    setMethodFilter(new Set(snapshot.sessions_view.methods.length ? snapshot.sessions_view.methods : METHODS));
+    setStatusFilter(new Set(snapshot.sessions_view.status_buckets.length ? snapshot.sessions_view.status_buckets : STATUS_BUCKETS));
+    setHostFocus(snapshot.sessions_view.host_focus);
+    setHostFilter(snapshot.sessions_view.host_filter);
+    setSort(snapshot.sessions_view.sort);
+    setViewMode(snapshot.sessions_view.view_mode);
+    setSelectedId(snapshot.sessions_view.selected_session_id);
+    setWorkspaceHydrated(true);
+  }, []);
+
+  const loadWorkspace = React.useCallback(async () => {
+    try {
+      const res = await fetch('/admin/workspace');
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      applyWorkspaceState(data.workspace);
+    } catch (err) {
+      console.warn('Failed to load workspace state', err);
+      setWorkspaceError(err);
+      setWorkspaceHydrated(true);
+    }
+  }, [applyWorkspaceState]);
+
+  React.useEffect(() => {
+    loadWorkspace();
+  }, [loadWorkspace]);
+
   const loadSessions = React.useCallback(async () => {
     try {
-      const res = await fetch(`/api/sessions?limit=${SESSION_LIST_LIMIT}`);
+      const params = new URLSearchParams({ workspace_view: 'current', limit: String(SESSION_LIST_LIMIT) });
+      const res = await fetch(`/api/sessions?${params}`);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       const live = (data.sessions || []).map((s, i) => adaptExchange(s, i));
       lastFetchRef.current = new Date();
       setSessionsError(null);
+      setSessionMeta({
+        total: data.total ?? live.length,
+        filtered_total: data.filtered_total ?? live.length,
+        facets: data.facets || null,
+      });
       setSessions(live);
       setSelectedId(prev => prev && live.some(s => s.id === prev) ? prev : live[0]?.id || null);
     } catch (err) {
       console.warn('Failed to load live sessions', err);
       setSessionsError(err);
+      setSessionMeta({ total: 0, filtered_total: 0, facets: null });
       setSessions([]);
       setSelectedId(null);
     }
@@ -439,7 +542,7 @@ function App() {
     if (!lastFetchRef.current) { loadSessions(); return; }
     const since = new Date(lastFetchRef.current.getTime() - 2000);
     try {
-      const params = new URLSearchParams({ since: since.toISOString(), limit: String(SESSION_LIST_LIMIT) });
+      const params = new URLSearchParams({ workspace_view: 'current', since: since.toISOString(), limit: String(SESSION_LIST_LIMIT) });
       const res = await fetch(`/api/sessions?${params}`);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
@@ -480,6 +583,56 @@ function App() {
   React.useEffect(() => {
     loadSessions();
   }, [loadSessions]);
+
+  React.useEffect(() => {
+    if (!workspaceHydrated) return undefined;
+    const patch = workspaceViewSnapshot({
+      activeRail,
+      search,
+      regexMode,
+      methodFilter,
+      statusFilter,
+      hostFocus,
+      hostFilter,
+      sort,
+      viewMode,
+      selectedId,
+    });
+    const signature = JSON.stringify(patch);
+    if (signature === workspaceSnapshotRef.current) return undefined;
+
+    const timer = setTimeout(async () => {
+      try {
+        const body = {
+          base_version: workspaceVersionRef.current,
+          patch,
+        };
+        if (body.base_version == null) delete body.base_version;
+        const res = await fetch('/admin/workspace', {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (res.status === 409) {
+          await loadWorkspace();
+          return;
+        }
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        if (data.workspace) {
+          applyWorkspaceState(data.workspace);
+          loadSessions();
+        } else {
+          workspaceSnapshotRef.current = signature;
+        }
+      } catch (err) {
+        console.warn('Failed to patch workspace state', err);
+        setWorkspaceError(err);
+      }
+    }, 250);
+
+    return () => clearTimeout(timer);
+  }, [workspaceHydrated, activeRail, search, regexMode, methodFilter, statusFilter, hostFocus, hostFilter, sort, viewMode, selectedId, loadWorkspace, loadSessions, applyWorkspaceState]);
 
   React.useEffect(() => {
     if (!selectedId) return;
@@ -616,40 +769,10 @@ function App() {
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   }, [sessions]);
 
-  // filter + sort
+  // Backend owns filtering and sorting. React renders the current workspace result.
   const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase();
-    let arr = sessions.filter(s => {
-      if (!methodFilter.has(s.method)) return false;
-      const bucket = s.status === 0 ? '-' : String(s.status)[0];
-      if (!statusFilter.has(bucket)) return false;
-      if (hostFilter && s.host !== hostFilter) return false;
-      if (hostFocus.length > 0 && !hostFocus.some(h => s.host === h || s.host.endsWith('.' + h))) return false;
-      if (q) {
-        if (regexMode) {
-          let re;
-          try { re = new RegExp(q, 'i'); } catch (e) { re = null; }
-          if (re) {
-            const hay = (s.url + ' ' + s.method + ' ' + s.host + ' ' + s.type + ' ' + s.tags.join(' '));
-            if (!re.test(hay)) return false;
-          }
-        } else {
-          const terms = parseSearch(q);
-          if (!sessionMatchesTerms(s, terms)) return false;
-        }
-      }
-      return true;
-    });
-    arr = [...arr].sort((a, b) => {
-      const k = sort.key;
-      const av = a[k] ?? '', bv = b[k] ?? '';
-      let cmp;
-      if (typeof av === 'number' && typeof bv === 'number') cmp = av - bv;
-      else cmp = String(av).localeCompare(String(bv));
-      return sort.dir === 'asc' ? cmp : -cmp;
-    });
-    return arr;
-  }, [sessions, search, methodFilter, statusFilter, hostFilter, hostFocus, sort, regexMode]);
+    return sessions;
+  }, [sessions]);
 
   React.useEffect(() => {
     setRenderLimit(SESSION_RENDER_PAGE_SIZE);
@@ -709,13 +832,19 @@ function App() {
         setRegexMode(v => !v);
         return;
       }
+      if (mod && e.key.toLowerCase() === 'j') {
+        e.preventDefault();
+        setAssistantOpen(v => !v);
+        return;
+      }
 
       if (isField) return;
       const idx = renderedSessions.findIndex(s => s.id === selectedId);
       if (e.key === 'ArrowDown' && idx < renderedSessions.length - 1) { e.preventDefault(); setSelectedId(renderedSessions[idx + 1].id); }
       if (e.key === 'ArrowUp' && idx > 0) { e.preventDefault(); setSelectedId(renderedSessions[idx - 1].id); }
       if (e.key === 'Escape') {
-        if (showShortcuts) setShowShortcuts(false);
+        if (assistantOpen) setAssistantOpen(false);
+        else if (showShortcuts) setShowShortcuts(false);
         else setSelectedId(null);
       }
       if (e.key === ' ' && activeRail === 'sessions') {
@@ -728,7 +857,7 @@ function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [renderedSessions, selectedId, t.theme, showShortcuts, activeRail]);
+  }, [renderedSessions, selectedId, t.theme, showShortcuts, activeRail, assistantOpen]);
 
   // Counts for status bar
   const counts = React.useMemo(() => {
@@ -744,6 +873,10 @@ function App() {
     });
     return c;
   }, [sessions]);
+  const displayCounts = React.useMemo(() => ({
+    ...counts,
+    total: sessionMeta.total ?? counts.total,
+  }), [counts, sessionMeta.total]);
 
   const resume = (id) => {
     const targetId = id || selectedId;
@@ -866,6 +999,11 @@ function App() {
             Window height is very small. Enlarge the app window and press <code>Ctrl+0</code> to reset zoom.
           </div>
         )}
+        {workspaceError && (
+          <div className="warn-strip" style={{ margin: 8, gridColumn: '1 / -1' }}>
+            Workspace state is temporarily local. Changes will sync again when the backend responds.
+          </div>
+        )}
         <LeftRail active={activeRail} onChange={setActiveRail} />
 
         <div
@@ -886,8 +1024,8 @@ function App() {
                   hostFilter={hostFilter} setHostFilter={setHostFilter}
                   hostFocus={hostFocus} setHostFocus={setHostFocus}
                   hostCounts={hostCounts}
-                  counts={counts}
-                  total={filtered.length}
+                  counts={displayCounts}
+                  total={sessionMeta.filtered_total ?? filtered.length}
                   viewMode={viewMode} setViewMode={setViewMode}
                   sort={sort} onResetSort={() => setSort({ key: 'idx', dir: 'asc' })}
                 />
@@ -984,6 +1122,44 @@ function App() {
       </div>
 
       <StatusBar counts={counts} liveRefresh={liveRefresh} t={t} runtime={runtime} setActiveRail={setActiveRail} />
+
+      <button
+        className="assistant-fab"
+        type="button"
+        aria-label="Open assistant"
+        aria-expanded={assistantOpen}
+        onClick={() => setAssistantOpen(true)}
+      >
+        <Icon name="bolt" size={18} stroke={1.8} />
+        <span>Assistant</span>
+      </button>
+
+      {assistantOpen && (
+        <div className="assistant-drawer-backdrop" onMouseDown={() => setAssistantOpen(false)}>
+          <div className="assistant-drawer" role="dialog" aria-label="Assistant" onMouseDown={e => e.stopPropagation()}>
+            <AssistantSurface
+              mode="drawer"
+              onClose={() => setAssistantOpen(false)}
+              onRefresh={() => loadSessions()}
+              activeSurface={activeRail}
+              uiState={{
+                sessions_count: sessions.length,
+                filtered_sessions_count: filtered.length,
+                search,
+                regex_mode: regexMode,
+                method_filter: [...methodFilter],
+                status_filter: [...statusFilter],
+                host_focus: hostFocus,
+                view_mode: viewMode,
+              }}
+              onWorkspaceChanged={() => {
+                loadWorkspace();
+                loadSessions();
+              }}
+            />
+          </div>
+        </div>
+      )}
 
       <TweaksPanel title="Tweaks">
         <TweakSection title="Appearance">

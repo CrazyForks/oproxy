@@ -10,6 +10,7 @@ await import('./detail-panel.jsx');
 await import('./surfaces.jsx');
 await import('./surfaces-extra.jsx');
 await import('./compose.jsx');
+await import('./assistant.jsx');
 await import('./app.jsx');
 
 createRoot(document.getElementById('root')).render(<window.App />);
