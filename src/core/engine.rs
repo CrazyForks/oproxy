@@ -3,6 +3,7 @@ use crate::middleware::{
     MiddlewareAction, RequestContext, ResponseContext, header_value, remove_header,
 };
 use bytes::Bytes;
+use futures_util::StreamExt;
 use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +20,28 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 
 use crate::core::decompression::decoded_response_body;
+use http_body_util::{BodyExt as _, Full};
+use std::future::ready;
+
+/// Downstream connection/stream identity captured at request entry (Phase 7),
+/// bundled so it can be threaded through the streaming path in one argument.
+struct StreamIdentity {
+    connection_id: Option<String>,
+    stream_id: Option<u64>,
+    downstream_protocol: Option<String>,
+}
+
+/// Human-readable label for an HTTP version, used for protocol observability.
+pub fn protocol_label(v: axum::http::Version) -> &'static str {
+    match v {
+        axum::http::Version::HTTP_09 => "HTTP/0.9",
+        axum::http::Version::HTTP_10 => "HTTP/1.0",
+        axum::http::Version::HTTP_11 => "HTTP/1.1",
+        axum::http::Version::HTTP_2 => "HTTP/2",
+        axum::http::Version::HTTP_3 => "HTTP/3",
+        _ => "HTTP/?",
+    }
+}
 
 fn display_request_uri(
     uri: &axum::http::Uri,
@@ -57,6 +80,9 @@ pub struct ProxyEngine {
     /// self-proxy loop detection when bound to a wildcard address. Cached to
     /// avoid a per-request UDP socket syscall in `detect_lan_ip`.
     self_lan_hosts: Vec<String>,
+    /// If set, injected as `alt-svc` on every forwarded response to advertise
+    /// the HTTP/3 listener. Built once from `Config.http3_port` at startup.
+    pub alt_svc_header: Option<String>,
 }
 
 impl ProxyEngine {
@@ -75,6 +101,21 @@ impl ProxyEngine {
             .pool_max_idle_per_host(pool_max_idle)
             .pool_idle_timeout(pool_idle)
             .redirect(reqwest::redirect::Policy::none());
+        // Optionally skip upstream TLS verification (e.g. forwarding to origins
+        // with self-signed certs while debugging, like mitmproxy's --ssl-insecure).
+        // Off by default; enabled via OPROXY_INSECURE_UPSTREAM=1. Read here (rather
+        // than threaded through the constructor) so every existing call site and
+        // the hot-reload path pick it up without signature churn.
+        let insecure_upstream = std::env::var("OPROXY_INSECURE_UPSTREAM")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if insecure_upstream {
+            tracing::warn!(
+                "OPROXY_INSECURE_UPSTREAM is set: upstream TLS certificate verification is DISABLED"
+            );
+            http = http.danger_accept_invalid_certs(true);
+            streaming = streaming.danger_accept_invalid_certs(true);
+        }
         if let Some(url) = upstream_proxy {
             if let Ok(p) = reqwest::Proxy::all(url) {
                 http = http.proxy(p);
@@ -136,6 +177,7 @@ impl ProxyEngine {
             .flatten()
             .map(|h| h.to_ascii_lowercase())
             .collect(),
+            alt_svc_header: None,
         }
     }
 
@@ -283,14 +325,34 @@ impl ProxyEngine {
         let start = Instant::now();
         let method = req.method().clone();
         let uri = req.uri().clone();
+        // HTTP/2 and HTTP/3 carry the target authority in the `:authority`
+        // pseudo-header (exposed via the request URI), not a `Host` header. Fall
+        // back to the URI authority so forward-proxied h2/h3 requests resolve a
+        // real upstream instead of "unknown" (which 502s).
         let host = req
             .headers()
             .get("host")
             .and_then(|h| h.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
+            .map(str::to_string)
+            .or_else(|| req.uri().authority().map(|a| a.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
 
         debug!(method = %method, uri = %uri, host = %host, "Processing request");
+
+        // Capture downstream connection identity (Phase 7) exactly once per
+        // request — `next_stream()` mutates the per-connection counter. The
+        // downstream protocol is the negotiated request version (h2 requests
+        // arrive as HTTP/2 regardless of the upstream leg).
+        let (connection_id, stream_id, downstream_protocol) = {
+            let conn = req
+                .extensions()
+                .get::<crate::transport::http::DownstreamConn>();
+            (
+                conn.map(|c| c.id.clone()),
+                conn.map(|c| c.next_stream()),
+                Some(protocol_label(req.version()).to_string()),
+            )
+        };
 
         // CONNECT is handled at the hyper service level in main.rs (before axum
         // middleware) so it never reaches here.  Return BAD_GATEWAY as a safety net.
@@ -310,6 +372,49 @@ impl ProxyEngine {
         }
 
         let display_uri = display_request_uri(&uri, mitm_destination.as_deref(), &host);
+
+        // Decide the forwarding class from the active plugins' body hints BEFORE
+        // the body is buffered (head-only, per the streaming contract). Today
+        // every plugin defaults to BodyHint::FullBody, so this resolves to
+        // ForwardClass::Buffered and the body is buffered exactly as before; the
+        // streaming branch is introduced when handle_request is split. Computing
+        // it here makes the decision load-bearing and observable now.
+        let forward_class = {
+            let head_ctx = RequestContext {
+                method: req_method.clone(),
+                uri: display_uri.clone(),
+                headers: req_headers.clone(),
+                host: host.clone(),
+                ..Default::default()
+            };
+            self.middleware_chain.read().await.forward_class(&head_ctx)
+        };
+        debug!(?forward_class, "Forwarding class decided");
+
+        // Streaming class: forward without buffering the body. Reached only when
+        // every active plugin declared a streaming-capable body hint (inspect-only
+        // in v1), so no plugin needs the whole body and none can mutate it. The
+        // move of `req`/`req_headers`/`uri` here is sound: this branch diverges
+        // (returns), so the buffered path below still owns them when it runs.
+        if forward_class == crate::core::forward::ForwardClass::Streaming {
+            return self
+                .forward_stream(
+                    req,
+                    req_method,
+                    uri,
+                    display_uri,
+                    req_headers,
+                    host,
+                    mitm_destination,
+                    start,
+                    StreamIdentity {
+                        connection_id,
+                        stream_id,
+                        downstream_protocol,
+                    },
+                )
+                .await;
+        }
 
         let req_body_bytes =
             match axum::body::to_bytes(req.into_body(), self.max_body_bytes()).await {
@@ -336,6 +441,9 @@ impl ProxyEngine {
             // MITM supplies the upstream target up front; routing/dns middleware may
             // still override it during the chain.
             destination: mitm_destination,
+            connection_id,
+            stream_id,
+            downstream_protocol,
             ..Default::default()
         };
 
@@ -418,18 +526,23 @@ impl ProxyEngine {
             }
         }
         // Strip hop-by-hop headers — illegal in HTTP/2 and must not be forwarded.
+        // Exception: `te: trailers` is required by gRPC and is explicitly allowed
+        // in HTTP/2 requests (RFC 7540 §8.1.2.2); strip `te` only when its value
+        // is something other than "trailers".
         for hdr in &[
             "connection",
             "keep-alive",
             "proxy-connection",
             "transfer-encoding",
-            "te",
             "trailer",
             "trailers",
             "upgrade",
         ] {
             req_ctx.headers.remove(hdr);
         }
+        req_ctx
+            .headers
+            .retain(|name, value| name != "te" || value.trim().eq_ignore_ascii_case("trailers"));
 
         // In forward-proxy mode the browser sends an absolute URI as the request
         // target (e.g. GET http://api.example.com/path HTTP/1.1).  Concatenating
@@ -556,6 +669,8 @@ impl ProxyEngine {
             Ok(res) => {
                 let ttfb_ms = net_start.elapsed().as_millis() as u64;
                 let status = res.status().as_u16();
+                // Record the negotiated upstream protocol for observability (Phase 0).
+                let upstream_protocol = protocol_label(res.version()).to_string();
                 let mut res_headers = crate::middleware::HeaderMap::new();
                 for (name, value) in res.headers().iter() {
                     // append (not insert) so duplicate upstream headers such as
@@ -600,6 +715,7 @@ impl ProxyEngine {
                         ttfb_ms,
                         request_host: host.clone(),
                         request_method: req_method.clone(),
+                        protocol: Some(upstream_protocol.clone()),
                         ..Default::default()
                     };
                     {
@@ -647,6 +763,7 @@ impl ProxyEngine {
                     body_ms,
                     request_host: host.clone(),
                     request_method: req_method.clone(),
+                    protocol: Some(upstream_protocol.clone()),
                     ..Default::default()
                 };
 
@@ -686,16 +803,365 @@ impl ProxyEngine {
                 for (name, value) in &res_ctx.headers {
                     builder = builder.header(name, value);
                 }
+                if let Some(ref svc) = self.alt_svc_header {
+                    builder = builder.header("alt-svc", svc.as_str());
+                }
 
-                builder
-                    .body(Body::from(res_ctx.body))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                // gRPC over HTTP/2 requires the response to end with a HEADERS frame
+                // (trailers) carrying `grpc-status`, NOT with DATA+END_STREAM.  reqwest
+                // silently discards upstream trailer frames, so we synthesise
+                // `grpc-status: 0` for HTTP 200 gRPC responses.  Non-200 statuses are
+                // left as plain bodies (the client already sees an error from the status
+                // code).  TODO: surface the actual upstream grpc-status once reqwest
+                // exposes trailer access (tracked upstream issue).
+                let is_grpc = content_type.starts_with("application/grpc");
+                if is_grpc && res_ctx.status == 200 {
+                    let mut grpc_trailers = axum::http::HeaderMap::new();
+                    grpc_trailers.insert(
+                        axum::http::header::HeaderName::from_static("grpc-status"),
+                        axum::http::header::HeaderValue::from_static("0"),
+                    );
+                    let body_with_trailers =
+                        Full::new(res_ctx.body).with_trailers(ready(Some(Ok::<
+                            _,
+                            std::convert::Infallible,
+                        >(
+                            grpc_trailers
+                        ))));
+                    builder
+                        .body(Body::new(body_with_trailers))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                } else {
+                    builder
+                        .body(Body::from(res_ctx.body))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                }
             }
             Err(e) => {
-                error!(error = %e, "Proxy error");
+                // Walk the source chain so the full cause is visible in logs.
+                let mut chain = format!("{e}");
+                let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    chain.push_str(&format!(": {s}"));
+                    src = s.source();
+                }
+                error!(error = %chain, "Proxy error");
                 // Run on_response with a synthetic 502 so InspectionMiddleware records
                 // the failed exchange instead of leaving it as a dangling "pending" session.
                 let mut err_ctx = crate::middleware::ResponseContext {
+                    status: 502,
+                    headers: crate::middleware::HeaderMap::new(),
+                    body: Bytes::from(format!("Proxy error: {}", e)),
+                    request_uri: display_uri.clone(),
+                    session_id: oproxy_session_id,
+                    ttfb_ms: net_start.elapsed().as_millis() as u64,
+                    request_host: host.clone(),
+                    request_method: req_method.clone(),
+                    ..Default::default()
+                };
+                {
+                    let chain = self.middleware_chain.read().await.clone();
+                    chain.execute_response(&mut err_ctx).await;
+                }
+                (StatusCode::BAD_GATEWAY, "Error forwarding request").into_response()
+            }
+        }
+    }
+
+    /// Streaming-class forwarding: relays the request body upstream without
+    /// buffering and streams the response straight back. Reached only when every
+    /// active plugin declared a streaming-capable body hint, so the request chain
+    /// runs head-only (no plugin needs or mutates the body) and inspection is
+    /// limited to headers/metadata in v1 (streaming = inspect-only).
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_stream(
+        self: Arc<Self>,
+        req: Request<Body>,
+        req_method: String,
+        uri: axum::http::Uri,
+        display_uri: String,
+        req_headers: crate::middleware::HeaderMap,
+        host: String,
+        mitm_destination: Option<String>,
+        start: Instant,
+        identity: StreamIdentity,
+    ) -> Response {
+        let req_uri = uri.to_string();
+        let mut req_ctx = RequestContext {
+            method: req_method.clone(),
+            uri: display_uri.clone(),
+            headers: req_headers,
+            host: host.clone(),
+            destination: mitm_destination,
+            connection_id: identity.connection_id,
+            stream_id: identity.stream_id,
+            downstream_protocol: identity.downstream_protocol,
+            ..Default::default()
+        };
+
+        // Request middleware chain, head-only.
+        {
+            let chain = self.middleware_chain.read().await.clone();
+            match chain.execute_request(&mut req_ctx).await {
+                MiddlewareAction::Continue => {}
+                MiddlewareAction::StopAndReturn => {
+                    // Mocks force the buffered class, so this is normally an
+                    // access-control block; handle a mock defensively all the same.
+                    if let Some(intercepted) = req_ctx.mock_response.take() {
+                        let crate::middleware::InterceptedResponse {
+                            status,
+                            headers,
+                            body: raw_body,
+                            tags,
+                        } = intercepted;
+                        let mut res_ctx = ResponseContext {
+                            status,
+                            headers,
+                            body: raw_body,
+                            request_uri: display_uri.clone(),
+                            session_id: req_ctx.session_id.clone(),
+                            tags,
+                            request_host: host.clone(),
+                            request_method: req_method.clone(),
+                            ..Default::default()
+                        };
+                        {
+                            let chain = self.middleware_chain.read().await.clone();
+                            if chain.execute_response(&mut res_ctx).await
+                                != MiddlewareAction::Continue
+                            {
+                                return (StatusCode::FORBIDDEN, "Response stopped by middleware")
+                                    .into_response();
+                            }
+                        }
+                        self.record_short_circuit_response(&res_ctx).await;
+                        let sc = StatusCode::from_u16(res_ctx.status).unwrap_or(StatusCode::OK);
+                        let mut builder = Response::builder().status(sc);
+                        for (k, v) in &res_ctx.headers {
+                            builder = builder.header(k, v);
+                        }
+                        return builder.body(Body::from(res_ctx.body)).unwrap_or_else(|_| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "mock error").into_response()
+                        });
+                    }
+                    return (StatusCode::FORBIDDEN, "Request stopped by middleware")
+                        .into_response();
+                }
+                MiddlewareAction::Pause => {
+                    return (StatusCode::ACCEPTED, "Request paused by breakpoint").into_response();
+                }
+            }
+        }
+
+        let destination = req_ctx.destination.take();
+        let oproxy_session_id = req_ctx.session_id.clone();
+        // Drop client-supplied x-oproxy-* headers and hop-by-hop headers, matching
+        // the buffered path. The response body is streamed back verbatim, so we
+        // leave content-encoding intact (the client decodes) — no manual decode.
+        req_ctx
+            .headers
+            .retain(|name, _| !name.trim().to_ascii_lowercase().starts_with("x-oproxy-"));
+        for hdr in &[
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "trailer",
+            "trailers",
+            "upgrade",
+        ] {
+            req_ctx.headers.remove(hdr);
+        }
+        // `te: trailers` is required by gRPC and allowed in h2 (RFC 7540 §8.1.2.2);
+        // only strip `te` when its value is not "trailers".
+        req_ctx
+            .headers
+            .retain(|name, value| name != "te" || value.trim().eq_ignore_ascii_case("trailers"));
+
+        let path_and_query: String = uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| {
+                if req_uri.starts_with('/') {
+                    req_uri.clone()
+                } else {
+                    "/".to_string()
+                }
+            });
+
+        let target_url = match destination {
+            Some(ref dest) => {
+                let base = dest.trim_end_matches('/');
+                let base = if base.starts_with("http://") || base.starts_with("https://") {
+                    base.to_string()
+                } else {
+                    format!("http://{}", base)
+                };
+                if let Ok(url) = reqwest::Url::parse(&base)
+                    && let Some(dest_host) = url.host_str()
+                {
+                    let host_val = match url.port() {
+                        Some(p) => format!("{}:{}", dest_host, p),
+                        None => dest_host.to_string(),
+                    };
+                    req_ctx.headers.insert("host".to_string(), host_val);
+                }
+                format!("{}{}", base, path_and_query)
+            }
+            None => format!("http://{}{}", req_ctx.host, path_and_query),
+        };
+
+        if self.is_self_proxy(&target_url) {
+            tracing::warn!(url = %target_url, "Proxy loop detected (streaming path)");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "Proxy error: Proxy loop detected (request forwarded to the proxy itself)",
+            )
+                .into_response();
+        }
+
+        let mut target_headers = reqwest::header::HeaderMap::new();
+        for (name, value) in &req_ctx.headers {
+            if name != "host"
+                && name != "content-length"
+                && let Ok(n) = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                && let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+            {
+                target_headers.append(n, v);
+            }
+        }
+
+        let client = self.clients.read().await.1.clone();
+        let forward_method = match reqwest::Method::from_bytes(req_method.as_bytes()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(method = %req_method, error = %e, "rejecting request with invalid HTTP method");
+                return (StatusCode::BAD_REQUEST, "invalid HTTP method").into_response();
+            }
+        };
+
+        // Collect stream observers now — after the request chain has set session_id
+        // and other side-channel fields — so observers can capture that state.
+        // Observers are created before send() so they can also tap the request body.
+        let observers_arc = {
+            let chain = self.middleware_chain.read().await;
+            let observers = chain.stream_observers(&req_ctx);
+            std::sync::Arc::new(std::sync::Mutex::new(observers))
+        };
+
+        // Relay request body as a stream, feeding each chunk to observers.
+        let obs_for_req = observers_arc.clone();
+        let body_stream = req.into_body().into_data_stream().map(move |result| {
+            if let Ok(ref bytes) = result
+                && let Ok(ref mut obs) = obs_for_req.lock()
+            {
+                for o in obs.iter_mut() {
+                    o.on_request_chunk(bytes);
+                }
+            }
+            result
+        });
+        let request_builder = client
+            .request(forward_method, &target_url)
+            .headers(target_headers)
+            .body(reqwest::Body::wrap_stream(body_stream));
+
+        let net_start = Instant::now();
+        match request_builder.send().await {
+            Ok(res) => {
+                let ttfb_ms = net_start.elapsed().as_millis() as u64;
+                let status = res.status().as_u16();
+                let upstream_protocol = protocol_label(res.version()).to_string();
+                let mut res_headers = crate::middleware::HeaderMap::new();
+                for (name, value) in res.headers().iter() {
+                    res_headers.append(name.to_string(), value.to_str().unwrap_or("").to_string());
+                }
+                for hdr in &[
+                    "connection",
+                    "keep-alive",
+                    "proxy-connection",
+                    "transfer-encoding",
+                    "te",
+                    "trailer",
+                    "trailers",
+                    "upgrade",
+                ] {
+                    remove_header(&mut res_headers, hdr);
+                }
+
+                let mut res_ctx = ResponseContext {
+                    status,
+                    headers: res_headers,
+                    request_uri: display_uri.clone(),
+                    session_id: oproxy_session_id,
+                    ttfb_ms,
+                    request_host: host.clone(),
+                    request_method: req_method.clone(),
+                    protocol: Some(upstream_protocol),
+                    // Signal to InspectionMiddleware that recording is deferred to
+                    // the BodyObserver so that on_response skips size recording.
+                    response_body_observer_pending: true,
+                    ..Default::default()
+                };
+
+                {
+                    let chain = self.middleware_chain.read().await.clone();
+                    if chain.execute_response(&mut res_ctx).await != MiddlewareAction::Continue {
+                        return (StatusCode::FORBIDDEN, "Response stopped by middleware")
+                            .into_response();
+                    }
+                }
+
+                // Reclaim observers from the Arc (request body stream is fully consumed
+                // by the time send() returns, so the clone in the map closure was dropped).
+                let mut observers = std::sync::Arc::try_unwrap(observers_arc)
+                    .map(|m| m.into_inner().unwrap_or_default())
+                    .unwrap_or_else(|arc| {
+                        std::mem::take(&mut *arc.lock().unwrap_or_else(|e| e.into_inner()))
+                    });
+
+                // Deliver response head to each observer.
+                for obs in &mut observers {
+                    obs.on_response_head(&res_ctx, start);
+                }
+
+                info!(
+                    method = %req_method,
+                    uri = %req_uri,
+                    status = res_ctx.status,
+                    latency_ms = start.elapsed().as_millis(),
+                    "Streaming request completed"
+                );
+
+                let status_code = StatusCode::from_u16(res_ctx.status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let mut builder = Response::builder().status(status_code);
+                for (name, value) in &res_ctx.headers {
+                    builder = builder.header(name, value);
+                }
+                if let Some(ref svc) = self.alt_svc_header {
+                    builder = builder.header("alt-svc", svc.as_str());
+                }
+                let stream_body = axum::body::Body::from_stream(async_stream::stream! {
+                    let mut r = res;
+                    let mut observers = observers;
+                    while let Ok(Some(chunk)) = r.chunk().await {
+                        for obs in &mut observers {
+                            obs.on_chunk(&chunk);
+                        }
+                        yield Ok::<_, reqwest::Error>(chunk);
+                    }
+                    for obs in observers {
+                        obs.finish().await;
+                    }
+                });
+                builder
+                    .body(stream_body)
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            }
+            Err(e) => {
+                error!(error = %e, "Proxy error (streaming path)");
+                let mut err_ctx = ResponseContext {
                     status: 502,
                     headers: crate::middleware::HeaderMap::new(),
                     body: Bytes::from(format!("Proxy error: {}", e)),

@@ -200,6 +200,40 @@ pub(super) fn spawn_https_listener(
     });
 }
 
+/// Bind the HTTP/3 UDP endpoint. Only available with the `http3` feature.
+/// Returns `None` when the config option is unset or binding fails.
+#[cfg(feature = "http3")]
+pub(super) async fn bind_http3_listener(
+    config: &Config,
+    ca: &std::sync::Arc<CertificateAuthority>,
+) -> Option<h3_quinn::quinn::Endpoint> {
+    if !config.http3_enabled {
+        return None;
+    }
+    let port = config.http3_port?;
+    match crate::transport::http3::bind_h3_listener(&config.bind_host, port, ca.clone()).await {
+        Ok(ep) => Some(ep),
+        Err(e) => {
+            tracing::warn!(error=%e, "Failed to bind HTTP/3 listener, continuing without it");
+            None
+        }
+    }
+}
+
+/// Spawn the HTTP/3 accept task. Only available with the `http3` feature.
+#[cfg(feature = "http3")]
+pub(super) fn spawn_http3_listener(
+    endpoint: Option<h3_quinn::quinn::Endpoint>,
+    engine: std::sync::Arc<crate::core::engine::ProxyEngine>,
+    shutdown_rx: watch::Receiver<bool>,
+    supervisor: &mut RuntimeSupervisor,
+) {
+    let Some(ep) = endpoint else { return };
+    supervisor.spawn_listener("http3", async move {
+        crate::transport::http3::run_h3_listener(ep, engine, shutdown_rx).await;
+    });
+}
+
 pub fn spawn_socks5_listener(
     listener: Option<tokio::net::TcpListener>,
     service: ProxySocks5Service,

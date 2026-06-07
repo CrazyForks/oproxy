@@ -59,6 +59,15 @@ impl Middleware for MapRemoteMiddleware {
         "MapRemoteMiddleware"
     }
 
+    fn body_hint(
+        &self,
+        _head: &crate::middleware::RequestContext,
+    ) -> crate::core::forward::BodyHint {
+        crate::core::forward::BodyHint::StreamingInspect {
+            granularity: crate::core::forward::Granularity::Bytes,
+        }
+    }
+
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         let rules = self.rules.read().await;
         let target = MatchTarget::from_request(ctx);

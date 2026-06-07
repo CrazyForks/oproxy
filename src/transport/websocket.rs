@@ -1,12 +1,15 @@
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
 use axum::body::Body;
+use futures_util::{SinkExt, StreamExt};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::watch;
-use tokio::time::timeout;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+    tungstenite::{
+        handshake::client::generate_key,
+        protocol::{Message, Role},
+    },
+};
 
 use crate::transport::TransportContext;
 use crate::transport::lifecycle::wait_for_shutdown;
@@ -19,124 +22,44 @@ pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
         .unwrap_or(false)
 }
 
-struct LeadingBytesReader<R> {
-    prefix: std::io::Cursor<Vec<u8>>,
-    inner: R,
+/// Returns `true` when the request is an RFC 8441 extended-CONNECT (h2
+/// WebSocket upgrade via `:protocol = websocket`).
+// RFC 8441 extended-CONNECT detection — not yet wired to a handler, stub kept
+// for the upcoming WebSocket-over-h2 path. Suppress the binary dead_code lint.
+#[allow(dead_code)]
+pub fn is_h2_websocket_upgrade<B>(req: &Request<B>) -> bool {
+    req.method() == hyper::Method::from_bytes(b"CONNECT").unwrap_or(hyper::Method::GET)
+        && req
+            .headers()
+            .get("protocol")
+            .or_else(|| req.headers().get(":protocol"))
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false)
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for LeadingBytesReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let me = &mut *self;
-        let pos = me.prefix.position() as usize;
-        let data = me.prefix.get_ref();
-        if pos < data.len() {
-            let to_read = (data.len() - pos).min(buf.remaining());
-            buf.put_slice(&data[pos..pos + to_read]);
-            me.prefix.set_position((pos + to_read) as u64);
-            return Poll::Ready(Ok(()));
+fn map_tungstenite_message_to_record(
+    msg: &Message,
+) -> Option<(u8, usize, Option<String>, Option<String>)> {
+    match msg {
+        Message::Text(text) => {
+            let preview = text.chars().take(512).collect::<String>();
+            Some((0x1, text.len(), Some(preview), None))
         }
-        Pin::new(&mut me.inner).poll_read(cx, buf)
-    }
-}
-
-async fn read_ws_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<(u8, Vec<u8>, Vec<u8>)> {
-    let mut header = [0u8; 2];
-    reader.read_exact(&mut header).await?;
-    let b0 = header[0];
-    let b1 = header[1];
-    let opcode = b0 & 0x0F;
-    let masked = (b1 & 0x80) != 0;
-    let len7 = (b1 & 0x7F) as usize;
-    let mut raw = vec![b0, b1];
-    let payload_len = match len7 {
-        126 => {
-            let mut ext = [0u8; 2];
-            reader.read_exact(&mut ext).await?;
-            raw.extend_from_slice(&ext);
-            u16::from_be_bytes(ext) as usize
+        Message::Binary(data) => {
+            let chunk = &data[..data.len().min(64)];
+            let hex: String = chunk.iter().map(|b| format!("{:02x}", b)).collect();
+            Some((
+                0x2,
+                data.len(),
+                None,
+                if hex.is_empty() { None } else { Some(hex) },
+            ))
         }
-        127 => {
-            let mut ext = [0u8; 8];
-            reader.read_exact(&mut ext).await?;
-            raw.extend_from_slice(&ext);
-            (u64::from_be_bytes(ext) as usize).min(16 * 1024 * 1024)
-        }
-        n => n,
-    };
-    let mask_key = if masked {
-        let mut key = [0u8; 4];
-        reader.read_exact(&mut key).await?;
-        raw.extend_from_slice(&key);
-        Some(key)
-    } else {
-        None
-    };
-    let mut payload = vec![0u8; payload_len];
-    reader.read_exact(&mut payload).await?;
-    raw.extend_from_slice(&payload);
-    let decoded = if let Some(key) = mask_key {
-        payload
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| b ^ key[i % 4])
-            .collect()
-    } else {
-        payload
-    };
-    Ok((opcode, decoded, raw))
-}
-
-async fn relay_ws_frames<R, W>(
-    mut reader: R,
-    mut writer: W,
-    sm: crate::session::SharedSessionManager,
-    session_id: String,
-    direction: crate::session::WsDirection,
-) where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    loop {
-        let (opcode, decoded, raw) = match read_ws_frame(&mut reader).await {
-            Ok(f) => f,
-            Err(_) => break,
-        };
-        if writer.write_all(&raw).await.is_err() {
-            break;
-        }
-        let payload_len = decoded.len();
-        let (payload_text, payload_hex) = if opcode == 0x1 {
-            let s = String::from_utf8_lossy(&decoded[..decoded.len().min(512)]).into_owned();
-            (Some(s), None)
-        } else {
-            let chunk = &decoded[..decoded.len().min(64)];
-            let mut hex = String::with_capacity(chunk.len() * 2);
-            for b in chunk {
-                use std::fmt::Write as _;
-                let _ = write!(hex, "{:02x}", b);
-            }
-            (None, if hex.is_empty() { None } else { Some(hex) })
-        };
-        sm.append_ws_frame(
-            &session_id,
-            crate::session::WsFrame {
-                timestamp: chrono::Utc::now(),
-                direction: direction.clone(),
-                opcode,
-                payload_len,
-                payload_text,
-                payload_hex,
-            },
-        );
-        if opcode == 0x8 {
-            break;
-        }
+        Message::Ping(_) => Some((0x9, 0, None, None)),
+        Message::Pong(_) => Some((0xA, 0, None, None)),
+        Message::Close(_) => Some((0x8, 0, None, None)),
+        Message::Frame(_) => None,
     }
 }
 
@@ -155,6 +78,16 @@ pub async fn handle_websocket(
 
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    // Downstream connection identity (Phase 7) — the upgrade request carries the
+    // DownstreamConn extension inserted by the accept loop.
+    let (ws_connection_id, ws_stream_id) = {
+        let conn = req
+            .extensions()
+            .get::<crate::transport::http::DownstreamConn>();
+        (conn.map(|c| c.id.clone()), conn.map(|c| c.next_stream()))
+    };
+    let ws_downstream_protocol =
+        Some(crate::core::engine::protocol_label(req.version()).to_string());
 
     let host_header = headers
         .get("host")
@@ -166,33 +99,86 @@ pub async fn handle_websocket(
         .host()
         .map(|s| s.to_string())
         .unwrap_or_else(|| host_header.split(':').next().unwrap_or("").to_string());
-    let port: u16 = uri.port_u16().unwrap_or(80);
-    let addr = format!("{}:{}", target_host, port);
+
+    // Determine scheme: if the proxy is in MITM mode and the original scheme was
+    // https/wss, use wss; otherwise fall back to port heuristic.
+    let scheme = uri.scheme_str().unwrap_or("ws");
+    let default_port: u16 = if scheme == "wss" || scheme == "https" {
+        443
+    } else {
+        80
+    };
+    let port: u16 = uri.port_u16().unwrap_or(default_port);
+    let use_tls = scheme == "wss" || scheme == "https" || port == 443;
 
     let path_and_query = uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    let mut raw_req = format!("GET {} HTTP/1.1\r\n", path_and_query);
+    let upstream_scheme = if use_tls { "wss" } else { "ws" };
+    let upstream_url = format!(
+        "{}://{}:{}{}",
+        upstream_scheme, target_host, port, path_and_query
+    );
+    let record_uri = upstream_url.clone();
+
+    // Build the upstream WebSocket request, forwarding the client's headers.
+    let mut ws_req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(&upstream_url)
+        .header("host", format!("{}:{}", target_host, port))
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", generate_key());
+
     for (name, value) in &headers {
+        let name_str = name.as_str().to_lowercase();
+        // Forward application headers; skip WS protocol-negotiation headers we set above.
+        if matches!(
+            name_str.as_str(),
+            "host"
+                | "upgrade"
+                | "connection"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-accept"
+        ) {
+            continue;
+        }
         if let Ok(v) = value.to_str() {
-            raw_req.push_str(&format!("{}: {}\r\n", name, v));
+            ws_req = ws_req.header(name.as_str(), v);
         }
     }
-    raw_req.push_str("\r\n");
 
-    let mut upstream = match timeout(connect_timeout, tokio::net::TcpStream::connect(&addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::warn!(error=%e, addr=%addr, "WS upstream unreachable");
+    let ws_req = match ws_req.body(()) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error=%e, "WS request build failed");
             return Response::builder()
                 .status(502)
-                .body(Body::from("WebSocket upstream unreachable"))
+                .body(Body::from("WebSocket request build failed"))
+                .unwrap();
+        }
+    };
+
+    // Connect to the upstream WebSocket server (with TLS if required).
+    let upstream_ws = match tokio::time::timeout(
+        connect_timeout + handshake_timeout,
+        connect_async_tls_with_config(ws_req, None, false, None),
+    )
+    .await
+    {
+        Ok(Ok((ws, _response))) => ws,
+        Ok(Err(e)) => {
+            tracing::warn!(error=%e, url=%upstream_url, "WS upstream connect failed");
+            return Response::builder()
+                .status(502)
+                .body(Body::from("WebSocket upstream connect failed"))
                 .unwrap();
         }
         Err(_) => {
-            tracing::warn!(addr=%addr, timeout_secs=connect_timeout.as_secs(), "WS upstream connect timed out");
+            tracing::warn!(url=%upstream_url, "WS upstream connect timed out");
             return Response::builder()
                 .status(504)
                 .body(Body::from("WebSocket upstream connect timed out"))
@@ -200,70 +186,7 @@ pub async fn handle_websocket(
         }
     };
 
-    let header_buf = match timeout(handshake_timeout, async {
-        if let Err(e) = upstream.write_all(raw_req.as_bytes()).await {
-            tracing::warn!(error=%e, "WS handshake send failed");
-            return Err("WS handshake send failed");
-        }
-
-        let mut header_buf: Vec<u8> = Vec::with_capacity(1024);
-        let mut tmp = [0u8; 512];
-        'read: loop {
-            match upstream.read(&mut tmp).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    header_buf.extend_from_slice(&tmp[..n]);
-                    for i in 0..header_buf.len().saturating_sub(3) {
-                        if &header_buf[i..i + 4] == b"\r\n\r\n" {
-                            break 'read;
-                        }
-                    }
-                    if header_buf.len() > 16_384 {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(header_buf)
-    })
-    .await
-    {
-        Ok(Ok(header_buf)) => header_buf,
-        Ok(Err(message)) => {
-            return Response::builder()
-                .status(502)
-                .body(Body::from(message))
-                .unwrap();
-        }
-        Err(_) => {
-            tracing::warn!(addr=%addr, timeout_secs=handshake_timeout.as_secs(), "WS handshake timed out");
-            return Response::builder()
-                .status(504)
-                .body(Body::from("WebSocket handshake timed out"))
-                .unwrap();
-        }
-    };
-
-    let header_str = String::from_utf8_lossy(&header_buf);
-    let first_line = header_str.lines().next().unwrap_or("");
-    if !first_line.contains(" 101 ") {
-        tracing::warn!(response=%first_line, addr=%addr, "WS upstream rejected upgrade");
-        return Response::builder()
-            .status(502)
-            .body(Body::from("Upstream did not switch protocols"))
-            .unwrap();
-    }
-
-    let mut builder = Response::builder().status(101);
-    for line in header_str.lines().skip(1) {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(": ") {
-            builder = builder.header(name, value);
-        }
-    }
-
+    // Record the session request head.
     let mut req_headers_map = crate::middleware::HeaderMap::new();
     for (k, v) in &headers {
         if let Ok(v) = v.to_str() {
@@ -274,20 +197,29 @@ pub async fn handle_websocket(
         session_id.clone(),
         crate::middleware::RequestContext {
             method: "WS".to_string(),
-            uri: format!("ws://{}:{}{}", target_host, port, path_and_query),
+            uri: record_uri,
             headers: req_headers_map,
             body: bytes::Bytes::new(),
             host: target_host.clone(),
+            connection_id: ws_connection_id,
+            stream_id: ws_stream_id,
+            downstream_protocol: ws_downstream_protocol,
             ..Default::default()
         },
     );
 
-    let header_end = header_buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .unwrap_or(header_buf.len());
-    let leftover: Vec<u8> = header_buf[header_end..].to_vec();
+    // Complete the h1 upgrade handshake with the downstream client.
+    let mut builder = Response::builder().status(101);
+    builder = builder.header("upgrade", "websocket");
+    builder = builder.header("connection", "Upgrade");
+    // Echo Sec-WebSocket-Accept so the client's browser completes the handshake.
+    if let Some(key) = headers
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+    {
+        let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+        builder = builder.header("sec-websocket-accept", accept);
+    }
 
     let on_upgrade = hyper::upgrade::on(req);
     connections.spawn_tracked("websocket-tunnel", peer, async move {
@@ -298,64 +230,102 @@ pub async fn handle_websocket(
                 return;
             }
         };
-        match upgraded {
-            Ok(upgraded) => {
-                let mut client_io = hyper_util::rt::TokioIo::new(upgraded);
-                if !inspect_frames {
-                    if !leftover.is_empty() {
-                        let _ = client_io.write_all(&leftover).await;
-                    }
-                    tokio::select! {
-                        result = tokio::io::copy_bidirectional(&mut client_io, &mut upstream) => {
-                            if let Err(e) = result {
-                                tracing::debug!(error=%e, "WS tunnel closed");
-                            }
-                        }
-                        _ = wait_for_shutdown(&mut shutdown) => {
-                            tracing::debug!("WS tunnel stopped by shutdown");
-                        }
-                    }
-                    return;
-                }
-                let (client_read, client_write) = tokio::io::split(client_io);
-                let (server_tcp_read, server_tcp_write) = upstream.into_split();
-                let server_read = LeadingBytesReader {
-                    prefix: std::io::Cursor::new(leftover),
-                    inner: server_tcp_read,
-                };
-                let sm_c = sm.clone();
-                let sid_c = session_id.clone();
-                let relay_c = relay_ws_frames(
-                    client_read,
-                    server_tcp_write,
-                    sm_c,
-                    sid_c,
-                    crate::session::WsDirection::ClientToServer,
-                );
-                let relay_s = relay_ws_frames(
-                    server_read,
-                    client_write,
-                    sm,
-                    session_id,
-                    crate::session::WsDirection::ServerToClient,
-                );
-                tokio::pin!(relay_c);
-                tokio::pin!(relay_s);
-                tokio::select! {
-                    _ = &mut relay_c => {}
-                    _ = &mut relay_s => {}
-                    _ = wait_for_shutdown(&mut shutdown) => {
-                        tracing::debug!("WS frame relay stopped by shutdown");
-                    }
-                }
+        let upgraded = match upgraded {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::debug!(error=%e, "WS client upgrade failed");
+                return;
             }
-            Err(e) => tracing::debug!(error=%e, "WS client upgrade failed"),
-        }
+        };
+
+        let client_io = hyper_util::rt::TokioIo::new(upgraded);
+        let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Server, None).await;
+
+        relay_ws(
+            client_ws,
+            upstream_ws,
+            sm,
+            session_id,
+            inspect_frames,
+            &mut shutdown,
+        )
+        .await;
     });
 
     builder
         .body(Body::empty())
         .unwrap_or_else(|_| Response::builder().status(500).body(Body::empty()).unwrap())
+}
+
+async fn relay_ws(
+    mut client: WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>,
+    mut upstream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    sm: crate::session::SharedSessionManager,
+    session_id: String,
+    inspect_frames: bool,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            msg = client.next() => {
+                match msg {
+                    Some(Ok(m)) => {
+                        if inspect_frames {
+                            record_frame(&sm, &session_id, &m, crate::session::WsDirection::ClientToServer);
+                        }
+                        let is_close = m.is_close();
+                        if upstream.send(m).await.is_err() || is_close {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            msg = upstream.next() => {
+                match msg {
+                    Some(Ok(m)) => {
+                        if inspect_frames {
+                            record_frame(&sm, &session_id, &m, crate::session::WsDirection::ServerToClient);
+                        }
+                        let is_close = m.is_close();
+                        if client.send(m).await.is_err() || is_close {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            _ = wait_for_shutdown(shutdown) => {
+                tracing::debug!("WS relay stopped by shutdown");
+                break;
+            }
+        }
+    }
+    let _ = client.close(None).await;
+    let _ = upstream.close(None).await;
+}
+
+fn record_frame(
+    sm: &crate::session::SharedSessionManager,
+    session_id: &str,
+    msg: &Message,
+    direction: crate::session::WsDirection,
+) {
+    if let Some((opcode, payload_len, payload_text, payload_hex)) =
+        map_tungstenite_message_to_record(msg)
+    {
+        sm.append_ws_frame(
+            session_id,
+            crate::session::WsFrame {
+                timestamp: chrono::Utc::now(),
+                direction,
+                opcode,
+                payload_len,
+                payload_text,
+                payload_hex,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -370,5 +340,50 @@ mod tests {
             .unwrap();
 
         assert!(is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn non_websocket_upgrade_not_detected() {
+        let req = Request::builder()
+            .header("upgrade", "h2c")
+            .body(())
+            .unwrap();
+        assert!(!is_websocket_upgrade(&req));
+    }
+
+    #[test]
+    fn text_message_maps_to_opcode_1() {
+        let msg = Message::Text("hello".to_string());
+        let (opcode, len, text, hex) = map_tungstenite_message_to_record(&msg).unwrap();
+        assert_eq!(opcode, 0x1);
+        assert_eq!(len, 5);
+        assert_eq!(text.as_deref(), Some("hello"));
+        assert!(hex.is_none());
+    }
+
+    #[test]
+    fn binary_message_maps_to_opcode_2_with_hex() {
+        let msg = Message::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let (opcode, len, text, hex) = map_tungstenite_message_to_record(&msg).unwrap();
+        assert_eq!(opcode, 0x2);
+        assert_eq!(len, 4);
+        assert!(text.is_none());
+        assert_eq!(hex.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn close_message_maps_to_opcode_8() {
+        let msg = Message::Close(None);
+        let (opcode, _, _, _) = map_tungstenite_message_to_record(&msg).unwrap();
+        assert_eq!(opcode, 0x8);
+    }
+
+    #[test]
+    fn large_text_preview_truncated_to_512_chars() {
+        let big = "x".repeat(1000);
+        let msg = Message::Text(big);
+        let (_, len, text, _) = map_tungstenite_message_to_record(&msg).unwrap();
+        assert_eq!(len, 1000);
+        assert_eq!(text.unwrap().len(), 512);
     }
 }

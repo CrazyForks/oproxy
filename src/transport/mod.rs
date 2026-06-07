@@ -1,6 +1,7 @@
 pub mod connect;
 pub mod context;
 pub mod http;
+pub mod http3;
 pub mod lifecycle;
 pub mod socks5;
 pub mod tls;

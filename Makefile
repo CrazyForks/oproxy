@@ -39,7 +39,7 @@ ui: ## Build the React UI assets (requires Node + Yarn)
 test: test-rust test-ui ## Run all tests (Rust + Playwright browser tests)
 
 test-rust: ## Run Rust unit/integration tests
-	RUSTFLAGS="-D warnings" cargo test
+	RUSTFLAGS="-D warnings" cargo test --all-features
 
 test-ui: ## Run Playwright browser tests (builds debug binary first)
 	@echo "Building debug binary for browser tests..."

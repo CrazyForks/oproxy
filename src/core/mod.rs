@@ -3,6 +3,7 @@ pub mod decompression;
 pub mod engine;
 #[cfg(test)]
 mod engine_tests;
+pub mod forward;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]

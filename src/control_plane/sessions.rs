@@ -40,6 +40,314 @@ pub(super) struct SessionQuery {
     include_bodies: Option<bool>,
 }
 
+/// One member exchange within a connection, trimmed to what the stream tree needs.
+#[derive(serde::Serialize)]
+pub(super) struct ConnectionStream {
+    id: String,
+    stream_id: Option<u64>,
+    method: String,
+    host: String,
+    path: String,
+    status: u16,
+    ts: String,
+    /// Milliseconds from `connection.first_seen` to this stream's start — the
+    /// x-offset for the concurrency timeline (Phase 9).
+    start_offset_ms: i64,
+    /// Stream duration in milliseconds (latency); the timeline bar width.
+    duration_ms: u64,
+}
+
+/// Aggregated view of one downstream connection and the streams multiplexed on it.
+#[derive(serde::Serialize)]
+pub(super) struct ConnectionSummary {
+    connection_id: String,
+    downstream_protocol: Option<String>,
+    /// Distinct origin hosts seen on this connection (usually one).
+    hosts: Vec<String>,
+    exchange_count: usize,
+    /// Number of distinct stream ids observed (h1 ≈ exchange_count; h2/h3 may
+    /// reuse the connection for many concurrent streams).
+    stream_count: usize,
+    first_seen: String,
+    last_seen: String,
+    /// Total wall-clock span of the connection in ms (timeline width).
+    span_ms: i64,
+    /// Peak number of streams in flight at the same instant — 1 for serial
+    /// HTTP/1.1, higher when h2/h3 streams genuinely overlap (Phase 9).
+    max_concurrency: usize,
+    streams: Vec<ConnectionStream>,
+}
+
+/// `GET /api/connections` — groups recorded exchanges by `connection_id` so the
+/// UI can render the connection → stream tree and h2/h3 multiplexing (Phase 8).
+/// Exchanges without a captured connection id are omitted.
+pub(super) async fn list_connections(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let started = Instant::now();
+    let sessions = state.session_manager.get_all_sessions();
+    let connections = aggregate_connections(sessions);
+
+    record_endpoint_timing(
+        &state.endpoint_metrics,
+        "/api/connections",
+        started,
+        connections.len(),
+    );
+    axum::Json(serde_json::json!({
+        "connections": connections,
+        "total": connections.len(),
+    }))
+}
+
+/// Pure aggregation of exchanges into per-connection summaries (most-recently
+/// active first). Extracted from the handler so it is unit-testable.
+pub(super) fn aggregate_connections(
+    sessions: Vec<crate::session::Exchange>,
+) -> Vec<ConnectionSummary> {
+    // Preserve first-seen order of connections.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<crate::session::Exchange>> =
+        std::collections::HashMap::new();
+    for ex in sessions {
+        let Some(cid) = ex.connection_id.clone() else {
+            continue;
+        };
+        groups.entry(cid.clone()).or_default().push(ex);
+        if !order.contains(&cid) {
+            order.push(cid);
+        }
+    }
+
+    let mut connections: Vec<ConnectionSummary> = Vec::with_capacity(order.len());
+    for cid in order {
+        let mut members = groups.remove(&cid).unwrap_or_default();
+        members.sort_by_key(|e| e.stream_id.unwrap_or(0));
+
+        let mut hosts: Vec<String> = Vec::new();
+        let mut stream_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut streams = Vec::with_capacity(members.len());
+        let downstream_protocol = members.iter().find_map(|e| e.downstream_protocol.clone());
+        let first_seen = members
+            .iter()
+            .map(|e| e.timestamp)
+            .min()
+            .unwrap_or_else(chrono::Utc::now);
+        let last_seen = members
+            .iter()
+            .map(|e| e.updated_at.unwrap_or(e.timestamp))
+            .max()
+            .unwrap_or_else(chrono::Utc::now);
+
+        // [start_ms, end_ms) intervals (relative to first_seen) for concurrency.
+        let mut intervals: Vec<(i64, i64)> = Vec::with_capacity(members.len());
+        for e in &members {
+            if let Some(sid) = e.stream_id {
+                stream_ids.insert(sid);
+            }
+            let host = e.request.host.clone();
+            if !host.is_empty() && !hosts.contains(&host) {
+                hosts.push(host.clone());
+            }
+            let (path, _) = e
+                .request
+                .uri
+                .split_once('?')
+                .unwrap_or((e.request.uri.as_str(), ""));
+            let start_offset_ms = (e.timestamp - first_seen).num_milliseconds();
+            let duration_ms = e.metrics.as_ref().map(|m| m.latency_ms).unwrap_or(0);
+            intervals.push((start_offset_ms, start_offset_ms + duration_ms as i64));
+            streams.push(ConnectionStream {
+                id: e.id.clone(),
+                stream_id: e.stream_id,
+                method: e.request.method.clone(),
+                host,
+                path: path.to_string(),
+                status: e
+                    .metrics
+                    .as_ref()
+                    .map(|m| m.status_code)
+                    .or_else(|| e.response.as_ref().map(|r| r.status))
+                    .unwrap_or(0),
+                ts: e.timestamp.to_rfc3339(),
+                start_offset_ms,
+                duration_ms,
+            });
+        }
+
+        let span_ms = (last_seen - first_seen)
+            .num_milliseconds()
+            .max(intervals.iter().map(|(_, end)| *end).max().unwrap_or(0));
+        let max_concurrency = peak_concurrency(&intervals);
+
+        connections.push(ConnectionSummary {
+            connection_id: cid,
+            downstream_protocol,
+            hosts,
+            exchange_count: members.len(),
+            stream_count: stream_ids.len(),
+            first_seen: first_seen.to_rfc3339(),
+            last_seen: last_seen.to_rfc3339(),
+            span_ms,
+            max_concurrency,
+            streams,
+        });
+    }
+
+    // Most recently active connections first.
+    connections.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    connections
+}
+
+/// A labelled count, serialised as `{ "label": .., "count": .. }`.
+#[derive(serde::Serialize)]
+pub(super) struct LabelCount {
+    label: String,
+    count: usize,
+}
+
+/// Aggregate protocol metrics over the whole session store (Phase 10 dashboard).
+#[derive(serde::Serialize, Default)]
+pub(super) struct ProtocolMetrics {
+    total_exchanges: usize,
+    connections: usize,
+    websockets: usize,
+    grpc_calls: usize,
+    /// Upstream (proxy→origin) protocol mix.
+    protocol_mix: Vec<LabelCount>,
+    /// Downstream (client→proxy) protocol mix.
+    downstream_mix: Vec<LabelCount>,
+    /// Status-class distribution (2xx/3xx/4xx/5xx/pending).
+    status_classes: Vec<LabelCount>,
+    /// gRPC status-code distribution (from captured `grpc-status`).
+    grpc_status: Vec<LabelCount>,
+    total_bytes: u64,
+    latency_p50_ms: u64,
+    latency_p95_ms: u64,
+    latency_max_ms: u64,
+}
+
+/// `GET /api/metrics/protocol` — live protocol dashboard aggregates over the
+/// recorded sessions. Cheap enough to recompute on demand; the UI polls / reacts
+/// to the session SSE broadcast.
+pub(super) async fn protocol_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let started = Instant::now();
+    let sessions = state.session_manager.get_all_sessions();
+    let metrics = aggregate_protocol_metrics(sessions);
+    record_endpoint_timing(
+        &state.endpoint_metrics,
+        "/api/metrics/protocol",
+        started,
+        metrics.total_exchanges,
+    );
+    axum::Json(metrics)
+}
+
+/// Pure aggregation for [`protocol_metrics`], extracted for unit testing.
+pub(super) fn aggregate_protocol_metrics(
+    sessions: Vec<crate::session::Exchange>,
+) -> ProtocolMetrics {
+    use std::collections::{BTreeMap, HashSet};
+
+    let mut m = ProtocolMetrics {
+        total_exchanges: sessions.len(),
+        ..Default::default()
+    };
+    let mut upstream: BTreeMap<String, usize> = BTreeMap::new();
+    let mut downstream: BTreeMap<String, usize> = BTreeMap::new();
+    let mut status: BTreeMap<String, usize> = BTreeMap::new();
+    let mut grpc: BTreeMap<String, usize> = BTreeMap::new();
+    let mut conns: HashSet<String> = HashSet::new();
+    let mut latencies: Vec<u64> = Vec::with_capacity(sessions.len());
+
+    for ex in &sessions {
+        if let Some(cid) = &ex.connection_id {
+            conns.insert(cid.clone());
+        }
+        if ex.request.method.eq_ignore_ascii_case("WS") {
+            m.websockets += 1;
+        }
+        if let Some(g) = ex.inspector_data.as_ref().and_then(|i| i.grpc.as_ref()) {
+            m.grpc_calls += 1;
+            if let Some(s) = &g.grpc_status {
+                *grpc.entry(s.clone()).or_default() += 1;
+            }
+        }
+        if let Some(p) = ex.metrics.as_ref().and_then(|x| x.protocol.clone()) {
+            *upstream.entry(p).or_default() += 1;
+        }
+        if let Some(p) = &ex.downstream_protocol {
+            *downstream.entry(p.clone()).or_default() += 1;
+        }
+        let code = ex
+            .metrics
+            .as_ref()
+            .map(|x| x.status_code)
+            .or_else(|| ex.response.as_ref().map(|r| r.status))
+            .unwrap_or(0);
+        let class = match code {
+            0 => "pending",
+            200..=299 => "2xx",
+            300..=399 => "3xx",
+            400..=499 => "4xx",
+            _ => "5xx",
+        };
+        *status.entry(class.to_string()).or_default() += 1;
+        if let Some(mx) = &ex.metrics {
+            m.total_bytes += mx.request_size_bytes as u64 + mx.response_size_bytes as u64;
+            latencies.push(mx.latency_ms);
+        }
+    }
+
+    let to_sorted = |map: BTreeMap<String, usize>| -> Vec<LabelCount> {
+        let mut v: Vec<LabelCount> = map
+            .into_iter()
+            .map(|(label, count)| LabelCount { label, count })
+            .collect();
+        v.sort_by(|a, b| b.count.cmp(&a.count).then(a.label.cmp(&b.label)));
+        v
+    };
+
+    m.connections = conns.len();
+    m.protocol_mix = to_sorted(upstream);
+    m.downstream_mix = to_sorted(downstream);
+    m.status_classes = to_sorted(status);
+    m.grpc_status = to_sorted(grpc);
+
+    latencies.sort_unstable();
+    let pct = |p: f64| -> u64 {
+        if latencies.is_empty() {
+            return 0;
+        }
+        let idx = ((p * (latencies.len() as f64 - 1.0)).round() as usize).min(latencies.len() - 1);
+        latencies[idx]
+    };
+    m.latency_p50_ms = pct(0.50);
+    m.latency_p95_ms = pct(0.95);
+    m.latency_max_ms = latencies.last().copied().unwrap_or(0);
+    m
+}
+
+/// Peak number of `[start, end)` intervals overlapping at any instant — the max
+/// in-flight stream concurrency on a connection. A classic endpoint sweep:
+/// +1 at each start, -1 at each end, tracking the running maximum. Equal
+/// start/end ties resolve ends before starts so a zero-duration stream and the
+/// next one don't count as overlapping.
+fn peak_concurrency(intervals: &[(i64, i64)]) -> usize {
+    let mut events: Vec<(i64, i8)> = Vec::with_capacity(intervals.len() * 2);
+    for &(start, end) in intervals {
+        events.push((start, 1));
+        events.push((end.max(start), -1));
+    }
+    // Sort by time; at the same time, process ends (-1) before starts (+1).
+    events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut cur = 0i64;
+    let mut peak = 0i64;
+    for (_, delta) in events {
+        cur += delta as i64;
+        peak = peak.max(cur);
+    }
+    peak.max(0) as usize
+}
+
 pub(super) async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<SessionQuery>,
@@ -485,4 +793,122 @@ pub(super) async fn import_har(
     let count = exchanges.len();
     state.session_manager.import_sessions(exchanges);
     axum::Json(serde_json::json!({ "imported": count }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{aggregate_connections, peak_concurrency};
+    use crate::middleware::RequestContext;
+    use crate::session::Exchange;
+
+    #[test]
+    fn peak_concurrency_serial_intervals_is_one() {
+        // Back-to-back, non-overlapping streams (h1-style).
+        assert_eq!(peak_concurrency(&[(0, 10), (10, 20), (20, 30)]), 1);
+    }
+
+    #[test]
+    fn peak_concurrency_counts_overlap() {
+        // Three streams all in flight 5..8 → peak 3.
+        assert_eq!(peak_concurrency(&[(0, 10), (5, 15), (6, 8)]), 3);
+    }
+
+    #[test]
+    fn peak_concurrency_empty_is_zero() {
+        assert_eq!(peak_concurrency(&[]), 0);
+    }
+
+    #[test]
+    fn protocol_metrics_counts_mix_status_and_latency() {
+        use super::aggregate_protocol_metrics;
+        use crate::session::InspectionMetrics;
+
+        let mk = |id: &str, proto: &str, status: u16, latency: u64| {
+            let mut e = ex(id, Some("c1"), Some(0), "api.test", "/p");
+            e.metrics = Some(InspectionMetrics {
+                status_code: status,
+                latency_ms: latency,
+                protocol: Some(proto.to_string()),
+                response_size_bytes: 100,
+                ..Default::default()
+            });
+            e
+        };
+        let m = aggregate_protocol_metrics(vec![
+            mk("a", "HTTP/2", 200, 10),
+            mk("b", "HTTP/2", 404, 20),
+            mk("c", "HTTP/1.1", 200, 30),
+        ]);
+
+        assert_eq!(m.total_exchanges, 3);
+        assert_eq!(m.connections, 1);
+        // HTTP/2 is the most common upstream protocol → first.
+        assert_eq!(m.protocol_mix[0].label, "HTTP/2");
+        assert_eq!(m.protocol_mix[0].count, 2);
+        let two_xx = m.status_classes.iter().find(|c| c.label == "2xx").unwrap();
+        assert_eq!(two_xx.count, 2);
+        assert_eq!(m.total_bytes, 300);
+        assert_eq!(m.latency_max_ms, 30);
+        assert_eq!(m.latency_p50_ms, 20);
+    }
+
+    fn ex(id: &str, conn: Option<&str>, stream: Option<u64>, host: &str, path: &str) -> Exchange {
+        Exchange {
+            id: id.to_string(),
+            timestamp: chrono::Utc::now(),
+            updated_at: None,
+            request: RequestContext {
+                method: "GET".to_string(),
+                uri: path.to_string(),
+                host: host.to_string(),
+                ..Default::default()
+            },
+            response: None,
+            metrics: None,
+            source: Default::default(),
+            ws_frames: vec![],
+            note: None,
+            tags: vec![],
+            inspector_data: None,
+            paused_at: None,
+            connection_id: conn.map(str::to_string),
+            stream_id: stream,
+            downstream_protocol: Some("HTTP/2".to_string()),
+        }
+    }
+
+    #[test]
+    fn aggregate_groups_by_connection_and_omits_unidentified() {
+        let connections = aggregate_connections(vec![
+            ex("a", Some("c1"), Some(0), "api.test", "/a"),
+            ex("b", Some("c1"), Some(1), "api.test", "/b"),
+            ex("c", Some("c2"), Some(0), "cdn.test", "/c"),
+            ex("d", None, None, "x.test", "/d"), // no connection id → omitted
+        ]);
+
+        assert_eq!(connections.len(), 2, "two identified connections");
+        let c1 = connections
+            .iter()
+            .find(|c| c.connection_id == "c1")
+            .expect("c1 present");
+        assert_eq!(c1.exchange_count, 2);
+        assert_eq!(c1.stream_count, 2);
+        assert_eq!(c1.streams.len(), 2);
+        assert_eq!(c1.downstream_protocol.as_deref(), Some("HTTP/2"));
+        // Streams ordered by stream_id.
+        assert_eq!(c1.streams[0].stream_id, Some(0));
+        assert_eq!(c1.streams[1].stream_id, Some(1));
+    }
+
+    #[test]
+    fn aggregate_dedups_hosts_and_counts_distinct_streams() {
+        let connections = aggregate_connections(vec![
+            ex("a", Some("c1"), Some(0), "api.test", "/a"),
+            ex("b", Some("c1"), Some(0), "api.test", "/b"), // same stream id reused
+        ]);
+        let c1 = &connections[0];
+        assert_eq!(c1.exchange_count, 2);
+        assert_eq!(c1.stream_count, 1, "distinct stream ids");
+        assert_eq!(c1.hosts, vec!["api.test".to_string()]);
+    }
 }

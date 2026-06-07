@@ -80,6 +80,15 @@ services:
       # Keep this in sync with the container path of the mock-responses volume.
       OPROXY_MAP_LOCAL_BASE_PATH: "/map-local"
 
+      # ── TLS verification ──────────────────────────────────────────────────────
+      # Skip TLS certificate verification for upstream connections.
+      # Required when the proxy itself intercepts (MITM) upstream TLS and the
+      # upstream server's cert is signed by the CA which
+      # reqwest's certificate store does not trust by default. It is also useful when
+      # targeting dev servers with self-signed certs.
+      # WARNING: disables all upstream cert validation — do not use in production.
+      OPROXY_INSECURE_UPSTREAM: 0
+
     volumes:
       # ── Persistent data ───────────────────────────────────────────────────────
       # Root CA key + cert. Trust root.crt once; it never rotates between restarts.
@@ -93,7 +102,6 @@ services:
       # /map-local/api/users.json inside the container. Paste content directly in
       # the UI to skip the volume mount for one-off fixtures.
       - ./mock-responses:/map-local
-
       # ── YAML config (optional) ────────────────────────────────────────────────
       # Mount a YAML config file to set options that have no env var override:
       #   socks5_port, upstream_proxy, timeout_secs, pool_max_idle_per_host,

@@ -632,6 +632,117 @@ body.col-resizing .t tbody tr { background: inherit !important; }
 .tag-badge.ws     { color: var(--c-2xx); }
 .tag-badge.sse    { color: var(--c-3xx); }
 
+/* Negotiated-protocol badge in the Sessions PROTO column. */
+.proto-badge {
+  display: inline-block;
+  min-width: 26px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9.5px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  border: 1px solid currentColor;
+  color: var(--text-low);
+  background: transparent;
+}
+.proto-badge[data-proto="h1"]    { color: var(--text-low); }
+.proto-badge[data-proto="h2"]    { color: var(--accent); }
+.proto-badge[data-proto="h3"]    { color: var(--c-2xx); }
+.proto-badge[data-proto="other"] { color: var(--text-low); opacity: 0.7; }
+
+/* Protocol dashboard (live aggregates). */
+.dash { padding: 10px 0; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.stat-card { background: var(--surface); border: 0.5px solid var(--border-soft); border-radius: var(--border-radius-md, 6px); padding: 10px 12px; }
+.stat-label { font-size: 11px; color: var(--text-low); text-transform: uppercase; letter-spacing: 0.04em; }
+.stat-value { font-size: 20px; font-weight: 500; color: var(--text-primary); font-variant-numeric: tabular-nums; margin-top: 2px; }
+.stat-sub { font-size: 11px; color: var(--text-low); margin-top: 1px; }
+.dash-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+.dist-title { font-size: 12px; color: var(--text-mid); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+.dist-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-family: var(--font-mono); font-size: 11.5px; }
+.dist-key { width: 78px; color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+.dist-track { position: relative; flex: 1; height: 10px; background: var(--border-soft); border-radius: 2px; overflow: hidden; }
+.dist-bar { position: absolute; top: 0; bottom: 0; left: 0; background: var(--accent); min-width: 2px; border-radius: 2px; }
+.dist-bar.ok { background: var(--c-2xx); }
+.dist-bar.redir { background: var(--c-3xx); }
+.dist-bar.err { background: var(--c-4xx); }
+.dist-bar.h2 { background: var(--accent); }
+.dist-bar.h3 { background: var(--c-2xx); }
+.dist-bar.h1 { background: var(--text-low); }
+.dist-count { width: 36px; text-align: right; color: var(--text-mid); font-variant-numeric: tabular-nums; }
+
+/* Connections surface (HTTP/2·3 multiplexing view). */
+.conn-list { display: flex; flex-direction: column; gap: 6px; padding: 8px 0; }
+.conn-card { border: 0.5px solid var(--border-soft); border-radius: var(--border-radius-md, 6px); overflow: hidden; }
+.conn-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 12px;
+}
+.conn-head:hover { background: var(--row-selected); }
+.conn-twig { color: var(--text-low); width: 12px; }
+.conn-host { color: var(--text-primary); font-weight: 500; }
+.conn-mux { color: var(--accent); font-size: 11px; }
+.conn-peak {
+  font-size: 10px; padding: 0 5px; border-radius: 3px;
+  border: 1px solid var(--accent); color: var(--accent);
+}
+.conn-meta { color: var(--text-mid); }
+.conn-meta.dim, .conn-id.dim { color: var(--text-low); }
+.conn-id { margin-left: auto; }
+.conn-streams { border-top: 0.5px solid var(--border-soft); background: var(--bg); padding: 4px 0; }
+.conn-stream {
+  display: flex; align-items: center; gap: 10px;
+  padding: 3px 10px 3px 30px;
+  font-family: var(--font-mono); font-size: 11.5px;
+}
+.conn-stream:hover { background: var(--row-selected); }
+.conn-stream-id { color: var(--text-low); min-width: 28px; }
+.conn-stream-path { color: var(--text-mid); width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+/* Per-stream concurrency timeline: a shared-axis track with a positioned bar.
+   Overlapping bars across rows reveal h2/h3 multiplexing (Phase 9). */
+.conn-track {
+  position: relative; flex: 1; height: 9px;
+  background: var(--border-soft); border-radius: 2px; overflow: hidden;
+}
+.conn-bar {
+  position: absolute; top: 0; bottom: 0;
+  background: var(--accent); border-radius: 2px; min-width: 2px;
+}
+.conn-bar.err { background: var(--c-4xx); }
+
+/* gRPC message timeline (detail panel). */
+.grpc-timeline { display: flex; flex-direction: column; gap: 4px; }
+.grpc-msg { border: 1px solid var(--border-soft); border-radius: 4px; overflow: hidden; }
+.grpc-msg.sent { border-left: 2px solid var(--accent); }
+.grpc-msg.recv { border-left: 2px solid var(--c-2xx); }
+.grpc-msg-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 8px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 11px;
+}
+.grpc-msg-head:hover { background: var(--row-selected); }
+.grpc-dir { font-weight: 700; }
+.grpc-msg.sent .grpc-dir { color: var(--accent); }
+.grpc-msg.recv .grpc-dir { color: var(--c-2xx); }
+.grpc-idx { color: var(--text-low); }
+.grpc-label { color: var(--text-mid); text-transform: uppercase; letter-spacing: 0.04em; font-size: 9.5px; }
+.grpc-flag {
+  font-size: 9px; padding: 0 4px; border-radius: 3px;
+  border: 1px solid currentColor; color: var(--c-3xx);
+}
+.grpc-flag.ws-ctrl { color: var(--c-paused); }
+.grpc-len { margin-left: auto; color: var(--text-mid); font-variant-numeric: tabular-nums; }
+.grpc-twig { color: var(--text-low); width: 12px; text-align: center; }
+.grpc-fields {
+  margin: 0; padding: 8px 10px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg);
+  font-family: var(--font-mono); font-size: 11px;
+  white-space: pre-wrap; word-break: break-word;
+}
+
 /* ==== Detail panel ==== */
 .detail-panel {
   background: var(--bg);

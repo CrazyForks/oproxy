@@ -29,7 +29,7 @@ const ALLOWED_METHODS: &[&str] = &[
 ];
 const ALLOWED_STATUS_BUCKETS: &[&str] = &["2", "3", "4", "5", "-"];
 const ALLOWED_SORT_KEYS: &[&str] = &[
-    "idx", "method", "status", "host", "path", "type", "reqSize", "total", "ts",
+    "idx", "method", "status", "host", "path", "type", "reqSize", "total", "ts", "protocol",
 ];
 const WORKSPACE_ACTION_PREFIX: &str = "wa_";
 

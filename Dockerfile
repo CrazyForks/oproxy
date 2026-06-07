@@ -28,7 +28,7 @@ RUN mkdir -p src && \
 COPY src    ./src
 COPY tests  ./tests
 COPY --from=ui-builder /ui/dist ./src/design/dist
-RUN touch src/main.rs src/lib.rs && cargo build --release
+RUN touch src/main.rs src/lib.rs && cargo build --release --all-features
 
 # ── Runtime stage ──────────────────────────────────────────────────────────────
 FROM debian:trixie-slim

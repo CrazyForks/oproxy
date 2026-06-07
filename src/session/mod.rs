@@ -49,6 +49,10 @@ pub struct InspectionMetrics {
     /// TLS handshake time in milliseconds (None for plain HTTP connections).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ms: Option<u64>,
+    /// Negotiated upstream HTTP protocol (e.g. "HTTP/1.1", "HTTP/2", "HTTP/3").
+    /// None when not captured (e.g. CONNECT tunnels, synthetic error responses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -96,6 +100,13 @@ pub struct GrpcInfo {
     pub service: Option<String>,
     pub method: Option<String>,
     pub messages: Vec<GrpcMessage>,
+    /// gRPC status code string from `grpc-status` (best-effort; present when the
+    /// server sends it in response headers or the streaming path captures it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_status: Option<String>,
+    /// Human-readable status detail from `grpc-message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_status_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -130,6 +141,20 @@ pub struct Exchange {
     /// Timestamp when the request was paused at a breakpoint; None if not paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_at: Option<DateTime<Utc>>,
+    /// Identity of the downstream connection this exchange arrived on. All
+    /// exchanges multiplexed over one HTTP/2 or HTTP/3 connection share this id;
+    /// for HTTP/1.1 it is one connection per (reused) socket. (Phase 7)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    /// Monotonic stream index within `connection_id`. For HTTP/1.1 this counts
+    /// sequential requests on the socket; for h2/h3 it orders the multiplexed
+    /// streams. None when not captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<u64>,
+    /// Protocol negotiated on the downstream (client→proxy) side, e.g. "HTTP/2".
+    /// Distinct from `metrics.protocol`, which is the upstream (proxy→origin) leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downstream_protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -212,7 +237,7 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(max_sessions: usize) -> Self {
         Self::with_body_budget(max_sessions, usize::MAX)
     }
@@ -580,6 +605,11 @@ fn process_write_op(
                         id: id.clone(),
                         timestamp: Utc::now(),
                         updated_at: None,
+                        // Copy the downstream identity off the request's side-channel
+                        // fields onto the serialised Exchange before the move (Phase 7).
+                        connection_id: request.connection_id.clone(),
+                        stream_id: request.stream_id,
+                        downstream_protocol: request.downstream_protocol.clone(),
                         request: *request,
                         response: None,
                         metrics: None,
@@ -1294,6 +1324,7 @@ mod tests {
             dns_ms: Some(10),
             tcp_connect_ms: Some(15),
             tls_ms: Some(25),
+            protocol: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         let m2: InspectionMetrics = serde_json::from_str(&json).unwrap();
@@ -1331,6 +1362,7 @@ mod tests {
             dns_ms: Some(5),
             tcp_connect_ms: Some(10),
             tls_ms: Some(20),
+            protocol: None,
         };
         sm.record_response_with_metrics("id1".to_string(), res("/test", 200), metrics);
         sm.flush().await;
@@ -1365,6 +1397,9 @@ mod tests {
             tags: vec!["auth".to_string()],
             inspector_data: None,
             paused_at: None,
+            connection_id: None,
+            stream_id: None,
+            downstream_protocol: None,
         };
         assert!(terms[0].matches(&ex));
         let ex2 = Exchange { tags: vec![], ..ex };
@@ -1388,6 +1423,9 @@ mod tests {
             tags: vec![],
             inspector_data: None,
             paused_at: None,
+            connection_id: None,
+            stream_id: None,
+            downstream_protocol: None,
         };
         sm.import_sessions(vec![exchange]);
         sm.flush().await;

@@ -61,8 +61,8 @@ use policy::{
 };
 use sessions::{
     annotate_session, clear_sessions, diff_sessions, export_har, export_session, get_session,
-    get_session_timing, get_ws_frames, import_curl, import_har, import_sessions, list_sessions,
-    load_sessions, save_sessions, sessions_stream,
+    get_session_timing, get_ws_frames, import_curl, import_har, import_sessions, list_connections,
+    list_sessions, load_sessions, protocol_metrics, save_sessions, sessions_stream,
 };
 use settings::{
     get_ca_cert, get_config, get_socks5_status, get_upstream_proxy, reload_config,
@@ -90,6 +90,8 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/timing", get(get_session_timing))
         .route("/api/sessions/diff", get(diff_sessions))
         .route("/api/sessions/{id}/ws-frames", get(get_ws_frames))
+        .route("/api/connections", get(list_connections))
+        .route("/api/metrics/protocol", get(protocol_metrics))
         .route("/api/import/curl", axum::routing::post(import_curl))
         .route("/admin/sessions", get(list_sessions).delete(clear_sessions))
         .route("/admin/sessions/save", axum::routing::post(save_sessions))
