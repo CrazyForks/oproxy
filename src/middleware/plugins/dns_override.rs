@@ -14,6 +14,15 @@ impl Middleware for DnsOverrideMiddleware {
         "dns_override"
     }
 
+    fn body_hint(
+        &self,
+        _head: &crate::middleware::RequestContext,
+    ) -> crate::core::forward::BodyHint {
+        crate::core::forward::BodyHint::StreamingInspect {
+            granularity: crate::core::forward::Granularity::Bytes,
+        }
+    }
+
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         let ovr = self.overrides.read().await;
         if ovr.is_empty() {

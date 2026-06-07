@@ -22,11 +22,27 @@ const statusBucket = (s) => {
   if (s === 0) return '-';
   return String(s)[0];
 };
+// Compact label for the negotiated protocol, e.g. "HTTP/2" → "H2".
+const protoShort = (p) => {
+  if (!p) return '—';
+  if (p === 'HTTP/1.1' || p === 'HTTP/1.0') return '1.1';
+  if (p === 'HTTP/2') return 'H2';
+  if (p === 'HTTP/3') return 'H3';
+  return p.replace(/^HTTP\//, '');
+};
+// Stable bucket used for the badge colour/data attribute.
+const protoBucket = (p) => {
+  if (p === 'HTTP/2') return 'h2';
+  if (p === 'HTTP/3') return 'h3';
+  if (p === 'HTTP/1.1' || p === 'HTTP/1.0') return 'h1';
+  return 'other';
+};
 
 window.fmtBytes = fmtBytes;
 window.fmtMs = fmtMs;
 window.fmtTime = fmtTime;
 window.statusBucket = statusBucket;
+window.protoShort = protoShort;
 
 function MiniWaterfall({ timing, max }) {
   const t = timing;
@@ -57,6 +73,7 @@ const COLUMN_DEFS = [
   { key: 'host',      label: 'HOST',      sortKey: 'host',    defaultWidth: 180, align: 'left'   },
   { key: 'path',      label: 'PATH',      sortKey: 'path',    defaultWidth: null, align: 'left'  }, // flex — gets remaining space
   { key: 'type',      label: 'TYPE',      sortKey: 'type',    defaultWidth: 56,  align: 'left'   },
+  { key: 'proto',     label: 'PROTO',     sortKey: 'protocol', defaultWidth: 52, align: 'center', tooltip: 'Negotiated HTTP protocol' },
   { key: 'tls',       label: 'TLS',       sortKey: null,      defaultWidth: 40,  align: 'center', tooltip: 'Transport security' },
   { key: 'size',      label: 'SIZE',      sortKey: 'reqSize', defaultWidth: 68,  align: 'right'  },
   { key: 'time',      label: 'TIME',      sortKey: 'total',   defaultWidth: 72,  align: 'right'  },
@@ -218,6 +235,10 @@ function SessionsTable({ sessions, selectedId, onSelect, sort, onSort, bulkSel, 
                   {s.tags.includes('sse')     && <span className="tag-badge sse">SSE</span>}
                 </td>
                 <td className="cell-type">{s.type}</td>
+                <td>
+                  {(s.paused || s.pending) ? <span className="dim">—</span>
+                    : <span className="proto-badge" data-proto={protoBucket(s.proto)} title={s.proto}>{protoShort(s.proto)}</span>}
+                </td>
                 <td><span className={'tls-cell ' + tls}>{tls === 'ok' ? '🔒' : tls === 'tunnel' ? '⇿' : '○'}</span></td>
                 <td className="cell-num">{fmtBytes(s.resSize || s.reqSize)}</td>
                 <td className="cell-num">{(s.paused || s.pending) ? '—' : fmtMs(s.total)}</td>

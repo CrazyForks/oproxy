@@ -374,6 +374,9 @@ mod tests {
             tags: vec![],
             inspector_data: None,
             paused_at: None,
+            connection_id: None,
+            stream_id: None,
+            downstream_protocol: None,
         }
     }
 

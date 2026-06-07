@@ -227,6 +227,12 @@ pub struct RequestContext {
     /// Parsed inspector data (JWT / GraphQL / gRPC) populated by the inspector
     /// middlewares and consumed by InspectionMiddleware.
     pub inspector: crate::session::InspectorData,
+    /// Downstream connection identity, set by the transport accept loop and
+    /// recorded onto the `Exchange` by InspectionMiddleware (Phase 7). In-memory
+    /// only — never serialised into recordings or sent upstream.
+    pub connection_id: Option<String>,
+    pub stream_id: Option<u64>,
+    pub downstream_protocol: Option<String>,
 }
 
 impl RequestContext {
@@ -272,6 +278,16 @@ pub struct ResponseContext {
     /// HTTP method of the originating request. Populated by the engine; not serialised.
     #[serde(skip)]
     pub request_method: String,
+    /// Negotiated upstream HTTP protocol (e.g. "HTTP/2"). Populated by the engine
+    /// from the reqwest response version; carried to InspectionMiddleware which
+    /// records it into `InspectionMetrics.protocol`. In-memory only.
+    #[serde(skip)]
+    pub protocol: Option<String>,
+    /// Set by the engine on the streaming forward path so that the inspection
+    /// middleware defers response recording to the [`BodyObserver`] instead of
+    /// recording with an empty body in `on_response`. In-memory only.
+    #[serde(skip)]
+    pub response_body_observer_pending: bool,
 }
 
 impl ResponseContext {
@@ -386,8 +402,38 @@ impl From<ResponseContextWire> for ResponseContext {
 pub enum MiddlewareAction {
     Continue,      // Proceed to next middleware
     StopAndReturn, // Stop chain and return current response (e.g., Map Local)
-    #[allow(dead_code)]
+    // Intended for BreakpointMiddleware; not yet produced on the default binary
+    // path, so suppress the dead_code lint outside test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     Pause, // Halt execution (e.g., Breakpoint)
+}
+
+/// Per-stream observer created by a plugin to inspect a streamed exchange
+/// without buffering. Created by [`Middleware::stream_observer`] and driven by
+/// `forward_stream` in the engine in four stages:
+///
+/// 1. [`on_request_chunk`] — zero or more calls as request body bytes are
+///    forwarded upstream (before the upstream response arrives).
+/// 2. [`on_response_head`] — once, after the upstream response head arrives
+///    and the response middleware chain has run.
+/// 3. [`on_chunk`] — zero or more calls as response body bytes arrive.
+/// 4. [`finish`] — once after the last response chunk.
+///
+/// All methods except `finish` are synchronous and must not block. The observer
+/// owns its own state — it must NOT reference the plugin's `Arc<Self>`.
+#[async_trait]
+pub trait BodyObserver: Send + 'static {
+    /// Called for each request body chunk before it is forwarded upstream.
+    fn on_request_chunk(&mut self, _chunk: &Bytes) {}
+    /// Called once after the upstream response head is received and the
+    /// response middleware chain has run. Lets observers capture response
+    /// metadata (status, headers, protocol, timing) before body chunks arrive.
+    fn on_response_head(&mut self, _res: &ResponseContext, _start: std::time::Instant) {}
+    /// Called for each response body chunk as bytes arrive from the upstream.
+    fn on_chunk(&mut self, chunk: &Bytes);
+    /// Called once after the last chunk. The observer is responsible for any
+    /// deferred recording or side-effects (e.g. persisting metrics).
+    async fn finish(self: Box<Self>);
 }
 
 #[async_trait]
@@ -402,6 +448,32 @@ pub trait Middleware: Send + Sync {
     /// Process the response before it is sent back to the client.
     async fn on_response(&self, _ctx: &mut ResponseContext) -> MiddlewareAction {
         MiddlewareAction::Continue
+    }
+
+    /// Declares, from the request head alone, how this plugin needs to access the
+    /// body. Called **before any body byte is forwarded** so the engine can pick
+    /// the forwarding class (buffered vs streaming) up front — see
+    /// [`crate::core::forward::select_class`].
+    ///
+    /// The default is [`BodyHint::FullBody`], preserving today's behaviour: a
+    /// plugin is assumed to need the whole (buffered) body unless it opts into
+    /// streaming inspection. Mutating plugins (mock, rewrite, Lua, breakpoint)
+    /// must keep this default; inspectors that can work incrementally should
+    /// return [`BodyHint::StreamingInspect`].
+    fn body_hint(&self, _head: &RequestContext) -> crate::core::forward::BodyHint {
+        crate::core::forward::BodyHint::FullBody
+    }
+
+    /// Optionally return a per-stream observer for the streaming forward path.
+    /// Called after the **request** middleware chain has run (so `req` has the
+    /// final session ID and side-channel state), but *before* the upstream
+    /// request is sent. Returns `None` by default.
+    ///
+    /// The engine then drives the observer through four lifecycle stages — see
+    /// [`BodyObserver`]. The observer must own all state it needs; it must NOT
+    /// borrow from `&self`.
+    fn stream_observer(&self, _req: &RequestContext) -> Option<Box<dyn BodyObserver>> {
+        None
     }
 }
 

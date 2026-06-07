@@ -27,6 +27,15 @@ impl MiddlewareChain {
             .collect()
     }
 
+    /// Decides the forwarding class for an exchange from the body hints declared
+    /// by the active plugins (see [`Middleware::body_hint`]). Computed from the
+    /// request head only, before any body byte is forwarded, so the engine never
+    /// buffers a stream by accident. Any plugin needing the full body forces the
+    /// buffered class; see [`crate::core::forward::select_class`] for the rules.
+    pub fn forward_class(&self, head: &RequestContext) -> crate::core::forward::ForwardClass {
+        crate::core::forward::select_class(self.middlewares.iter().map(|m| m.body_hint(head)))
+    }
+
     #[instrument(skip(self, ctx))]
     pub async fn execute_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         for middleware in &self.middlewares {
@@ -52,6 +61,20 @@ impl MiddlewareChain {
             }
         }
         MiddlewareAction::Continue
+    }
+
+    /// Collect per-stream observers from all plugins for the streaming forward
+    /// path. Called after the request middleware chain has run so `req` has the
+    /// final session ID and side-channel state. The response head is delivered
+    /// to each observer separately via [`BodyObserver::on_response_head`].
+    pub fn stream_observers(
+        &self,
+        req: &crate::middleware::RequestContext,
+    ) -> Vec<Box<dyn crate::middleware::BodyObserver>> {
+        self.middlewares
+            .iter()
+            .filter_map(|m| m.stream_observer(req))
+            .collect()
     }
 }
 
@@ -224,6 +247,62 @@ mod tests {
         );
     }
 
+    /// A plugin that declares a streaming-inspect body hint.
+    struct StreamingInspector;
+
+    #[async_trait]
+    impl Middleware for StreamingInspector {
+        fn name(&self) -> &str {
+            "streaming-inspector"
+        }
+        fn body_hint(&self, _head: &RequestContext) -> crate::core::forward::BodyHint {
+            crate::core::forward::BodyHint::StreamingInspect {
+                granularity: crate::core::forward::Granularity::Bytes,
+            }
+        }
+    }
+
+    /// A plugin using the default body hint (FullBody).
+    struct FullBodyPlugin;
+
+    #[async_trait]
+    impl Middleware for FullBodyPlugin {
+        fn name(&self) -> &str {
+            "full-body"
+        }
+    }
+
+    #[test]
+    fn forward_class_defaults_to_buffered_for_empty_chain() {
+        let chain = MiddlewareChain::new();
+        assert_eq!(
+            chain.forward_class(&req()),
+            crate::core::forward::ForwardClass::Buffered
+        );
+    }
+
+    #[test]
+    fn forward_class_is_streaming_when_all_plugins_stream() {
+        let mut chain = MiddlewareChain::new();
+        chain.add_middleware(Arc::new(StreamingInspector));
+        assert_eq!(
+            chain.forward_class(&req()),
+            crate::core::forward::ForwardClass::Streaming
+        );
+    }
+
+    #[test]
+    fn forward_class_is_buffered_when_any_plugin_needs_full_body() {
+        let mut chain = MiddlewareChain::new();
+        chain.add_middleware(Arc::new(StreamingInspector));
+        chain.add_middleware(Arc::new(FullBodyPlugin));
+        assert_eq!(
+            chain.forward_class(&req()),
+            crate::core::forward::ForwardClass::Buffered,
+            "a single full-body plugin must force the buffered class"
+        );
+    }
+
     #[tokio::test]
     async fn pause_action_short_circuits_and_is_propagated() {
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -243,5 +322,37 @@ mod tests {
         let action = chain.execute_request(&mut req()).await;
         assert_eq!(action, MiddlewareAction::Pause);
         assert_eq!(*order.lock().unwrap(), vec!["A"]);
+    }
+
+    /// A chain composed only of non-body plugins must yield `Streaming`.
+    #[test]
+    fn forward_class_is_streaming_for_non_body_real_plugins() {
+        use crate::middleware::plugins::access_control::AccessControlMiddleware;
+        use crate::middleware::plugins::capture_filter::CaptureFilterMiddleware;
+        use crate::middleware::plugins::dns_override::DnsOverrideMiddleware;
+        use crate::middleware::plugins::jwt_inspector::JwtInspectorMiddleware;
+        use crate::middleware::plugins::map_remote::MapRemoteMiddleware;
+        use crate::middleware::plugins::routing::ThrottlingMiddleware;
+        use std::collections::HashMap;
+        use tokio::sync::RwLock;
+
+        let mut chain = MiddlewareChain::new();
+        chain.add_middleware(Arc::new(AccessControlMiddleware::new(vec![])));
+        chain.add_middleware(Arc::new(CaptureFilterMiddleware::new(Arc::new(
+            RwLock::new(Default::default()),
+        ))));
+        chain.add_middleware(Arc::new(DnsOverrideMiddleware {
+            overrides: Arc::new(RwLock::new(HashMap::new())),
+        }));
+        chain.add_middleware(Arc::new(JwtInspectorMiddleware));
+        chain.add_middleware(Arc::new(MapRemoteMiddleware::new(vec![])));
+        chain.add_middleware(Arc::new(ThrottlingMiddleware {
+            config: Arc::new(RwLock::new(Default::default())),
+        }));
+        assert_eq!(
+            chain.forward_class(&req()),
+            crate::core::forward::ForwardClass::Streaming,
+            "a chain of non-body plugins must yield Streaming"
+        );
     }
 }

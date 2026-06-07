@@ -53,6 +53,15 @@ impl Middleware for CaptureFilterMiddleware {
         "CaptureFilterMiddleware"
     }
 
+    fn body_hint(
+        &self,
+        _head: &crate::middleware::RequestContext,
+    ) -> crate::core::forward::BodyHint {
+        crate::core::forward::BodyHint::StreamingInspect {
+            granularity: crate::core::forward::Granularity::Bytes,
+        }
+    }
+
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         let cfg = self.config.read().await;
         if cfg.should_skip(&ctx.host) {

@@ -65,6 +65,7 @@ impl ProxySocks5Service {
             mitm_intercept(
                 stream,
                 resolved.host.clone(),
+                format!("{}:{}", resolved.host, resolved.port),
                 self.engine.clone(),
                 ca,
                 self.handshake_timeout,

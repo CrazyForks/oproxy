@@ -367,6 +367,7 @@ function InspectorTab({ s }) {
     );
   }
   if (i.kind === 'grpc') {
+    const messages = i.messages || [];
     return (
       <>
         <div className="section">
@@ -376,16 +377,100 @@ function InspectorTab({ s }) {
               <div className="k">Service</div><div className="v">{i.service}</div>
               <div className="k">Method</div><div className="v">{i.rpc}</div>
               <div className="k">Encoding</div><div className="v">application/grpc+proto</div>
+              <div className="k">Messages</div>
+              <div className="v">{i.reqCount} sent ↑ · {i.resCount} received ↓</div>
             </div>
           </div>
         </div>
-        <CodeBlock title="Request message" lang="protobuf" content={i.requestMessage} />
-        <div style={{ height: 12 }} />
-        <CodeBlock title="Response message" lang="protobuf" content={i.responseMessage} />
+        <div className="section">
+          <h4>Message timeline <span className="meta">{messages.length} frame{messages.length === 1 ? '' : 's'}</span></h4>
+          <div className="sec-body">
+            {messages.length === 0 && <span className="mute">(no decoded messages)</span>}
+            <GrpcMessageTimeline messages={messages} />
+          </div>
+        </div>
       </>
     );
   }
   return null;
+}
+
+/* Ordered, direction-aware gRPC message stream. Each frame is collapsible to its
+   decoded protobuf fields. Works for unary and all three streaming call types. */
+function GrpcMessageTimeline({ messages }) {
+  const [open, setOpen] = React.useState(() => new Set([0]));
+  const toggle = (idx) => setOpen(p => { const n = new Set(p); n.has(idx) ? n.delete(idx) : n.add(idx); return n; });
+  return (
+    <div className="grpc-timeline">
+      {messages.map((m, idx) => {
+        const sent = m.direction === 'request';
+        const isOpen = open.has(idx);
+        return (
+          <div key={idx} className={'grpc-msg ' + (sent ? 'sent' : 'recv')}>
+            <div className="grpc-msg-head" onClick={() => toggle(idx)}>
+              <span className="grpc-dir">{sent ? '↑' : '↓'}</span>
+              <span className="grpc-idx">#{idx + 1}</span>
+              <span className="grpc-label">{sent ? 'client' : 'server'}</span>
+              {m.compressed && <span className="grpc-flag">gzip</span>}
+              <span className="grpc-len">{window.fmtBytes ? window.fmtBytes(m.length) : (m.length + ' B')}</span>
+              <span className="grpc-twig">{isOpen ? '▾' : '▸'}</span>
+            </div>
+            {isOpen && (
+              <pre className="grpc-fields">
+                {JSON.stringify(m.fields || [], null, 2)}
+              </pre>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+const WS_OPCODES = { 0: 'cont', 1: 'text', 2: 'binary', 8: 'close', 9: 'ping', 10: 'pong' };
+
+/* WebSocket frame timeline — ordered, direction-aware, with opcode + payload. */
+function FramesTab({ s }) {
+  const frames = s.wsFrames || [];
+  const [open, setOpen] = React.useState(() => new Set());
+  const toggle = (idx) => setOpen(p => { const n = new Set(p); n.has(idx) ? n.delete(idx) : n.add(idx); return n; });
+  if (frames.length === 0) {
+    return <div className="section"><div className="sec-body"><span className="mute">(no frames captured)</span></div></div>;
+  }
+  const sent = frames.filter(f => f.direction === 'ClientToServer').length;
+  const recv = frames.length - sent;
+  return (
+    <div className="section">
+      <h4>WebSocket Frames <span className="meta">{frames.length} · {sent} ↑ / {recv} ↓</span></h4>
+      <div className="sec-body">
+        <div className="grpc-timeline">
+          {frames.map((f, idx) => {
+            const out = f.direction === 'ClientToServer';
+            const op = WS_OPCODES[f.opcode] ?? ('0x' + Number(f.opcode).toString(16));
+            const ctrl = f.opcode === 8 || f.opcode === 9 || f.opcode === 10;
+            const isOpen = open.has(idx);
+            const hasPayload = f.payload_text != null || f.payload_hex != null;
+            return (
+              <div key={idx} className={'grpc-msg ' + (out ? 'sent' : 'recv')}>
+                <div className="grpc-msg-head" onClick={() => hasPayload && toggle(idx)} style={{ cursor: hasPayload ? 'pointer' : 'default' }}>
+                  <span className="grpc-dir">{out ? '↑' : '↓'}</span>
+                  <span className="grpc-idx">#{idx + 1}</span>
+                  <span className={'grpc-flag' + (ctrl ? ' ws-ctrl' : '')}>{op}</span>
+                  <span className="grpc-len">{window.fmtBytes ? window.fmtBytes(f.payload_len) : (f.payload_len + ' B')}</span>
+                  <span className="grpc-twig">{hasPayload ? (isOpen ? '▾' : '▸') : ''}</span>
+                </div>
+                {isOpen && hasPayload && (
+                  <pre className="grpc-fields">
+                    {f.payload_text != null ? f.payload_text : f.payload_hex}
+                  </pre>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function CookiesTab({ s, raw }) {
@@ -494,6 +579,7 @@ function DetailPanel({ session: s, onClose, onResume, onAbort, onCopyCurl, onCop
     setRawView(nextRaw);
   };
 
+  const wsFrames = s.wsFrames || [];
   const tabs = [
     { key: 'overview',  label: 'Overview' },
     { key: 'headers',   label: 'Headers',   count: Object.keys(s.reqHeaders || {}).length + Object.keys(s.resHeaders || {}).length },
@@ -503,6 +589,10 @@ function DetailPanel({ session: s, onClose, onResume, onAbort, onCopyCurl, onCop
     { key: 'inspector', label: 'Inspector', count: s.inspector ? 1 : null },
     { key: 'cookies',   label: 'Cookies' },
   ];
+  // WebSocket sessions get a dedicated live frame timeline, placed up front.
+  if (wsFrames.length > 0) {
+    tabs.splice(1, 0, { key: 'frames', label: 'Frames', count: wsFrames.length });
+  }
 
   return (
     <div className="detail-panel">
@@ -573,6 +663,7 @@ function DetailPanel({ session: s, onClose, onResume, onAbort, onCopyCurl, onCop
         {tab === 'response'  && <ResponseTab s={s} raw={rawView} />}
         {tab === 'timing'    && <TimingTab s={s} />}
         {tab === 'inspector' && <InspectorTab s={s} />}
+        {tab === 'frames'    && <FramesTab s={s} />}
         {tab === 'cookies'   && <CookiesTab s={s} raw={rawView} />}
       </div>
     </div>

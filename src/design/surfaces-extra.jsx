@@ -680,10 +680,157 @@ function ShortcutsModal({ onClose }) {
   );
 }
 
+// ─── Connections (HTTP/2·3 multiplexing view) ──────────────────────────
+const protoBucketC = (p) => p === 'HTTP/2' ? 'h2' : p === 'HTTP/3' ? 'h3' : (p === 'HTTP/1.1' || p === 'HTTP/1.0') ? 'h1' : 'other';
+const protoShortC = (p) => !p ? '—' : p === 'HTTP/2' ? 'H2' : p === 'HTTP/3' ? 'H3' : (p === 'HTTP/1.1' || p === 'HTTP/1.0') ? '1.1' : p.replace(/^HTTP\//, '');
+const fmtClock = (iso) => { try { return new Date(iso).toTimeString().slice(0, 8); } catch { return '—'; } };
+
+function ConnectionsSurface() {
+  const [connections, setConnections] = React.useState([]);
+  const [open, setOpen] = React.useState(() => new Set());
+  const [loaded, setLoaded] = React.useState(false);
+  const load = React.useCallback(async () => {
+    const data = await fetchJson('/api/connections', {});
+    setConnections((data && data.connections) || []);
+    setLoaded(true);
+  }, []);
+  React.useEffect(() => {
+    load();
+    const t = setInterval(load, 4000); // live-ish refresh
+    return () => clearInterval(t);
+  }, [load]);
+  const toggle = (id) => setOpen(p => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  return (
+    <SurfaceShell title="Connections"
+                  sub="downstream connections grouped by identity · HTTP/2 and HTTP/3 streams multiplexed on one connection"
+                  actions={<button className="btn" onClick={load}>↻ Refresh</button>}>
+      {loaded && connections.length === 0 && (
+        <div className="empty">No connections recorded yet. Proxy some traffic to populate this view.</div>
+      )}
+      <div className="conn-list">
+        {connections.map(c => {
+          const isOpen = open.has(c.connection_id);
+          const multiplexed = c.stream_count > 1 && (c.downstream_protocol === 'HTTP/2' || c.downstream_protocol === 'HTTP/3');
+          return (
+            <div key={c.connection_id} className="conn-card">
+              <div className="conn-head" onClick={() => toggle(c.connection_id)}>
+                <span className="conn-twig">{isOpen ? '▾' : '▸'}</span>
+                <span className="proto-badge" data-proto={protoBucketC(c.downstream_protocol)} title={c.downstream_protocol || 'unknown'}>
+                  {protoShortC(c.downstream_protocol)}
+                </span>
+                <span className="conn-host" title={c.hosts.join(', ')}>{c.hosts[0] || '(unknown host)'}{c.hosts.length > 1 && <span className="dim"> +{c.hosts.length - 1}</span>}</span>
+                {multiplexed && <span className="conn-mux" title="Multiplexed streams">⇄ {c.stream_count} streams</span>}
+                {c.max_concurrency > 1 && <span className="conn-peak" title="Peak streams in flight at once">peak {c.max_concurrency}</span>}
+                <span className="conn-meta">{c.exchange_count} exchange{c.exchange_count === 1 ? '' : 's'}</span>
+                <span className="conn-meta dim">{fmtClock(c.first_seen)}–{fmtClock(c.last_seen)}</span>
+                <span className="conn-id dim" title={c.connection_id}>{c.connection_id.slice(0, 8)}</span>
+              </div>
+              {isOpen && (
+                <div className="conn-streams">
+                  {c.streams.map(s => {
+                    const span = Math.max(1, c.span_ms || 1);
+                    const left = Math.max(0, Math.min(100, (s.start_offset_ms / span) * 100));
+                    const width = Math.max(1.5, Math.min(100 - left, ((s.duration_ms || 0) / span) * 100));
+                    return (
+                      <div key={s.id} className="conn-stream">
+                        <span className="conn-stream-id">#{s.stream_id ?? '–'}</span>
+                        <span className="cell-method" data-m={s.method}>{s.method}</span>
+                        <span className="conn-stream-path" title={s.host + s.path}>{s.path}</span>
+                        <span className="conn-track" title={`+${s.start_offset_ms} ms · ${s.duration_ms} ms`}>
+                          <span className={'conn-bar' + (s.status >= 400 ? ' err' : '')} style={{ left: left + '%', width: width + '%' }} />
+                        </span>
+                        <span className="cell-status" data-c={s.status ? String(s.status)[0] : '-'}>{s.status || '···'}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </SurfaceShell>
+  );
+}
+
+// ─── Protocol dashboard (live aggregates) ──────────────────────────────
+const fmtBytesD = (n) => {
+  if (n == null) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
+};
+function StatCard({ label, value, sub }) {
+  return (
+    <div className="stat-card">
+      <div className="stat-label">{label}</div>
+      <div className="stat-value">{value}</div>
+      {sub && <div className="stat-sub">{sub}</div>}
+    </div>
+  );
+}
+function DistBars({ title, rows, tone }) {
+  const total = rows.reduce((a, r) => a + r.count, 0);
+  return (
+    <div className="dist">
+      <div className="dist-title">{title}</div>
+      {rows.length === 0 && <div className="mute" style={{ fontSize: 12 }}>(none)</div>}
+      {rows.map(r => (
+        <div key={r.label} className="dist-row">
+          <span className="dist-key" title={r.label}>{r.label}</span>
+          <span className="dist-track"><span className={'dist-bar ' + (tone ? tone(r.label) : '')} style={{ width: (total ? (r.count / total) * 100 : 0) + '%' }} /></span>
+          <span className="dist-count">{r.count}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+function ProtocolDashboard() {
+  const [m, setM] = React.useState(null);
+  const load = React.useCallback(async () => {
+    setM(await fetchJson('/api/metrics/protocol', {}));
+  }, []);
+  React.useEffect(() => {
+    load();
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
+  }, [load]);
+  const statusTone = (k) => k === '2xx' ? 'ok' : k === '3xx' ? 'redir' : (k === '4xx' || k === '5xx') ? 'err' : '';
+  const protoTone = (k) => k === 'HTTP/2' ? 'h2' : k === 'HTTP/3' ? 'h3' : 'h1';
+  return (
+    <SurfaceShell title="Protocol Dashboard"
+                  sub="live aggregates across recorded sessions · refreshes every 3s"
+                  actions={<button className="btn" onClick={load}>↻ Refresh</button>}>
+      {!m ? <div className="empty">Loading metrics…</div> : (
+        <div className="dash">
+          <div className="stat-grid">
+            <StatCard label="Exchanges" value={m.total_exchanges} />
+            <StatCard label="Connections" value={m.connections} />
+            <StatCard label="WebSockets" value={m.websockets} />
+            <StatCard label="gRPC calls" value={m.grpc_calls} />
+            <StatCard label="Latency p50 / p95" value={`${m.latency_p50_ms} / ${m.latency_p95_ms} ms`} sub={`max ${m.latency_max_ms} ms`} />
+            <StatCard label="Traffic" value={fmtBytesD(m.total_bytes)} />
+          </div>
+          <div className="dash-cols">
+            <DistBars title="Upstream protocol" rows={m.protocol_mix} tone={protoTone} />
+            <DistBars title="Downstream protocol" rows={m.downstream_mix} tone={protoTone} />
+            <DistBars title="Status classes" rows={m.status_classes} tone={statusTone} />
+            {m.grpc_status.length > 0 && <DistBars title="gRPC status" rows={m.grpc_status} />}
+          </div>
+        </div>
+      )}
+    </SurfaceShell>
+  );
+}
+
 window.MockSurface = MockSurface;
 window.LuaSurface = LuaSurface;
 window.WebhooksSurface = WebhooksSurface;
 window.DnsSurface = DnsSurface;
 window.CaptureFilterSurface = CaptureFilterSurface;
 window.SettingsSurface = SettingsSurface;
+window.ConnectionsSurface = ConnectionsSurface;
+window.ProtocolDashboard = ProtocolDashboard;
 window.ShortcutsModal = ShortcutsModal;

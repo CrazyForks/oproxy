@@ -11,5 +11,6 @@ pub mod security;
 pub mod session;
 pub mod setup;
 pub mod storage;
+pub mod telemetry;
 pub mod transport;
 pub mod webhooks;

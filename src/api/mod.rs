@@ -299,6 +299,7 @@ fn sort_sessions(sessions: &mut [Exchange], sort: &SessionSort) {
         "type" => sessions.sort_by_key(session_kind),
         "reqSize" => sessions.sort_by_key(request_size),
         "total" => sessions.sort_by_key(session_latency),
+        "protocol" => sessions.sort_by_key(session_protocol),
         _ => sessions.sort_by_key(|session| session.timestamp),
     }
 
@@ -392,6 +393,16 @@ fn session_latency(session: &Exchange) -> u64 {
         .as_ref()
         .map(|metrics| metrics.latency_ms)
         .unwrap_or(0)
+}
+
+/// Sort key for the negotiated protocol column (e.g. "HTTP/1.1" < "HTTP/2").
+/// Sessions with no captured protocol sort together at the end of an ascending sort.
+fn session_protocol(session: &Exchange) -> String {
+    session
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.protocol.clone())
+        .unwrap_or_default()
 }
 
 fn session_filter_haystack(session: &Exchange) -> String {
@@ -727,6 +738,48 @@ mod tests {
 
         assert_eq!(r.sessions[0].id, "fast");
         assert_eq!(r.sessions[1].id, "slow");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_sorts_by_protocol() {
+        let h = make_handler();
+        for (id, proto) in [("h2sess", "HTTP/2"), ("h1sess", "HTTP/1.1")] {
+            h.session_manager
+                .record_request(id.to_string(), req_with("GET", "x.test.com", "/x"));
+            h.session_manager.record_response_with_metrics(
+                id.to_string(),
+                ResponseContext {
+                    status: 200,
+                    headers: crate::middleware::HeaderMap::new(),
+                    body: bytes::Bytes::new(),
+                    request_uri: "/x".to_string(),
+                    ..Default::default()
+                },
+                crate::session::InspectionMetrics {
+                    protocol: Some(proto.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        h.session_manager.flush().await;
+
+        let r = h
+            .list_sessions(SessionListOptions {
+                include_bodies: true,
+                filter: SessionListFilter {
+                    sort: SessionSort {
+                        key: "protocol".to_string(),
+                        dir: SessionSortDirection::Asc,
+                    },
+                    ..SessionListFilter::default()
+                },
+                ..SessionListOptions::default()
+            })
+            .await;
+
+        // Ascending string order: "HTTP/1.1" < "HTTP/2".
+        assert_eq!(r.sessions[0].id, "h1sess");
+        assert_eq!(r.sessions[1].id, "h2sess");
     }
 
     #[tokio::test]

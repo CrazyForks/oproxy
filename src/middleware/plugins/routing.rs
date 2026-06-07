@@ -21,6 +21,15 @@ impl Middleware for ThrottlingMiddleware {
         "ThrottlingMiddleware"
     }
 
+    fn body_hint(
+        &self,
+        _head: &crate::middleware::RequestContext,
+    ) -> crate::core::forward::BodyHint {
+        crate::core::forward::BodyHint::StreamingInspect {
+            granularity: crate::core::forward::Granularity::Bytes,
+        }
+    }
+
     async fn on_request(&self, _ctx: &mut RequestContext) -> MiddlewareAction {
         let config = self.config.read().await;
         if config.enabled && config.latency_ms > 0 {

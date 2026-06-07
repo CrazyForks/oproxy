@@ -63,3 +63,4 @@ ROADMAP.md
 src/design/certs/root.crt
 src/design/certs/root.key
 .gstack/
+tests/__generated_grpc__/

@@ -19,6 +19,8 @@ struct BoundListeners {
     http: tokio::net::TcpListener,
     https: Option<(tokio::net::TcpListener, tokio_rustls::TlsAcceptor)>,
     socks5: Option<tokio::net::TcpListener>,
+    #[cfg(feature = "http3")]
+    http3: Option<h3_quinn::quinn::Endpoint>,
 }
 
 pub(crate) async fn run() -> Result<(), StartupError> {
@@ -65,6 +67,8 @@ async fn bind_listeners(
         http: super::listeners::bind_http_listener(config).await?,
         https: super::listeners::bind_https_listener(config, ca).await?,
         socks5: super::listeners::bind_socks5_listener(config).await?,
+        #[cfg(feature = "http3")]
+        http3: super::listeners::bind_http3_listener(config, ca).await,
     })
 }
 
@@ -117,7 +121,7 @@ fn spawn_runtime_listeners(
     supervisor: &mut super::supervisor::RuntimeSupervisor,
 ) {
     let http_service = build_http_service(state.clone(), config, timeouts, supervisor);
-    let socks5_service = build_socks5_service(state, timeouts);
+    let socks5_service = build_socks5_service(state.clone(), timeouts);
 
     super::listeners::spawn_http_listener(
         listeners.http,
@@ -137,6 +141,14 @@ fn spawn_runtime_listeners(
     super::listeners::spawn_socks5_listener(
         listeners.socks5,
         socks5_service,
+        shutdown_rx.clone(),
+        supervisor,
+    );
+
+    #[cfg(feature = "http3")]
+    super::listeners::spawn_http3_listener(
+        listeners.http3,
+        state.proxy_engine.clone(),
         shutdown_rx,
         supervisor,
     );

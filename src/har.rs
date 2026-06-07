@@ -261,7 +261,12 @@ pub fn exchange_to_har_entry(ex: &Exchange) -> HarEntry {
         let resp = HarResponse {
             status: res.status,
             status_text,
-            http_version: "HTTP/1.1".to_string(),
+            // Emit the captured negotiated protocol when known, else default.
+            http_version: ex
+                .metrics
+                .as_ref()
+                .and_then(|m| m.protocol.clone())
+                .unwrap_or_else(|| "HTTP/1.1".to_string()),
             cookies: extract_response_cookies(res),
             headers: har_res_headers,
             content: HarContent {
@@ -417,6 +422,14 @@ pub fn har_entry_to_exchange(entry: &HarEntry) -> Exchange {
             dns_ms: entry.timings.dns.map(|v| v as u64),
             tcp_connect_ms: entry.timings.connect.map(|v| v as u64),
             tls_ms: entry.timings.ssl.map(|v| v as u64),
+            protocol: {
+                let v = entry.response.http_version.trim();
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            },
         })
     } else {
         None
@@ -442,6 +455,9 @@ pub fn har_entry_to_exchange(entry: &HarEntry) -> Exchange {
         tags: entry.oproxy_tags.clone(),
         inspector_data: None,
         paused_at: None,
+        connection_id: None,
+        stream_id: None,
+        downstream_protocol: None,
     }
 }
 
@@ -681,6 +697,9 @@ mod tests {
             tags: vec![],
             inspector_data: None,
             paused_at: None,
+            connection_id: None,
+            stream_id: None,
+            downstream_protocol: None,
         }
     }
 
@@ -830,6 +849,31 @@ mod tests {
         let ex = make_exchange("GET", "https://example.com/", 200, "ok", "");
         let entry = exchange_to_har_entry(&ex);
         assert_eq!(entry.oproxy_id.as_deref(), Some("test-id"));
+    }
+
+    #[test]
+    fn har_entry_uses_captured_protocol_for_http_version() {
+        // Phase 0: the negotiated upstream protocol is surfaced on export.
+        let mut ex = make_exchange("GET", "https://example.com/", 200, "ok", "");
+        if let Some(m) = &mut ex.metrics {
+            m.protocol = Some("HTTP/2".to_string());
+        }
+        let entry = exchange_to_har_entry(&ex);
+        assert_eq!(entry.response.http_version, "HTTP/2");
+    }
+
+    #[test]
+    fn har_import_roundtrips_http_version_into_protocol_metric() {
+        let mut ex = make_exchange("GET", "https://example.com/", 200, "ok", "");
+        if let Some(m) = &mut ex.metrics {
+            m.protocol = Some("HTTP/3".to_string());
+        }
+        let entry = exchange_to_har_entry(&ex);
+        let restored = har_entry_to_exchange(&entry);
+        assert_eq!(
+            restored.metrics.and_then(|m| m.protocol).as_deref(),
+            Some("HTTP/3")
+        );
     }
 
     #[test]

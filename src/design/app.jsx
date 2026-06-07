@@ -4,7 +4,7 @@ const {
   Icon, SessionsTable, DetailPanel, RulesSurface, BreakpointsSurface,
   InspectorsSurface, CertSurface, ComposeSurface, MockSurface, LuaSurface,
   WebhooksSurface, DnsSurface, CaptureFilterSurface, SettingsSurface,
-  AssistantSurface, ShortcutsModal, confirmAction,
+  ConnectionsSurface, ProtocolDashboard, AssistantSurface, ShortcutsModal, confirmAction,
 } = window;
 /* Main app shell — top bar, left rail, master/detail split, status bar, tweaks */
 
@@ -26,7 +26,15 @@ const ACCENT_OPTIONS = [
 const METHODS = ['GET','POST','PUT','PATCH','DELETE','CONNECT','OPTIONS','HEAD'];
 const STATUS_BUCKETS = ['2','3','4','5','-'];
 const WORKSPACE_SURFACES = new Set(['sessions','compose','rules','breakpoints','mock','lua','inspector','dns','capture','webhooks','ca','settings']);
-const SESSION_SORT_KEYS = new Set(['idx','method','status','host','path','type','reqSize','total','ts']);
+const SESSION_SORT_KEYS = new Set(['idx','method','status','host','path','type','reqSize','total','ts','protocol']);
+const PROTO_BUCKETS = ['h1','h2','h3'];
+// Maps a session's protocol string to a filter bucket.
+const protoBucketOf = (p) => {
+  if (p === 'HTTP/2') return 'h2';
+  if (p === 'HTTP/3') return 'h3';
+  if (p === 'HTTP/1.1' || p === 'HTTP/1.0') return 'h1';
+  return 'other';
+};
 
 const SESSION_LIST_LIMIT = 10000;
 const SESSION_RENDER_PAGE_SIZE = 250;
@@ -120,12 +128,17 @@ function normalizeInspectorData(data) {
     };
   }
   if (data.grpc) {
+    const messages = data.grpc.messages || [];
     return {
       kind: 'grpc',
       service: data.grpc.service || '(unknown service)',
       rpc: data.grpc.method || '(unknown method)',
-      requestMessage: JSON.stringify((data.grpc.messages || []).filter(m => m.direction === 'request'), null, 2),
-      responseMessage: JSON.stringify((data.grpc.messages || []).filter(m => m.direction === 'response'), null, 2),
+      // Full ordered, direction-aware message stream for the timeline view.
+      messages,
+      reqCount: messages.filter(m => m.direction === 'request').length,
+      resCount: messages.filter(m => m.direction === 'response').length,
+      requestMessage: JSON.stringify(messages.filter(m => m.direction === 'request'), null, 2),
+      responseMessage: JSON.stringify(messages.filter(m => m.direction === 'response'), null, 2),
     };
   }
   return null;
@@ -174,7 +187,11 @@ function adaptExchange(exchange, idx) {
     paused: !!exchange.paused_at,
     pending: !res && !exchange.paused_at && (req.method || 'GET').toUpperCase() !== 'WS',
     note: exchange.note || '',
-    proto: req.version || 'HTTP/1.1',
+    // Captured WebSocket frames (empty for non-WS exchanges).
+    wsFrames: exchange.ws_frames || [],
+    // Prefer the negotiated upstream protocol captured in metrics (Phase 0);
+    // fall back to the request version, then HTTP/1.1.
+    proto: metrics.protocol || req.version || 'HTTP/1.1',
     remote: req.remote_addr || '',
     cipher: parts.scheme === 'https' ? 'TLS' : '',
     reqHeadersRaw,
@@ -483,6 +500,8 @@ function App() {
   const [search, setSearch] = React.useState('');
   const [methodFilter, setMethodFilter] = React.useState(new Set(METHODS));
   const [statusFilter, setStatusFilter] = React.useState(new Set(['2','3','4','5','-']));
+  // Protocol facet — client-side refinement over fetched rows (all on = no filter).
+  const [protoFilter, setProtoFilter] = React.useState(new Set(PROTO_BUCKETS));
   const [hostFilter, setHostFilter] = React.useState(null);
   const [hostFocus, setHostFocus] = React.useState([]); // pinned hosts shown as chips
   const [liveRefresh, setLiveRefresh] = React.useState(true);
@@ -810,6 +829,14 @@ function App() {
       return next;
     });
   };
+  const toggleProto = (p) => {
+    setProtoFilter(prev => {
+      const next = new Set(prev);
+      next.has(p) ? next.delete(p) : next.add(p);
+      // Never allow an empty selection (that would hide everything); reset to all.
+      return next.size === 0 ? new Set(PROTO_BUCKETS) : next;
+    });
+  };
   const DEFAULT_SORT = { key: 'ts', dir: 'desc' };
   const onSort = (key) => setSort(prev => {
     if (prev.key !== key) return { key, dir: 'asc' };
@@ -827,14 +854,16 @@ function App() {
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   }, [sessions]);
 
-  // Backend owns filtering and sorting. React renders the current workspace result.
+  // Backend owns search/method/status filtering and sorting; the protocol facet
+  // is a lightweight client-side refinement over the rows already fetched.
   const filtered = React.useMemo(() => {
-    return sessions;
-  }, [sessions]);
+    if (protoFilter.size >= PROTO_BUCKETS.length) return sessions;
+    return sessions.filter(s => protoFilter.has(protoBucketOf(s.proto)));
+  }, [sessions, protoFilter]);
 
   React.useEffect(() => {
     setRenderLimit(SESSION_RENDER_PAGE_SIZE);
-  }, [search, methodFilter, statusFilter, hostFilter, hostFocus, sort, regexMode, viewMode]);
+  }, [search, methodFilter, statusFilter, protoFilter, hostFilter, hostFocus, sort, regexMode, viewMode]);
 
   const renderedSessions = React.useMemo(
     () => filtered.slice(0, renderLimit),
@@ -848,7 +877,8 @@ function App() {
     !!hostFilter ||
     (Array.isArray(hostFocus) ? hostFocus.length > 0 : !!hostFocus) ||
     methodFilter.size < METHODS.length ||
-    statusFilter.size < STATUS_BUCKETS.length;
+    statusFilter.size < STATUS_BUCKETS.length ||
+    protoFilter.size < PROTO_BUCKETS.length;
   const emptyState = sessionsError
     ? {
         title: 'Session API unavailable.',
@@ -1092,6 +1122,7 @@ function App() {
                 <FilterBar
                   methodFilter={methodFilter} toggleMethod={toggleMethod}
                   statusFilter={statusFilter} toggleStatus={toggleStatus}
+                  protoFilter={protoFilter} toggleProto={toggleProto}
                   hostFilter={hostFilter} setHostFilter={setHostFilter}
                   hostFocus={hostFocus} setHostFocus={setHostFocus}
                   hostCounts={hostCounts}
@@ -1172,6 +1203,8 @@ function App() {
               />
             </>
           )}
+          {activeRail === 'dashboard' && <ProtocolDashboard />}
+          {activeRail === 'connections' && <ConnectionsSurface />}
           {activeRail === 'rules' && <RulesSurface />}
           {activeRail === 'breakpoints' && (
             <BreakpointsSurface
@@ -1372,6 +1405,8 @@ function TopBar({ liveRefresh, setLiveRefresh, search, setSearch, regexMode, set
 function LeftRail({ active, onChange }) {
   const items = [
     { key: 'sessions',    icon: 'list',       label: 'Sessions' },
+    { key: 'dashboard',   icon: 'record',     label: 'Dashboard' },
+    { key: 'connections', icon: 'layout',     label: 'Connections' },
     { key: 'compose',     icon: 'open',       label: 'Compose' },
     { key: 'rules',       icon: 'rules',      label: 'Rules' },
     { key: 'breakpoints', icon: 'pauseRail',  label: 'Breakpoints' },
@@ -1408,7 +1443,7 @@ function LeftRail({ active, onChange }) {
 }
 
 /* ===== Filter bar ===== */
-function FilterBar({ methodFilter, toggleMethod, statusFilter, toggleStatus, hostFilter, setHostFilter, hostFocus, setHostFocus, hostCounts, counts, total, viewMode, setViewMode, sort, onResetSort }) {
+function FilterBar({ methodFilter, toggleMethod, statusFilter, toggleStatus, protoFilter, toggleProto, hostFilter, setHostFilter, hostFocus, setHostFocus, hostCounts, counts, total, viewMode, setViewMode, sort, onResetSort }) {
   const [hostMenuOpen, setHostMenuOpen] = React.useState(false);
   const [hostMenuPos, setHostMenuPos] = React.useState({ top: 0, left: 0 });
   const hostButtonRef = React.useRef(null);
@@ -1460,6 +1495,12 @@ function FilterBar({ methodFilter, toggleMethod, statusFilter, toggleStatus, hos
         <button className={'chip' + (statusFilter.has('4') ? ' on' : '')} data-tone="4xx" onClick={() => toggleStatus('4')} aria-pressed={statusFilter.has('4')}>4xx</button>
         <button className={'chip' + (statusFilter.has('5') ? ' on' : '')} data-tone="5xx" onClick={() => toggleStatus('5')} aria-pressed={statusFilter.has('5')}>5xx</button>
         <button className={'chip' + (statusFilter.has('-') ? ' on' : '')} onClick={() => toggleStatus('-')} aria-pressed={statusFilter.has('-')}>pending</button>
+      </div>
+      <span className="filter-label" style={{ marginLeft: 8 }}>Proto</span>
+      <div className="chip-group">
+        <button className={'chip' + (protoFilter.has('h1') ? ' on' : '')} onClick={() => toggleProto('h1')} aria-pressed={protoFilter.has('h1')} title="HTTP/1.x">1.1</button>
+        <button className={'chip' + (protoFilter.has('h2') ? ' on' : '')} onClick={() => toggleProto('h2')} aria-pressed={protoFilter.has('h2')} title="HTTP/2">H2</button>
+        <button className={'chip' + (protoFilter.has('h3') ? ' on' : '')} onClick={() => toggleProto('h3')} aria-pressed={protoFilter.has('h3')} title="HTTP/3">H3</button>
       </div>
 
       <div className="host-filter" style={{ marginLeft: 8 }}>

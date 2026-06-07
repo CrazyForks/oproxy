@@ -14,10 +14,19 @@ path = "src/main.rs"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# HTTP/3 (QUIC) support. Phase 5 of the protocol-support RFC.
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:webpki-roots"]
+# OpenTelemetry export of per-exchange protocol spans (Phase 11). Gates the
+# per-exchange emission; the OTLP exporter layer (opentelemetry-otlp /
+# tracing-opentelemetry) is attached at the logging layer when enabled.
+otel = []
+
 [dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
 axum = "0.8.9"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "http2"] }
 rcgen = "0.14"
 rustls = "0.23"
 tokio-rustls = "0.26"
@@ -47,7 +56,13 @@ base64 = "0.22"
 similar = "3"
 graphql-parser = "0.4"
 prost = "0.14"
+http-body-util = "0.1"
 mlua = { version = "0.11", features = ["lua54", "vendored", "async", "send"] }
 hmac = "0.13"
 sha2 = "0.11"
 time = "0.3.47"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+quinn        = { version = "0.11", optional = true }
+h3           = { version = "0.0.8", optional = true }
+h3-quinn     = { version = "0.0.10", optional = true }
+webpki-roots = { version = "0.26", optional = true }

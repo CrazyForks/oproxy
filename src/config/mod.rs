@@ -164,6 +164,24 @@ pub struct Config {
     /// Port to listen for SOCKS5 connections. Disabled when None (default).
     #[serde(default)]
     pub socks5_port: Option<u16>,
+    /// Enable the HTTP/3 (QUIC) listener. Requires the `http3` build feature and
+    /// `http3_port` to be set. Disabled by default (research preview). See the
+    /// protocol-support RFC §12.1 — h3 binds its own UDP port, never shared.
+    #[serde(default)]
+    pub http3_enabled: bool,
+    /// UDP port for the HTTP/3 (QUIC) listener. Kept distinct from the TCP `port`
+    /// so the QUIC listener lifecycle is independent and Alt-Svc can advertise it
+    /// explicitly (`alt-svc: h3=":<http3_port>"`). Disabled when None.
+    #[serde(default)]
+    pub http3_port: Option<u16>,
+    /// Export per-exchange protocol spans over OpenTelemetry (Phase 11). Requires
+    /// the `otel` build feature and `otel_endpoint`. Disabled by default.
+    #[serde(default)]
+    pub otel_enabled: bool,
+    /// OTLP collector endpoint (e.g. "http://localhost:4317"). The exporter layer
+    /// is attached at startup when `otel_enabled` and the `otel` feature are on.
+    #[serde(default)]
+    pub otel_endpoint: Option<String>,
     /// Base directory for map_local fixture files. When set, MapLocalRule.file_path
     /// is resolved relative to this directory. When unset, paths are absolute.
     /// In containerized deployments, set via OPROXY_MAP_LOCAL_BASE_PATH env var.
@@ -208,6 +226,10 @@ impl Default for Config {
             allow_private_admin_egress: default_allow_private_admin_egress(),
             upstream_proxy: None,
             socks5_port: None,
+            http3_enabled: false,
+            http3_port: None,
+            otel_enabled: false,
+            otel_endpoint: None,
             map_local_base_path: default_map_local_base_path(),
         }
     }
@@ -279,6 +301,44 @@ impl Config {
                 "storage_path '{}' appears to be read-only",
                 self.storage_path.display()
             ));
+        }
+
+        // HTTP/3 requires a dedicated UDP port (RFC §12.1).
+        if self.http3_enabled && self.http3_port.is_none() {
+            warnings.push(
+                "http3_enabled is true but http3_port is not set - the HTTP/3 listener will not start"
+                    .to_string(),
+            );
+        }
+        if let Some(h3) = self.http3_port {
+            if h3 == self.port {
+                warnings.push(
+                    "http3_port equals the TCP port - HTTP/3 uses UDP so this is allowed, but a distinct port is recommended"
+                        .to_string(),
+                );
+            }
+            if !cfg!(feature = "http3") {
+                warnings.push(
+                    "http3_port is set but the binary was built without the `http3` feature - HTTP/3 is unavailable"
+                        .to_string(),
+                );
+            }
+        }
+
+        // OpenTelemetry export (Phase 11).
+        if self.otel_enabled {
+            if self.otel_endpoint.is_none() {
+                warnings.push(
+                    "otel_enabled is true but otel_endpoint is not set - no spans will be exported"
+                        .to_string(),
+                );
+            }
+            if !cfg!(feature = "otel") {
+                warnings.push(
+                    "otel_enabled is true but the binary was built without the `otel` feature - OpenTelemetry export is unavailable"
+                        .to_string(),
+                );
+            }
         }
 
         // Check CA path when MITM is enabled.
@@ -393,6 +453,24 @@ impl Config {
         }
         if let Ok(val) = std::env::var("OPROXY_INSPECT_WS_FRAMES") {
             config.inspect_ws_frames = !matches!(val.to_lowercase().as_str(), "0" | "false" | "no");
+        }
+        if let Ok(val) = std::env::var("OPROXY_HTTP3_ENABLED") {
+            config.http3_enabled = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(val) = std::env::var("OPROXY_HTTP3_PORT") {
+            match val.parse::<u16>() {
+                Ok(p) => config.http3_port = Some(p),
+                Err(_) => {
+                    warn!(value = %val, "OPROXY_HTTP3_PORT is not a valid port number, ignoring")
+                }
+            }
+        }
+        if let Ok(val) = std::env::var("OPROXY_OTEL_ENABLED") {
+            config.otel_enabled = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(val) = std::env::var("OPROXY_OTEL_ENDPOINT") {
+            let v = val.trim().to_string();
+            config.otel_endpoint = (!v.is_empty()).then_some(v);
         }
         if let Ok(val) = std::env::var("OPROXY_ALLOW_REMOTE_ADMIN") {
             config.allow_remote_admin = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes");
@@ -551,6 +629,86 @@ mod tests {
             std::env::remove_var("OPROXY_PORT");
         }
         assert_eq!(cfg.port, 9090);
+    }
+
+    #[test]
+    fn http3_env_vars_override_enabled_and_port() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("OPROXY_CONFIG", "/tmp/oproxy_no_such_file.yaml");
+            std::env::set_var("OPROXY_HTTP3_ENABLED", "true");
+            std::env::set_var("OPROXY_HTTP3_PORT", "8443");
+        }
+        let cfg = Config::load();
+        unsafe {
+            std::env::remove_var("OPROXY_CONFIG");
+            std::env::remove_var("OPROXY_HTTP3_ENABLED");
+            std::env::remove_var("OPROXY_HTTP3_PORT");
+        }
+        assert!(cfg.http3_enabled);
+        assert_eq!(cfg.http3_port, Some(8443));
+    }
+
+    #[test]
+    fn http3_enabled_without_port_warns() {
+        let cfg = Config {
+            http3_enabled: true,
+            http3_port: None,
+            ..Default::default()
+        };
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|w| w.contains("http3_port is not set")),
+            "must warn when h3 is enabled without a port"
+        );
+    }
+
+    #[test]
+    fn http3_disabled_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.http3_enabled);
+        assert_eq!(cfg.http3_port, None);
+    }
+
+    #[test]
+    fn otel_env_vars_override_enabled_and_endpoint() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("OPROXY_CONFIG", "/tmp/oproxy_no_such_file.yaml");
+            std::env::set_var("OPROXY_OTEL_ENABLED", "true");
+            std::env::set_var("OPROXY_OTEL_ENDPOINT", "http://localhost:4317");
+        }
+        let cfg = Config::load();
+        unsafe {
+            std::env::remove_var("OPROXY_CONFIG");
+            std::env::remove_var("OPROXY_OTEL_ENABLED");
+            std::env::remove_var("OPROXY_OTEL_ENDPOINT");
+        }
+        assert!(cfg.otel_enabled);
+        assert_eq!(cfg.otel_endpoint.as_deref(), Some("http://localhost:4317"));
+    }
+
+    #[test]
+    fn otel_enabled_without_endpoint_warns() {
+        let cfg = Config {
+            otel_enabled: true,
+            otel_endpoint: None,
+            ..Default::default()
+        };
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|w| w.contains("otel_endpoint is not set")),
+            "must warn when otel is enabled without an endpoint"
+        );
+    }
+
+    #[test]
+    fn otel_disabled_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.otel_enabled);
+        assert_eq!(cfg.otel_endpoint, None);
     }
 
     #[test]

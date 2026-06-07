@@ -16,6 +16,38 @@ use crate::transport::websocket::{handle_websocket, is_websocket_upgrade};
 #[derive(Clone, Copy, Debug)]
 pub struct DownstreamPeer(pub SocketAddr);
 
+/// Per-connection identity threaded into every request's extensions so the engine
+/// can record which downstream connection (and which stream within it) an
+/// exchange belongs to (Phase 7). The counter is shared across all requests on
+/// the connection: HTTP/1.1 increments it per sequential request, h2/h3 per
+/// multiplexed stream.
+#[derive(Clone, Debug)]
+pub struct DownstreamConn {
+    pub id: String,
+    pub stream_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DownstreamConn {
+    pub fn new() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            stream_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Returns the next stream index on this connection (0-based, monotonic).
+    pub fn next_stream(&self) -> u64 {
+        self.stream_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for DownstreamConn {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyHttpService {
     app: Router,
@@ -57,10 +89,13 @@ pub async fn serve_http_connection<IO>(
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     let request_shutdown = shutdown.clone();
+    // One identity per accepted connection; cloned into every request on it.
+    let conn = DownstreamConn::new();
     let svc = hyper::service::service_fn(move |mut req: Request<Incoming>| {
         if let Some(peer) = peer {
             req.extensions_mut().insert(DownstreamPeer(peer));
         }
+        req.extensions_mut().insert(conn.clone());
         let service = service.clone();
         let shutdown = request_shutdown.clone();
         async move { service.handle(req, shutdown).await }

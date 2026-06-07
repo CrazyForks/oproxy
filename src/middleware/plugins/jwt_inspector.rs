@@ -75,6 +75,15 @@ impl Middleware for JwtInspectorMiddleware {
         "JwtInspectorMiddleware"
     }
 
+    fn body_hint(
+        &self,
+        _head: &crate::middleware::RequestContext,
+    ) -> crate::core::forward::BodyHint {
+        crate::core::forward::BodyHint::StreamingInspect {
+            granularity: crate::core::forward::Granularity::Bytes,
+        }
+    }
+
     async fn on_request(&self, ctx: &mut RequestContext) -> MiddlewareAction {
         if let Some(token) = Self::extract_jwt(&ctx.headers)
             && let Some(info) = Self::decode_jwt(&token)

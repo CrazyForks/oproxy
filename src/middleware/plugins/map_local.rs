@@ -105,7 +105,7 @@ pub struct MapLocalMiddleware {
 }
 
 impl MapLocalMiddleware {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(rules: Vec<MapLocalRule>) -> Self {
         Self {
             rules: Arc::new(RwLock::new(rules)),
@@ -114,7 +114,7 @@ impl MapLocalMiddleware {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_base_path(rules: Vec<MapLocalRule>, base_path: Option<PathBuf>) -> Self {
         Self {
             rules: Arc::new(RwLock::new(rules)),
