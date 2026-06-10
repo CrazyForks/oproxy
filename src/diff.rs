@@ -218,6 +218,7 @@ mod tests {
             }),
             source: SessionSource::Proxy,
             ws_frames: vec![],
+            events: vec![],
             note: None,
             tags: vec![],
             inspector_data: None,
@@ -225,6 +226,7 @@ mod tests {
             connection_id: None,
             stream_id: None,
             downstream_protocol: None,
+            protocol_context: None,
         }
     }
 

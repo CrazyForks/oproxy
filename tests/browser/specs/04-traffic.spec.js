@@ -53,10 +53,10 @@ test.describe('Traffic view', () => {
     await expect(page.locator('tbody tr')).toHaveCount(2, { timeout: 10000 });
 
     await page.getByRole('button', { name: '2xx' }).click();
-    await expect(page.getByText('ok.example.com')).toHaveCount(0);
-    await expect(page.locator('tbody tr', { hasText: 'missing.example.com' })).toHaveCount(1);
-    await page.getByRole('button', { name: '2xx' }).click();
     await expect(page.locator('tbody tr', { hasText: 'ok.example.com' })).toHaveCount(1);
+    await expect(page.getByText('missing.example.com')).toHaveCount(0);
+    await page.getByRole('button', { name: '2xx' }).click();
+    await expect(page.locator('tbody tr')).toHaveCount(2);
   });
 
   test('column sort and structure controls are interactive', async ({ page, request }) => {

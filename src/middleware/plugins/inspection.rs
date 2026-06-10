@@ -178,13 +178,14 @@ struct InspectionObserver {
 
 #[async_trait]
 impl BodyObserver for InspectionObserver {
-    fn on_response_head(&mut self, res: &ResponseContext, start: std::time::Instant) {
+    async fn on_response_head(&mut self, res: &ResponseContext, start: std::time::Instant) {
         self.res_ctx = Some(res.clone());
         self.start = Some(start);
     }
 
-    fn on_chunk(&mut self, chunk: &Bytes) {
+    async fn on_chunk(&mut self, chunk: Bytes) -> Option<Bytes> {
         self.byte_count += chunk.len() as u64;
+        Some(chunk)
     }
 
     async fn finish(self: Box<Self>) {
@@ -215,10 +216,26 @@ impl BodyObserver for InspectionObserver {
     }
 }
 
+/// Internal engine headers that must never appear in session recordings.
+/// Only THESE specific names are stripped. User-defined rewrite rules that
+/// inject headers with `x-oproxy-*` names are preserved so users can verify
+/// the injected values in the session detail panel.
+const INTERNAL_HEADERS: &[&str] = &[
+    "x-oproxy-session-id",
+    "x-oproxy-destination",
+    "x-oproxy-mock-response",
+    "x-oproxy-tags",
+    "x-oproxy-grpc-direction",
+    "x-oproxy-grpc-compressed",
+    "x-oproxy-frame-direction",
+    "x-oproxy-frame-opcode",
+    "x-oproxy-admin-token",
+];
+
 fn strip_internal_headers(headers: &mut crate::middleware::HeaderMap) {
     headers.retain(|name, _| {
         let name = name.trim().to_ascii_lowercase();
-        !name.starts_with("x-oproxy-")
+        !INTERNAL_HEADERS.contains(&name.as_str())
     });
 }
 
@@ -457,11 +474,11 @@ mod tests {
         let mut obs = mw
             .stream_observer(&rq)
             .expect("stream_observer must return Some");
-        obs.on_response_head(&rs, start);
+        obs.on_response_head(&rs, start).await;
         let chunk1 = bytes::Bytes::from_static(b"hello ");
         let chunk2 = bytes::Bytes::from_static(b"world");
-        obs.on_chunk(&chunk1);
-        obs.on_chunk(&chunk2);
+        assert_eq!(obs.on_chunk(chunk1.clone()).await, Some(chunk1));
+        assert_eq!(obs.on_chunk(chunk2.clone()).await, Some(chunk2));
         obs.finish().await;
         sm.flush().await;
 

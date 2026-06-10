@@ -59,6 +59,13 @@ pub(super) async fn execute_assistant_tool(
         "get_config" => read_config(state).await.map(ToolOutcome::Read),
         "get_feature_catalog" => read_feature_catalog(args).map(ToolOutcome::Read),
         "get_rules" => read_rules(state, args).await.map(ToolOutcome::Read),
+        "get_protocol_metrics" => Ok(ToolOutcome::Read(json!(
+            super::sessions::aggregate_protocol_metrics(state.session_manager.get_all_sessions())
+        ))),
+        "get_connections" => read_connections(state, args).map(ToolOutcome::Read),
+        "get_breakpoint_diagnostics" => Ok(ToolOutcome::Read(json!({
+            "diagnostics": state.api_handler.list_breakpoint_diagnostics().await,
+        }))),
         "get_throttling" => Ok(ToolOutcome::Read(json!(
             state.throttling_config.read().await.clone()
         ))),
@@ -153,6 +160,9 @@ async fn read_list_sessions(state: &Arc<AppState>, args: Value) -> Result<Value,
                 "tags": exchange.tags,
                 "note": exchange.note,
                 "metrics": exchange.metrics,
+                "downstream_protocol": exchange.downstream_protocol,
+                "connection_id": exchange.connection_id,
+                "stream_id": exchange.stream_id,
             })
         })
         .collect();
@@ -196,6 +206,33 @@ async fn read_get_session(state: &Arc<AppState>, args: Value) -> Result<Value, S
         "tags": exchange.tags,
         "note": exchange.note,
         "inspector_data": redact_value(&json!(exchange.inspector_data)),
+        "downstream_protocol": exchange.downstream_protocol,
+        "connection_id": exchange.connection_id,
+        "stream_id": exchange.stream_id,
+        "protocol_context": exchange.protocol_context,
+        "ws_frame_count": exchange.ws_frames.len(),
+        "event_count": exchange.events.len(),
+        "paused_at": exchange.paused_at,
+    }))
+}
+
+/// `get_connections`: connection → stream tree built from recorded exchanges
+/// (h2/h3 multiplexing view). Trimmed to the most recently active connections
+/// so the payload stays small enough for model context.
+fn read_connections(state: &Arc<AppState>, args: Value) -> Result<Value, String> {
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v.clamp(1, 20) as usize)
+        .unwrap_or(10);
+    let mut connections =
+        super::sessions::aggregate_connections(state.session_manager.get_all_sessions());
+    let total = connections.len();
+    connections.truncate(limit);
+    Ok(json!({
+        "connections": redact_value(&json!(connections)),
+        "total": total,
+        "limit": limit,
     }))
 }
 
@@ -204,6 +241,11 @@ async fn read_config(state: &Arc<AppState>) -> Result<Value, String> {
         "port": state.config.port,
         "bind_host": state.config.bind_host,
         "mitm_enabled": state.config.mitm.enabled,
+        "https_port": state.config.https_port,
+        "socks5_port": state.config.socks5_port,
+        "http3_enabled": state.config.http3_enabled,
+        "http3_port": state.config.http3_port,
+        "otel_enabled": state.config.otel_enabled,
         "max_body_bytes": state.proxy_engine.max_body_bytes(),
         "max_sessions": state.config.max_sessions,
         "max_connections": state.config.max_connections,
@@ -252,7 +294,7 @@ async fn propose_dns_override_action(
 }
 
 fn propose_dns_override_action_from_map(
-    current: HashMap<String, String>,
+    current: crate::middleware::plugins::dns_override::DnsOverrides,
     args: Value,
 ) -> Result<AssistantAction, String> {
     let current_state = json!(current);
@@ -274,10 +316,16 @@ fn propose_dns_override_action_from_map(
                 normalize_dns_ip(args.get("ip").and_then(Value::as_str).ok_or_else(|| {
                     "propose_dns_override operation=set requires ip".to_string()
                 })?)?;
-            let mut next: HashMap<String, String> =
+            let mut next: crate::middleware::plugins::dns_override::DnsOverrides =
                 serde_json::from_value(current_state.clone())
                     .map_err(|e| format!("invalid current DNS state: {e}"))?;
-            next.insert(host.clone(), ip.clone());
+            next.insert(
+                host.clone(),
+                crate::middleware::plugins::dns_override::DnsEntry {
+                    ip: ip.clone(),
+                    enabled: true,
+                },
+            );
             let mut action = propose_action(json!({
                 "method": "POST",
                 "endpoint": "/admin/dns",
@@ -639,6 +687,15 @@ fn location_from_args(args: &Value) -> Result<Location, String> {
     if let Some(protocol) = non_empty_string_arg(args, "protocol") {
         location.protocol = Some(protocol.to_ascii_lowercase());
     }
+    if let Some(wire_protocol) = non_empty_string_arg(args, "wire_protocol") {
+        location.wire_protocol = Some(wire_protocol.to_ascii_lowercase());
+    }
+    if let Some(application_protocol) = non_empty_string_arg(args, "application_protocol") {
+        location.application_protocol = Some(application_protocol.to_ascii_lowercase());
+    }
+    if let Some(body_mode) = non_empty_string_arg(args, "body_mode") {
+        location.body_mode = Some(body_mode.to_ascii_lowercase());
+    }
     if let Some(query) = non_empty_string_arg(args, "query") {
         location.query = Some(query);
     }
@@ -783,7 +840,7 @@ mod tests {
         prompt: String,
         expected_tool: String,
         #[serde(default)]
-        current_dns: HashMap<String, String>,
+        current_dns: HashMap<String, crate::middleware::plugins::dns_override::DnsValue>,
         #[serde(default)]
         current_capture_filter: Option<CaptureFilterConfig>,
         #[serde(default)]
@@ -814,8 +871,16 @@ mod tests {
 
     #[test]
     fn dns_override_proposal_merges_with_existing_overrides() {
+        use crate::middleware::plugins::dns_override::{DnsEntry, DnsOverrides};
+        let existing: DnsOverrides = HashMap::from([(
+            "old.test.com".to_string(),
+            DnsEntry {
+                ip: "10.0.0.1".to_string(),
+                enabled: true,
+            },
+        )]);
         let action = propose_dns_override_action_from_map(
-            HashMap::from([("old.test.com".to_string(), "10.0.0.1".to_string())]),
+            existing,
             json!({
                 "operation": "set",
                 "host": "API.TEST.COM",
@@ -826,16 +891,17 @@ mod tests {
 
         assert_eq!(action.method, "POST");
         assert_eq!(action.endpoint, "/admin/dns");
-        assert_eq!(action.payload["old.test.com"], "10.0.0.1");
-        assert_eq!(action.payload["api.test.com"], "10.0.0.5");
+        assert_eq!(action.payload["old.test.com"]["ip"], "10.0.0.1");
+        assert_eq!(action.payload["api.test.com"]["ip"], "10.0.0.5");
         assert_eq!(action.preconditions.len(), 1);
         assert_eq!(action.preconditions[0].resource, "dns");
     }
 
     #[test]
     fn dns_override_delete_proposes_item_delete() {
+        use crate::middleware::plugins::dns_override::DnsOverrides;
         let action = propose_dns_override_action_from_map(
-            HashMap::new(),
+            DnsOverrides::new(),
             json!({
                 "operation": "delete",
                 "host": "api.test.com",
@@ -885,6 +951,22 @@ mod tests {
         assert_eq!(action.payload["location"]["methods"], json!(["GET"]));
         assert_eq!(action.payload["applies_to"], "request");
         assert_eq!(action.payload["actions"][0]["type"], "set_header");
+    }
+
+    #[test]
+    fn rewrite_rule_proposal_preserves_protocol_matcher_fields() {
+        let action = propose_rewrite_rule_action(json!({
+            "host": "api.test.com",
+            "wire_protocol": "HTTP2",
+            "application_protocol": "GRPC",
+            "body_mode": "stream_messages",
+            "actions": [{ "type": "set_header", "name": "x-debug", "value": "yes" }]
+        }))
+        .expect("rewrite proposal");
+
+        assert_eq!(action.payload["location"]["wire_protocol"], "http2");
+        assert_eq!(action.payload["location"]["application_protocol"], "grpc");
+        assert_eq!(action.payload["location"]["body_mode"], "stream_messages");
     }
 
     #[test]
@@ -989,9 +1071,14 @@ mod tests {
 
     fn run_eval_case(case: &AssistantEvalCase) -> Result<AssistantAction, String> {
         match case.expected_tool.as_str() {
-            "propose_dns_override" => {
-                propose_dns_override_action_from_map(case.current_dns.clone(), case.args.clone())
-            }
+            "propose_dns_override" => propose_dns_override_action_from_map(
+                case.current_dns
+                    .clone()
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_entry()))
+                    .collect(),
+                case.args.clone(),
+            ),
             "propose_throttling" => propose_throttling_action_from_config(
                 case.current_throttling.clone().unwrap_or(ThrottlingConfig {
                     enabled: false,

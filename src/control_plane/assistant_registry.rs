@@ -265,6 +265,52 @@ mod tests {
     }
 
     #[test]
+    fn feature_catalog_covers_protocol_features() {
+        let catalog = assistant_feature_catalog();
+        for id in ["protocol_observability", "http3", "telemetry"] {
+            assert!(
+                catalog.iter().any(|feature| feature.id == id),
+                "feature catalog must document '{id}'"
+            );
+        }
+        let breakpoints = catalog
+            .iter()
+            .find(|feature| feature.id == "breakpoints")
+            .expect("breakpoints feature doc");
+        assert!(
+            breakpoints.notes.iter().any(|note| note.contains("tier")),
+            "breakpoints doc must explain tiers"
+        );
+        let compose = catalog
+            .iter()
+            .find(|feature| feature.id == "compose_forward")
+            .expect("compose feature doc");
+        assert!(
+            compose
+                .action_endpoints
+                .iter()
+                .any(|endpoint| endpoint == "/admin/forward/websocket"),
+            "compose doc must list the WebSocket forward endpoint"
+        );
+    }
+
+    #[test]
+    fn tool_registry_exposes_protocol_read_tools() {
+        for name in [
+            "get_protocol_metrics",
+            "get_connections",
+            "get_breakpoint_diagnostics",
+        ] {
+            assert!(
+                tool_info()
+                    .iter()
+                    .any(|tool| tool.name == name && tool.category == "read"),
+                "tool registry must expose '{name}' as a read tool"
+            );
+        }
+    }
+
+    #[test]
     fn response_guidance_prioritizes_ui_steps() {
         let guidance = assistant_response_guidance();
 

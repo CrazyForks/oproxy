@@ -158,6 +158,8 @@ mod tests {
             },
             view_mode: SessionsViewMode::Sequence,
             selected_session_id: Some("s1".to_string()),
+            app_filter: Default::default(),
+            wire_filter: Default::default(),
         };
 
         let filter = session_filter_from_workspace_context(&view);

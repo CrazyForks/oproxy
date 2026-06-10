@@ -32,7 +32,6 @@ pub(super) async fn bind_http_listener(
                 addr: addr_str,
                 source: e,
             })?;
-    tracing::info!("oproxy listening on http://{}", addr);
     Ok(listener)
 }
 
@@ -63,13 +62,10 @@ pub(super) async fn bind_https_listener(
                                 source: e,
                             })?;
                     match tokio::net::TcpListener::bind(tls_addr).await {
-                        Ok(tls_l) => {
-                            tracing::info!("oproxy HTTPS listener on https://{}", tls_addr);
-                            Ok(Some((
-                                tls_l,
-                                tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)),
-                            )))
-                        }
+                        Ok(tls_l) => Ok(Some((
+                            tls_l,
+                            tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)),
+                        ))),
                         Err(e) => {
                             tracing::warn!(error=%e, "Failed to bind HTTPS listener, continuing without it");
                             Ok(None)
@@ -102,10 +98,7 @@ pub(super) async fn bind_socks5_listener(
         source: e,
     })?;
     match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            tracing::info!("oproxy SOCKS5 listener on socks5://{}", addr);
-            Ok(Some(listener))
-        }
+        Ok(listener) => Ok(Some(listener)),
         Err(e) => {
             tracing::warn!(error=%e, port=socks5_port, "Failed to bind SOCKS5 listener, continuing without it");
             Ok(None)

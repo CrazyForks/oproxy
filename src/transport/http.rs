@@ -121,7 +121,6 @@ pub async fn serve_http_connection<IO>(
 mod tests {
     use super::*;
     use axum::routing::get;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -147,9 +146,15 @@ mod tests {
         ));
         let context = TransportContext {
             session_manager: Arc::new(crate::session::SessionManager::new(10_000)),
+            breakpoint_manager: Arc::new(
+                crate::middleware::plugins::breakpoints::BreakpointManager::new(),
+            ),
+            mock_rules: Arc::new(RwLock::new(Vec::new())),
             connections: ConnectionSupervisor::new(100),
             engine,
-            dns_overrides: Arc::new(RwLock::new(HashMap::new())),
+            dns_overrides: Arc::new(RwLock::new(
+                crate::middleware::plugins::dns_override::DnsOverrides::new(),
+            )),
             inspect_ws_frames: true,
             connect_timeout: Duration::from_millis(50),
             handshake_timeout: Duration::from_millis(50),

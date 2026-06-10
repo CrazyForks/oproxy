@@ -83,6 +83,10 @@ pub(super) async fn list_pending_bp(State(state): State<Arc<AppState>>) -> impl 
     axum::Json(state.api_handler.list_pending().await)
 }
 
+pub(super) async fn list_bp_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    axum::Json(state.api_handler.list_breakpoint_diagnostics().await)
+}
+
 #[derive(serde::Deserialize)]
 pub(super) struct ResolutionRequest {
     action: String,

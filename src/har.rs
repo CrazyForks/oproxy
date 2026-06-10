@@ -79,6 +79,8 @@ pub struct HarEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub server_ip_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
     #[serde(rename = "cache")]
     pub cache: HarCache,
     // oproxy extensions ──────────────────────────────────────────────────────
@@ -107,6 +109,24 @@ pub struct HarEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub oproxy_updated_at: Option<String>,
+    #[serde(
+        rename = "_oproxy_stream_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub oproxy_stream_id: Option<u64>,
+    #[serde(
+        rename = "_oproxy_downstream_protocol",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub oproxy_downstream_protocol: Option<String>,
+    #[serde(
+        rename = "_oproxy_protocol_context",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub oproxy_protocol_context: Option<crate::core::forward::ProtocolContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,11 +352,15 @@ pub fn exchange_to_har_entry(ex: &Exchange) -> HarEntry {
         response: har_response,
         timings,
         server_ip_address: None,
+        connection: ex.connection_id.clone(),
         cache: HarCache::default(),
         oproxy_id: Some(ex.id.clone()),
         oproxy_note: ex.note.clone(),
         oproxy_tags: ex.tags.clone(),
         oproxy_updated_at: ex.updated_at.map(|t| t.to_rfc3339()),
+        oproxy_stream_id: ex.stream_id,
+        oproxy_downstream_protocol: ex.downstream_protocol.clone(),
+        oproxy_protocol_context: ex.protocol_context.clone(),
     }
 }
 
@@ -451,13 +475,15 @@ pub fn har_entry_to_exchange(entry: &HarEntry) -> Exchange {
         metrics,
         source: SessionSource::Imported,
         ws_frames: vec![],
+        events: vec![],
         note: entry.oproxy_note.clone(),
         tags: entry.oproxy_tags.clone(),
         inspector_data: None,
         paused_at: None,
-        connection_id: None,
-        stream_id: None,
-        downstream_protocol: None,
+        connection_id: entry.connection.clone(),
+        stream_id: entry.oproxy_stream_id,
+        downstream_protocol: entry.oproxy_downstream_protocol.clone(),
+        protocol_context: entry.oproxy_protocol_context.clone(),
     }
 }
 
@@ -693,6 +719,7 @@ mod tests {
             metrics,
             source: SessionSource::Proxy,
             ws_frames: vec![],
+            events: vec![],
             note: None,
             tags: vec![],
             inspector_data: None,
@@ -700,6 +727,7 @@ mod tests {
             connection_id: None,
             stream_id: None,
             downstream_protocol: None,
+            protocol_context: None,
         }
     }
 
@@ -873,6 +901,37 @@ mod tests {
         assert_eq!(
             restored.metrics.and_then(|m| m.protocol).as_deref(),
             Some("HTTP/3")
+        );
+    }
+
+    #[test]
+    fn har_roundtrip_preserves_connection_stream_identity() {
+        let mut ex = make_exchange("GET", "https://example.com/", 200, "ok", "");
+        ex.connection_id = Some("conn-h2-1".to_string());
+        ex.stream_id = Some(7);
+        ex.downstream_protocol = Some("HTTP/2".to_string());
+        ex.protocol_context = Some(
+            crate::core::forward::ProtocolContext::http(
+                axum::http::Version::HTTP_2,
+                "https",
+                crate::core::forward::ApplicationProtocol::Grpc,
+                crate::core::forward::BodyMode::StreamMessages,
+            )
+            .with_identity(ex.connection_id.clone(), ex.stream_id),
+        );
+
+        let entry = exchange_to_har_entry(&ex);
+        assert_eq!(entry.connection.as_deref(), Some("conn-h2-1"));
+        assert_eq!(entry.oproxy_stream_id, Some(7));
+        assert_eq!(entry.oproxy_downstream_protocol.as_deref(), Some("HTTP/2"));
+
+        let restored = har_entry_to_exchange(&entry);
+        assert_eq!(restored.connection_id.as_deref(), Some("conn-h2-1"));
+        assert_eq!(restored.stream_id, Some(7));
+        assert_eq!(restored.downstream_protocol.as_deref(), Some("HTTP/2"));
+        assert_eq!(
+            restored.protocol_context.as_ref().map(|ctx| ctx.downstream),
+            Some(crate::core::forward::WireProtocol::Http2)
         );
     }
 

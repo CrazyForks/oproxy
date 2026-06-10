@@ -95,8 +95,8 @@ pub async fn handle_connect(
         let ovr = dns_overrides.read().await;
         if !ovr.is_empty() {
             let (hostname, port_part) = raw.split_once(':').unwrap_or((&raw, "443"));
-            if let Some(ip) = ovr.get(hostname) {
-                format!("{}:{}", ip, port_part)
+            if let Some(entry) = ovr.get(hostname).filter(|e| e.enabled) {
+                format!("{}:{}", entry.ip, port_part)
             } else {
                 raw
             }
@@ -166,12 +166,13 @@ pub async fn handle_connect(
                             }
                             // MITM mode: TLS detection skipped the initial record_request.
                             // Record the cleartext tunnel as a CONNECT session now so it
-                            // appears in the dashboard (e.g. h2c gRPC, ws://).
+                            // appears in the dashboard (e.g. h2c gRPC, ws://). Labelled
+                            // http:// — this tunnel is explicitly NOT TLS.
                             sm.record_request(
                                 session_id.clone(),
                                 crate::middleware::RequestContext {
                                     method: "CONNECT".to_string(),
-                                    uri: format!("https://{}", host),
+                                    uri: format!("http://{}", host),
                                     headers: crate::middleware::HeaderMap::new(),
                                     body: bytes::Bytes::new(),
                                     host: host.clone(),
@@ -320,6 +321,8 @@ mod tests {
     async fn prefixed_io_completes_a_real_tls_handshake() {
         use tokio::io::AsyncWriteExt;
         use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        crate::transport::tls::install_default_crypto_provider();
 
         let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
         let key = rcgen::KeyPair::generate().expect("key");

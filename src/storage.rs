@@ -8,13 +8,24 @@ use crate::middleware::plugins::rules::RewriteRuleSet;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn to_io_error(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
+/// Per-process monotonic counter used to generate unique tmp file names.
+/// Prevents concurrent saves to the same target file from racing on a shared
+/// `.tmp` suffix (which would let one write silently overwrite another in flight).
+static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 async fn write_atomic(path: &Path, contents: String) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Use a sequence-stamped hidden tmp file in the same directory so the
+    // final rename is always on the same filesystem (no cross-device move).
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp_name = format!(".{file_name}.{seq}.tmp");
+    let tmp = path.with_file_name(tmp_name);
     tokio::fs::write(&tmp, &contents).await?;
     tokio::fs::rename(&tmp, path).await
 }
@@ -51,11 +62,19 @@ pub async fn save_throttle(path: &Path, config: &ThrottlingConfig) -> io::Result
     save_json(path, "throttle.json", config).await
 }
 
-pub fn load_dns_overrides(path: &Path) -> HashMap<String, String> {
-    load_json(path, "dns_overrides.json")
+pub fn load_dns_overrides(path: &Path) -> crate::middleware::plugins::dns_override::DnsOverrides {
+    // Support backward-compat: old files stored plain strings, new files store DnsEntry objects.
+    let raw: HashMap<String, crate::middleware::plugins::dns_override::DnsValue> =
+        load_json(path, "dns_overrides.json");
+    raw.into_iter()
+        .map(|(host, v)| (host, v.into_entry()))
+        .collect()
 }
 
-pub async fn save_dns_overrides(path: &Path, map: &HashMap<String, String>) -> io::Result<()> {
+pub async fn save_dns_overrides(
+    path: &Path,
+    map: &crate::middleware::plugins::dns_override::DnsOverrides,
+) -> io::Result<()> {
     save_json(path, "dns_overrides.json", map).await
 }
 
@@ -162,10 +181,9 @@ pub async fn save_map_remote_rules(path: &Path, rules: &[MapRemoteRule]) -> io::
 mod tests {
     use super::*;
     use crate::middleware::matcher::Location;
-    use crate::middleware::plugins::breakpoints::{BreakpointRule, BreakpointType};
+    use crate::middleware::plugins::breakpoints::{BreakpointRule, BreakpointTier, BreakpointType};
     use crate::middleware::plugins::routing::ThrottlingConfig;
     use crate::middleware::plugins::rules::{AppliesTo, RewriteAction, RewriteRuleSet};
-    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn tmp(label: &str) -> PathBuf {
@@ -259,12 +277,32 @@ mod tests {
 
     #[tokio::test]
     async fn dns_overrides_roundtrip() {
+        use crate::middleware::plugins::dns_override::DnsEntry;
         let dir = tmp("dns_rt");
-        let mut map = HashMap::new();
-        map.insert("api.local".to_string(), "127.0.0.1".to_string());
+        let mut map = crate::middleware::plugins::dns_override::DnsOverrides::new();
+        map.insert(
+            "api.local".to_string(),
+            DnsEntry {
+                ip: "127.0.0.1".to_string(),
+                enabled: true,
+            },
+        );
         save_dns_overrides(&dir, &map).await.unwrap();
         let loaded = load_dns_overrides(&dir);
-        assert_eq!(loaded, map);
+        assert_eq!(loaded["api.local"].ip, "127.0.0.1");
+        assert!(loaded["api.local"].enabled);
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn dns_overrides_legacy_string_compat() {
+        // Legacy format: {"host": "ip"} should load as enabled entry
+        let dir = tmp("dns_legacy");
+        let legacy = r#"{"api.local": "127.0.0.1"}"#;
+        std::fs::write(dir.join("dns_overrides.json"), legacy).unwrap();
+        let loaded = load_dns_overrides(&dir);
+        assert_eq!(loaded["api.local"].ip, "127.0.0.1");
+        assert!(loaded["api.local"].enabled);
         cleanup(&dir);
     }
 
@@ -290,6 +328,7 @@ mod tests {
                     ..Default::default()
                 },
                 bp_type: BreakpointType::Request,
+                tier: BreakpointTier::Body,
                 enabled: true,
             },
             BreakpointRule {
@@ -300,6 +339,7 @@ mod tests {
                     ..Default::default()
                 },
                 bp_type: BreakpointType::Response,
+                tier: BreakpointTier::Body,
                 enabled: false,
             },
         ];

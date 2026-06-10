@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapLocalRule {
+    #[serde(default)]
     pub id: String,
     pub name: String,
     #[serde(default = "default_true")]
@@ -173,6 +174,7 @@ impl Middleware for MapLocalMiddleware {
                         file_path.display()
                     )),
                     tags: vec!["map-local-error".to_string()],
+                    served_mock: None,
                 });
                 return MiddlewareAction::StopAndReturn;
             }
@@ -215,6 +217,7 @@ impl Middleware for MapLocalMiddleware {
                                 file_path.display()
                             )),
                             tags: vec!["map-local-error".to_string()],
+                            served_mock: None,
                         });
                         return MiddlewareAction::StopAndReturn;
                     }
@@ -230,6 +233,7 @@ impl Middleware for MapLocalMiddleware {
                                 file_path.display()
                             )),
                             tags: vec!["map-local-error".to_string()],
+                            served_mock: None,
                         });
                         return MiddlewareAction::StopAndReturn;
                     }
@@ -246,6 +250,7 @@ impl Middleware for MapLocalMiddleware {
                         headers,
                         body: Bytes::from(contents),
                         tags: vec!["map-local".to_string()],
+                        served_mock: None,
                     });
                     return MiddlewareAction::StopAndReturn;
                 }

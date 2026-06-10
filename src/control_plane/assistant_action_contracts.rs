@@ -61,6 +61,15 @@ const ACTION_ENDPOINT_CONTRACTS: &[StaticActionEndpointContract] = &[
         refreshed_resource: "dns",
         shape: ActionEndpointShape::DnsOverrides,
     },
+    // Must precede "/admin/forward": contracts match in order and the websocket
+    // path would otherwise be parsed as item id "websocket" on /admin/forward.
+    StaticActionEndpointContract {
+        base_path: "/admin/forward/websocket",
+        kind: "forward-websocket",
+        risk: AssistantActionRisk::Network,
+        refreshed_resource: "sessions",
+        shape: ActionEndpointShape::Singleton,
+    },
     StaticActionEndpointContract {
         base_path: "/admin/forward",
         kind: "forward",
@@ -248,6 +257,11 @@ mod tests {
                 .risk,
             AssistantActionRisk::Network
         );
+        let ws = action_route_contract("POST", "/admin/forward/websocket")
+            .expect("websocket forward must be allowlisted, not parsed as an item id");
+        assert_eq!(ws.kind, "forward-websocket");
+        assert_eq!(ws.risk, AssistantActionRisk::Network);
+        assert_eq!(ws.item_id, None);
         assert_eq!(
             action_route_contract("POST", "/admin/webhooks")
                 .expect("webhook")

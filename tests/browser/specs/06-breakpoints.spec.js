@@ -104,6 +104,67 @@ test.describe('Breakpoints', () => {
     expect(rule.enabled).toBe(false);
   });
 
+  test('protocol breakpoint tiers persist and render in the UI', async ({ page, request }) => {
+    await request.post('/admin/breakpoints', {
+      data: {
+        id: '',
+        location: location({
+          host: 'socket-break.example.com',
+          path: '/ws',
+          wire_protocol: 'websocket',
+          body_mode: 'frames',
+        }),
+        bp_type: 'Request',
+        tier: 'frame',
+        enabled: true,
+      },
+    });
+    await request.post('/admin/breakpoints', {
+      data: {
+        id: '',
+        location: location({
+          host: 'tunnel-break.example.com',
+          wire_protocol: 'socks5',
+          body_mode: 'tunnel',
+        }),
+        bp_type: 'Request',
+        tier: 'tunnel',
+        enabled: true,
+      },
+    });
+
+    await gotoRail(page, 'Breakpoints');
+    const frameRow = page.locator('.rule-row', { hasText: 'socket-break.example.com' });
+    await expect(frameRow).toContainText('/ws');
+    await expect(frameRow).toContainText('frame · glob');
+
+    const tunnelRow = page.locator('.rule-row', { hasText: 'tunnel-break.example.com' });
+    await expect(tunnelRow).toContainText('tunnel · glob');
+
+    const rules = await (await request.get('/admin/breakpoints')).json();
+    expect(rules.find(r => r.location?.host === 'socket-break.example.com')?.tier).toBe('frame');
+    expect(rules.find(r => r.location?.host === 'tunnel-break.example.com')?.tier).toBe('tunnel');
+  });
+
+  test('frame breakpoint tier applies WebSocket matcher fields without a WS method', async ({ page, request }) => {
+    await gotoRail(page, 'Breakpoints');
+    await page.getByRole('button', { name: /Add breakpoint/ }).click();
+    const dialog = page.locator('.ui-dialog');
+    await dialog.locator('select').nth(1).selectOption('frame');
+    await dialog.getByPlaceholder('api.example.com').fill('ui-frame-break.example.com');
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+
+    const rules = await (await request.get('/admin/breakpoints')).json();
+    const saved = rules.find(r => r.location?.host === 'ui-frame-break.example.com');
+    expect(saved).toBeTruthy();
+    expect(saved.tier).toBe('frame');
+    expect(saved.location).toMatchObject({
+      wire_protocol: 'websocket',
+      body_mode: 'frames',
+    });
+    expect(saved.location.methods || []).not.toContain('WS');
+  });
+
   test('Disable all turns off rules and releases held requests', async ({ page, request, baseURL }) => {
     await withServer(async port => {
       await request.post('/admin/breakpoints', {

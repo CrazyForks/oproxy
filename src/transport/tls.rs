@@ -5,6 +5,16 @@ use tokio::time::timeout;
 
 use crate::core::engine::ProxyEngine;
 
+/// Install the rustls crypto provider used by oproxy.
+///
+/// rustls 0.23 cannot auto-select a provider when multiple backends are present
+/// in the dependency graph. That happens in `--all-features` builds because
+/// reqwest/tokio-rustls pull aws-lc-rs while quinn pulls ring. Installing one
+/// provider explicitly keeps runtime startup and lib tests deterministic.
+pub(crate) fn install_default_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 pub fn is_tls_port(port: u16) -> bool {
     matches!(port, 443 | 8443 | 4443)
 }
@@ -23,6 +33,7 @@ pub fn build_mitm_server_config(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
 ) -> Result<Arc<rustls::ServerConfig>, rustls::Error> {
+    install_default_crypto_provider();
     let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
     let private_key: rustls::pki_types::PrivateKeyDer<'static> =
         rustls::pki_types::PrivatePkcs8KeyDer::from(key_der).into();

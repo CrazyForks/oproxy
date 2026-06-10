@@ -3,6 +3,9 @@ response_guidance:
   - If a matching feature has ui_steps, list those steps before mentioning API endpoints or assistant automation.
   - After UI steps, briefly explain what the feature does and offer to prepare a confirmed action when the request would change oproxy state.
   - For HTTPS setup questions, include proxy address, CA trust, and verification guidance before advanced details.
+  - For questions about protocol mix, HTTP/2 or HTTP/3 usage, gRPC/WebSocket counts, or latency percentiles, call get_protocol_metrics instead of estimating from list_sessions.
+  - For questions about connection reuse or stream multiplexing, call get_connections.
+  - When a breakpoint did not fire, call get_breakpoint_diagnostics to check for tier/body-mode incompatibilities before suggesting rule changes.
 
 workspace_actions:
   - name: navigation.open_surface
@@ -21,7 +24,7 @@ workspace_actions:
           properties:
             surface:
               type: string
-              enum: [sessions, compose, rules, breakpoints, mock, lua, inspector, dns, capture, webhooks, ca, settings]
+              enum: [sessions, dashboard, connections, compose, rules, breakpoints, mock, lua, inspector, dns, capture, webhooks, ca, settings]
 
   - name: sessions.apply_filter
     category: ui
@@ -50,7 +53,7 @@ workspace_actions:
               type: array
               items:
                 type: string
-                enum: ["2", "3", "4", "5", "-"]
+                enum: ["1", "2", "3", "4", "5", "-"]
               description: Use '-' for pending or paused sessions.
             host_focus:
               type: array
@@ -58,12 +61,24 @@ workspace_actions:
                 type: string
             host_filter:
               type: string
+            wire_filter:
+              type: array
+              items:
+                type: string
+                enum: [h1, h2, h3, socks]
+              description: Filter by wire/transport protocol. h1=HTTP/1.1, h2=HTTP/2, h3=HTTP/3, socks=SOCKS5 tunnel.
+            app_filter:
+              type: array
+              items:
+                type: string
+                enum: [http, ws, grpc, tunnel]
+              description: Filter by application protocol. ws=WebSocket, grpc=gRPC, tunnel=TCP tunnels.
             sort:
               type: object
               properties:
                 key:
                   type: string
-                  enum: [idx, method, status, host, path, type, reqSize, total, ts]
+                  enum: [idx, method, status, host, path, type, reqSize, total, ts, protocol]
                 dir:
                   type: string
                   enum: [asc, desc]
@@ -131,7 +146,7 @@ workspace_actions:
       type: function
       function:
         name: workspace_rules_open_tab
-        description: Safely open the Rules surface and focus a tab such as rules, map_remote, map_local, access, or throttling.
+        description: Safely open the Rules surface and focus a tab. Valid tab values are rules, mapremote, maplocal, fixtures, access, or throttle.
         parameters:
           type: object
           required: [tab]
@@ -143,11 +158,11 @@ features:
   - id: sessions
     title: Sessions and Traffic Capture
     category: observe
-    purpose: Capture, search, inspect, annotate, diff, export, save, load, and clear HTTP/HTTPS sessions.
+    purpose: Capture, search, inspect, annotate, diff, export, save, load, and clear HTTP/HTTPS/gRPC/WebSocket/SOCKS sessions.
     ui_steps:
       - Open the Sessions rail item.
-      - Use the top search/filter bar to find requests by method, host, path, status, tag, or text.
-      - Select a session to inspect request, response, timing, websocket frames, exports, and replay options.
+      - Use the top search/filter bar to find requests by method, host, path, status, tag, text, wire protocol (HTTP/1.1, H2, H3, SOCKS), or app protocol (HTTP, WS, gRPC, Tunnel).
+      - Select a session to inspect request, response, timing, websocket frames, gRPC messages, exports, and replay options.
     use_when:
       - The user asks what happened, why a request failed, or wants to inspect captured traffic.
       - The user wants HAR/JSON export, cURL generation, session import, or saved sessions.
@@ -167,6 +182,8 @@ features:
     notes:
       - Session reads are automatic; clearing, importing, loading, saving, and exporting require confirmation.
       - Bodies and sensitive headers must be redacted before model context.
+      - Sessions carry protocol identity (downstream protocol, negotiated upstream protocol, connection_id, stream_id) and can be sorted by the protocol column.
+      - Streamed exchanges record an event timeline (gRPC messages, WebSocket frames, breakpoint pauses, served mocks, tunnel open/close).
 
   - id: rewrite_rules
     title: Rewrite Rule Sets
@@ -242,6 +259,7 @@ features:
       - File mode serves the file verbatim; directory mode appends the request path to find the file inside it.
       - Relative file_path resolves against OPROXY_MAP_LOCAL_BASE_PATH (if set) then storage/map-local/; absolute paths are used verbatim.
       - Prefer inline_body on the rule over raw-body fixture endpoints (those are mainly for uploads/scripts).
+      - The Fixtures tab (under Rules → Fixtures) lets users browse, upload, preview, and delete files stored in storage/map-local/.
       - For dynamic responses or sequences, use mock_server instead.
 
   - id: access_rules
@@ -269,37 +287,53 @@ features:
   - id: breakpoints
     title: Breakpoints
     category: debug
-    purpose: Pause matching requests or responses so the user can inspect, modify, continue, or drop them.
+    purpose: Pause matching requests or responses so the user can inspect, modify, continue, or drop them. Tiers control what is paused, from headers to whole bodies, individual WebSocket frames / gRPC messages, or SOCKS5 tunnel metadata.
     ui_steps:
       - Open the Breakpoints rail item.
       - Create a request or response breakpoint with matching Location fields.
-      - When traffic is held, inspect it in Pending breakpoints and continue, modify, or drop it.
+      - Choose the tier; head pauses on headers/metadata only, body (default) allows full body editing, frame pauses each WebSocket frame or gRPC message, tunnel pauses SOCKS5 tunnel setup.
+      - When traffic is held, it appears in a live SSE-driven queue under Pending.
+      - Click a pending request to edit headers or body inline, then continue or drop it.
     use_when:
       - The user wants to hold traffic at request/response time.
       - The user wants interactive debugging before forwarding or returning a response.
-    read_tools: [get_rules]
+      - The user wants to pause, edit, or drop individual WebSocket frames or gRPC messages mid-stream.
+      - A breakpoint did not fire and the user wants to know why.
+    read_tools: [get_rules, get_breakpoint_diagnostics]
     action_endpoints:
       - /admin/breakpoints
       - /admin/breakpoints/pending/{id}/resolve
+      - /admin/breakpoints/diagnostics
     examples:
       - pause POST /login requests
       - break on 500 responses from api.example.com
+      - pause every WebSocket frame to /socket
+      - why did my breakpoint not pause that gRPC stream
     notes:
+      - Breakpoint payloads accept a `tier` field (head, body, frame, tunnel); body is the default and only works for buffered bodies.
+      - Body-tier breakpoints cannot pause streams, frames, or tunnels; the engine records a diagnostic instead. Use get_breakpoint_diagnostics to surface these mismatches.
+      - Frame-tier breakpoints require frame or stream_messages body modes (WebSocket / gRPC); pair them with location wire_protocol/application_protocol/body_mode matchers.
       - Creating breakpoints requires confirmation.
       - Resolving a held breakpoint changes live traffic and requires confirmation.
 
   - id: mock_server
     title: Mock Responses
     category: mock
-    purpose: Return configured mock responses, including response rotation and optional delay, for matching requests.
+    purpose: Return configured mock responses for matching requests. Supports HTTP response variants (rotated), WebSocket frames, gRPC messages, and SOCKS5 tunnel allow/deny.
     ui_steps:
       - Open the Mock Server rail item.
-      - Click Add rule.
-      - Set the Location matcher and one or more mock responses with status, headers, body, and optional delay.
-      - Save the rule and send matching traffic through the proxy.
+      - Click Add mock.
+      - Choose the mock type (HTTP, WebSocket, gRPC, or Tunnel) and set the Location matcher.
+      - "For HTTP: add one or more response variants (status, headers, body, delay); variants rotate on successive calls."
+      - "For WebSocket: set frame opcode and payload."
+      - "For gRPC: set the message payload and optional trailers."
+      - "For Tunnel: choose allow or deny for matching SOCKS5 tunnels."
+      - Use quick-add presets (200, 404, 500, 401, 429) to prefill common HTTP responses.
+      - Save the rule; the call count column shows hits with a proportional bar.
     use_when:
       - The user wants a fake response body/status/headers for an API.
-      - The user wants deterministic or sequential mock behavior.
+      - The user wants deterministic or sequential (rotating) mock behavior.
+      - The user wants to simulate WebSocket, gRPC, or SOCKS5 tunnel responses.
     read_tools: [get_rules]
     action_endpoints:
       - /admin/mock/rules
@@ -307,31 +341,43 @@ features:
     examples:
       - mock GET /users with a 200 JSON response
       - return 429 for /checkout with retry-after header
+      - mock a WebSocket connection to /ws
+      - mock a gRPC method
     notes:
-      - Use mock_server for synthetic HTTP responses; use map_local for filesystem fixtures.
+      - Use mock_server for synthetic responses; use map_local for serving files from disk.
       - Resetting call count requires confirmation.
-      - Prefer propose_mock_rule for creating new mock response rules.
+      - Prefer propose_mock_rule for HTTP response mocks.
+      - For WebSocket, gRPC, or Tunnel mocks, use propose_action with the full behavior payload (behavior.type = web_socket_script, grpc_script, or tunnel_decision).
+      - "WebSocket script: behavior.frames is an array of {opcode (1=text, 2=binary, 8=close, 9=ping, 10=pong), payload, delay_ms}; match with wire_protocol=websocket, body_mode=frames."
+      - "gRPC script: behavior.messages is an array of {payload_base64, compressed, delay_ms}; configured trailers (e.g. grpc-status) are surfaced as response headers and grpc-status defaults to 0. Match with application_protocol=grpc."
+      - "Tunnel decision: behavior.decision is {allow: true|false, delay_ms}; applies to SOCKS5 tunnels, match with wire_protocol=socks5, body_mode=tunnel."
 
   - id: compose_forward
     title: Compose and Forward
     category: network
-    purpose: Send manually composed HTTP requests through the admin forward endpoint and capture the result.
+    purpose: Send manually composed HTTP/gRPC/WebSocket requests through the admin forward endpoint and capture the result.
     ui_steps:
       - Open the Compose rail item.
-      - Enter method, URL, headers, and optional body.
+      - Each compose tab is independent; open multiple tabs for concurrent requests.
+      - Enter method, URL, headers, and optional body (or gRPC message, or WebSocket frame).
       - Send the request; the result is captured as an admin-forward session.
-      - From Sessions, you can also open a captured request in Compose or replay it.
+      - From Sessions, right-click or use the context menu to open a captured request in Compose for editing or replay.
     use_when:
       - The user wants to send a new request manually.
       - The user wants to replay or tweak a captured request outside the original client.
     read_tools: [list_sessions, get_session]
-    action_endpoints: [/admin/forward, /admin/playback]
+    action_endpoints: [/admin/forward, /admin/forward/websocket, /admin/playback]
     examples:
       - send a POST to https://api.example.com/login
+      - send a gRPC call to pkg.Service/Method
+      - send a WebSocket message to wss://echo.example.com and show the replies
       - replay all captured traffic
     notes:
       - Forwarding and playback are outbound network actions and require confirmation.
       - Admin egress policy may block private or loopback targets when remote admin is enabled.
+      - "HTTP forward: propose_action POST /admin/forward with method, url, headers, body."
+      - "gRPC forward: propose_action POST /admin/forward with kind=grpc, url, and body (the message payload); the body is wrapped in a gRPC frame and sent as POST with content-type application/grpc+proto."
+      - "WebSocket forward: propose_action POST /admin/forward/websocket with url (ws:// or wss://), optional headers, and frames (array of {opcode: text|binary|ping|pong|close, payload}); binary payloads are base64. Up to 10 server frames are collected before the socket is closed."
 
   - id: dns_overrides
     title: DNS Overrides
@@ -492,6 +538,33 @@ features:
       - decode JWT claims
     notes:
       - Inspector data is captured from matching traffic and is read-only.
+      - gRPC inspection decodes length-prefixed messages on streaming exchanges and records grpc-status / grpc-message when present.
+
+  - id: protocol_observability
+    title: Protocol Observability
+    category: observe
+    purpose: Understand which wire protocols (HTTP/1.1, HTTP/2, HTTP/3, WebSocket, SOCKS5) and application protocols (HTTP, gRPC, SSE, GraphQL) traffic uses, how connections multiplex streams, and the live protocol/latency mix.
+    ui_steps:
+      - Open the Sessions rail item; the protocol column shows the negotiated upstream protocol and is sortable.
+      - Use the wire/app protocol filters to focus on h1/h2/h3/SOCKS or HTTP/WS/gRPC/Tunnel traffic.
+      - Open the Connections rail item to see exchanges grouped by downstream connection with per-stream timelines and peak concurrency.
+      - Open the Dashboard rail item for the live protocol mix, sources, status classes, gRPC statuses, bytes, and latency percentiles.
+    use_when:
+      - The user asks which protocol a request used, whether HTTP/2 or HTTP/3 is being negotiated, or why everything shows HTTP/1.1.
+      - The user asks about connection reuse, multiplexing, or concurrent streams.
+      - The user wants traffic-wide protocol, latency, or gRPC status statistics.
+    read_tools: [get_protocol_metrics, get_connections, list_sessions, get_session]
+    action_endpoints: []
+    examples:
+      - how much of my traffic is HTTP/2
+      - show connections with multiplexed streams
+      - what is the p95 latency right now
+      - how many gRPC calls failed
+    notes:
+      - Sessions record both the downstream (client→proxy) protocol and the upstream (proxy→origin) negotiated protocol; they can differ.
+      - MITM advertises h2 + http/1.1 via ALPN, so HTTP/2 (and gRPC) work through interception; HTTP/3 requires the dedicated UDP listener.
+      - HAR exports carry the negotiated protocol and connection/stream identity.
+      - This area is read-only; use rules/mocks/breakpoints with wire_protocol, application_protocol, and body_mode matchers to act on specific protocols.
 
   - id: socks5
     title: SOCKS5 Listener
@@ -511,6 +584,48 @@ features:
       - how do I proxy a CLI through SOCKS5
     notes:
       - SOCKS5 status is read-only; listener configuration comes from runtime config.
+      - SOCKS5 tunnels are recorded as CONNECT sessions with open/close events and byte counts; TLS tunnels on known TLS ports are MITM-intercepted when enabled.
+      - Mock rules with behavior type tunnel_decision can allow or deny matching SOCKS5 tunnels (match on wire_protocol=socks5, body_mode=tunnel).
+
+  - id: http3
+    title: HTTP/3 Listener
+    category: setup
+    purpose: Accept HTTP/3 (QUIC) traffic on a dedicated UDP port and advertise it to clients via Alt-Svc (research preview).
+    ui_steps:
+      - Build oproxy with the http3 Cargo feature (not enabled in default builds).
+      - Set http3_enabled and http3_port in YAML config, or OPROXY_HTTP3_ENABLED / OPROXY_HTTP3_PORT env vars.
+      - Restart oproxy; forwarded responses then carry an alt-svc header advertising the h3 port, and clients that trust the oproxy CA can connect over QUIC.
+      - Confirm h3 sessions in Sessions via the protocol column or wire-protocol filter.
+    use_when:
+      - The user asks how to capture or test HTTP/3 / QUIC traffic.
+      - The user asks why no h3 sessions appear.
+    read_tools: [get_config, get_protocol_metrics]
+    action_endpoints: []
+    examples:
+      - enable HTTP/3
+      - why do I see no HTTP/3 traffic
+    notes:
+      - Requires a binary built with the http3 feature AND http3_enabled + http3_port config; otherwise the listener does not start and config validation warns.
+      - HTTP/3 uses UDP, so the port is independent of the TCP proxy port; clients must trust the oproxy CA for QUIC TLS.
+      - Listener configuration is config/env only; there is no admin endpoint to toggle it at runtime.
+
+  - id: telemetry
+    title: OpenTelemetry Export
+    category: integrate
+    purpose: Export one OpenTelemetry span per completed exchange, carrying protocol, connection/stream identity, latency, and gRPC status attributes.
+    ui_steps:
+      - Build oproxy with the otel Cargo feature.
+      - Set otel_enabled and otel_endpoint (OTLP collector, e.g. http://localhost:4317) in YAML config or OPROXY_OTEL_ENABLED / OPROXY_OTEL_ENDPOINT env vars.
+      - Restart oproxy and watch spans arrive in your collector; group by oproxy.connection_id to reconstruct connections.
+    use_when:
+      - The user wants proxy traffic visible in an observability stack (Jaeger, Grafana, etc.).
+    read_tools: [get_config]
+    action_endpoints: []
+    examples:
+      - export traffic spans to my OTLP collector
+    notes:
+      - Disabled by default; requires both the otel build feature and otel_enabled config, otherwise validation warns and nothing is exported.
+      - Configuration is config/env only; there is no admin endpoint to toggle it at runtime.
 
   - id: settings
     title: Runtime Settings
@@ -610,6 +725,47 @@ tools:
             resource:
               type: string
               enum: [all, rule_sets, map_remote, map_local, access, breakpoints, mock, scripts]
+
+  - name: get_protocol_metrics
+    category: read
+    description: Read aggregate protocol metrics over recorded sessions (protocol mix, websocket/gRPC counts, status classes, bytes, latency percentiles).
+    openai_spec:
+      type: function
+      function:
+        name: get_protocol_metrics
+        description: Read the live protocol dashboard aggregates. Use for questions about protocol mix (HTTP/1.1 vs HTTP/2 vs HTTP/3), WebSocket or gRPC counts, gRPC status distribution, total bytes, or latency percentiles (p50/p95/max).
+        parameters:
+          type: object
+          properties: {}
+
+  - name: get_connections
+    category: read
+    description: Read the connection-to-stream tree built from recorded exchanges (h2/h3 multiplexing view).
+    openai_spec:
+      type: function
+      function:
+        name: get_connections
+        description: List recorded downstream connections with their multiplexed streams, peak concurrency, and timing. Use for questions about connection reuse, HTTP/2 or HTTP/3 multiplexing, or which requests shared a connection.
+        parameters:
+          type: object
+          properties:
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 20
+              description: Maximum connections returned, most recently active first. Default 10.
+
+  - name: get_breakpoint_diagnostics
+    category: read
+    description: Read recent breakpoint diagnostics explaining why matching rules could not pause traffic.
+    openai_spec:
+      type: function
+      function:
+        name: get_breakpoint_diagnostics
+        description: Read diagnostics for breakpoint rules whose Location matched but whose tier was incompatible with the traffic (e.g. a body-tier breakpoint on a stream, frame, or tunnel). Use when the user asks why a breakpoint did not fire.
+        parameters:
+          type: object
+          properties: {}
 
   - name: get_throttling
     category: read
@@ -769,6 +925,15 @@ tools:
             protocol:
               type: string
               enum: [http, https]
+            wire_protocol:
+              type: string
+              enum: [http1, http2, http3, websocket, socks5]
+            application_protocol:
+              type: string
+              enum: [http, grpc, sse, graphql, json, binary]
+            body_mode:
+              type: string
+              enum: [empty, full, stream_bytes, stream_messages, frames, tunnel]
             port:
               type: integer
               minimum: 0
@@ -818,7 +983,7 @@ tools:
       type: function
       function:
         name: propose_mock_rule
-        description: Prepare a confirmed mock response rule. Use when the user asks to return fake/synthetic HTTP responses.
+        description: Prepare a confirmed HTTP mock response rule (http_response type). Use for HTTP status/headers/body mocks with optional multi-variant rotation. For WebSocket, gRPC, or tunnel mocks use propose_action with a full behavior payload instead.
         parameters:
           type: object
           properties:
@@ -838,6 +1003,15 @@ tools:
             protocol:
               type: string
               enum: [http, https]
+            wire_protocol:
+              type: string
+              enum: [http1, http2, http3, websocket, socks5]
+            application_protocol:
+              type: string
+              enum: [http, grpc, sse, graphql, json, binary]
+            body_mode:
+              type: string
+              enum: [empty, full, stream_bytes, stream_messages, frames, tunnel]
             port:
               type: integer
               minimum: 0
@@ -873,7 +1047,7 @@ tools:
               minItems: 1
               items:
                 type: object
-                required: [status, headers, body, delay_ms]
+                required: [status, headers, body]
                 properties:
                   status:
                     type: integer
@@ -920,6 +1094,15 @@ tools:
             protocol:
               type: string
               enum: [http, https]
+            wire_protocol:
+              type: string
+              enum: [http1, http2, http3, websocket, socks5]
+            application_protocol:
+              type: string
+              enum: [http, grpc, sse, graphql, json, binary]
+            body_mode:
+              type: string
+              enum: [empty, full, stream_bytes, stream_messages, frames, tunnel]
             port:
               type: integer
               minimum: 0
@@ -990,7 +1173,7 @@ tools:
               enum: [POST, PUT, DELETE]
             endpoint:
               type: string
-              description: "Allowlisted oproxy admin endpoint path. Allowed bases: /admin/rule-sets, /admin/map-remote-rules, /admin/map-local-rules, /admin/access-rules, /admin/throttling, /admin/breakpoints, /admin/mock/rules, /admin/scripts, /admin/dns, /admin/capture-filter, /admin/upstream-proxy, /admin/webhooks, /admin/forward, /admin/playback, /admin/sessions. PUT/DELETE may append /{id}."
+              description: "Allowlisted oproxy admin endpoint path. Allowed bases: /admin/rule-sets, /admin/map-remote-rules, /admin/map-local-rules, /admin/access-rules, /admin/throttling, /admin/breakpoints, /admin/mock/rules, /admin/scripts, /admin/dns, /admin/capture-filter, /admin/upstream-proxy, /admin/webhooks, /admin/forward, /admin/forward/websocket, /admin/playback, /admin/sessions. PUT/DELETE may append /{id}."
             summary:
               type: string
             payload:

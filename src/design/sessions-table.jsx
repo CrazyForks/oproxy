@@ -22,12 +22,13 @@ const statusBucket = (s) => {
   if (s === 0) return '-';
   return String(s)[0];
 };
-// Compact label for the negotiated protocol, e.g. "HTTP/2" → "H2".
+// Compact label for the negotiated wire protocol, e.g. "HTTP/2" → "H2".
 const protoShort = (p) => {
   if (!p) return '—';
   if (p === 'HTTP/1.1' || p === 'HTTP/1.0') return '1.1';
   if (p === 'HTTP/2') return 'H2';
   if (p === 'HTTP/3') return 'H3';
+  if (p === 'SOCKS5') return 'SOCKS';
   return p.replace(/^HTTP\//, '');
 };
 // Stable bucket used for the badge colour/data attribute.
@@ -35,7 +36,29 @@ const protoBucket = (p) => {
   if (p === 'HTTP/2') return 'h2';
   if (p === 'HTTP/3') return 'h3';
   if (p === 'HTTP/1.1' || p === 'HTTP/1.0') return 'h1';
+  if (p === 'SOCKS5') return 'socks';
   return 'other';
+};
+
+const appShort = (p) => {
+  if (p === 'WebSocket') return 'WS';
+  if (p === 'gRPC') return 'gRPC';
+  if (p === 'Tunnel') return 'TUNNEL';
+  return p || 'HTTP';
+};
+const appBucket = (p) => {
+  if (p === 'WebSocket') return 'ws';
+  if (p === 'gRPC') return 'grpc';
+  if (p === 'Tunnel') return 'socks';
+  return 'other';
+};
+const contentLabel = (value) => {
+  const v = String(value || 'http').toLowerCase();
+  if (v === 'ws') return 'FRAMES';
+  if (v === 'grpc') return 'PROTO';
+  if (v === 'pending') return '—';
+  if (v === 'tunnel') return 'BYTES';
+  return v.toUpperCase();
 };
 
 window.fmtBytes = fmtBytes;
@@ -72,8 +95,10 @@ const COLUMN_DEFS = [
   { key: 'status',    label: 'STATUS',    sortKey: 'status',  defaultWidth: 62,  align: 'left'   },
   { key: 'host',      label: 'HOST',      sortKey: 'host',    defaultWidth: 180, align: 'left'   },
   { key: 'path',      label: 'PATH',      sortKey: 'path',    defaultWidth: null, align: 'left'  }, // flex — gets remaining space
-  { key: 'type',      label: 'TYPE',      sortKey: 'type',    defaultWidth: 56,  align: 'left'   },
-  { key: 'proto',     label: 'PROTO',     sortKey: 'protocol', defaultWidth: 52, align: 'center', tooltip: 'Negotiated HTTP protocol' },
+  { key: 'app',       label: 'APP',       sortKey: null,      defaultWidth: 72,  align: 'center', tooltip: 'Application family' },
+  { key: 'proto',     label: 'WIRE',      sortKey: 'protocol', defaultWidth: 68, align: 'center', tooltip: 'Downstream wire protocol' },
+  { key: 'type',      label: 'CONTENT',   sortKey: 'type',    defaultWidth: 72,  align: 'left', tooltip: 'Payload/content shape' },
+  { key: 'source',    label: 'SOURCE',    sortKey: null,      defaultWidth: 76,  align: 'left', tooltip: 'Capture source' },
   { key: 'tls',       label: 'TLS',       sortKey: null,      defaultWidth: 40,  align: 'center', tooltip: 'Transport security' },
   { key: 'size',      label: 'SIZE',      sortKey: 'reqSize', defaultWidth: 68,  align: 'right'  },
   { key: 'time',      label: 'TIME',      sortKey: 'total',   defaultWidth: 72,  align: 'right'  },
@@ -94,9 +119,65 @@ function saveColWidths(widths) {
   try { localStorage.setItem(COL_STORAGE_KEY, JSON.stringify(widths)); } catch {}
 }
 
+// ── Context menu for creating rules/mocks/breakpoints from sessions ───────────
+
+function SessionContextMenu({ x, y, session, onClose }) {
+  const ref = React.useRef(null);
+
+  React.useEffect(() => {
+    const dismiss = (e) => { if (ref.current && !ref.current.contains(e.target)) onClose(); };
+    document.addEventListener('mousedown', dismiss);
+    document.addEventListener('scroll', onClose, true);
+    return () => { document.removeEventListener('mousedown', dismiss); document.removeEventListener('scroll', onClose, true); };
+  }, [onClose]);
+
+  const dispatch = (action) => {
+    const loc = {
+      host: session.host || '',
+      path: session.path || '.*',
+      methods: session.method && session.method !== '*' && !['CONNECT'].includes(session.method)
+        ? [session.method] : undefined,
+      mode: 'glob',
+    };
+    const prefill = { location: loc, name: `${action === 'mock' ? 'Mock' : action === 'rule' ? 'Rewrite' : 'BP'} ${session.method || ''} ${session.host || ''}${session.path || '/'}`.trim() };
+    window.dispatchEvent(new CustomEvent('oproxy:create-from-session', { detail: { action, prefill } }));
+    onClose();
+  };
+
+  return (
+    <div
+      ref={ref}
+      style={{
+        position: 'fixed', left: x, top: y, zIndex: 9999,
+        background: 'var(--surface-2, #2a2a2a)', border: '1px solid var(--border)',
+        borderRadius: 6, boxShadow: '0 4px 16px rgba(0,0,0,0.4)', padding: '4px 0',
+        minWidth: 190, fontSize: 12,
+      }}
+      onClick={e => e.stopPropagation()}>
+      <div style={{ padding: '3px 10px 5px', fontSize: 10, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.08em', borderBottom: '1px solid var(--border-soft)', marginBottom: 3 }}>
+        {session.method} {session.host}{session.path}
+      </div>
+      {[
+        ['mock',       '🔲 Create mock rule'],
+        ['rule',       '✏️ Add rewrite rule'],
+        ['breakpoint', '⏸ Add breakpoint'],
+      ].map(([action, label]) => (
+        <button key={action}
+          style={{ display: 'block', width: '100%', textAlign: 'left', padding: '6px 14px', background: 'none', border: 'none', color: 'var(--text)', cursor: 'pointer', fontSize: 12 }}
+          onMouseEnter={e => e.currentTarget.style.background = 'var(--surface-hi, rgba(255,255,255,0.07))'}
+          onMouseLeave={e => e.currentTarget.style.background = 'none'}
+          onClick={() => dispatch(action)}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function SessionsTable({ sessions, selectedId, onSelect, sort, onSort, bulkSel, onBulkToggle, onBulkToggleAll, emptyState }) {
   const maxTotal = Math.max(...sessions.map(s => s.total), 1);
   const hasBulk = !!onBulkToggle;
+  const [contextMenu, setContextMenu] = React.useState(null); // {x, y, session}
   const allChecked = hasBulk && sessions.length > 0 && sessions.every(s => bulkSel?.has(s.id));
 
   // ── Column widths (localStorage-backed) ───────────────────────────────────
@@ -173,7 +254,7 @@ function SessionsTable({ sessions, selectedId, onSelect, sort, onSort, bulkSel, 
   };
 
   return (
-    <div className="table-wrap" role="grid">
+    <div className="table-wrap" role="grid" onClick={() => contextMenu && setContextMenu(null)}>
       <table className="t">
         <colgroup>
           {hasBulk && <col style={{ width: '28px' }} />}
@@ -208,16 +289,17 @@ function SessionsTable({ sessions, selectedId, onSelect, sort, onSort, bulkSel, 
                     s.paused  ? 'paused'  : '',
                     s.pending ? 'pending' : '',
                   ].filter(Boolean).join(' ')}
-                  onClick={() => onSelect(s.id)}>
+                  onClick={() => onSelect(s.id)}
+                  onContextMenu={e => { e.preventDefault(); setContextMenu({ x: e.clientX, y: e.clientY, session: s }); }}>
                 {hasBulk && (
                   <td className="cell-check" onClick={(e) => e.stopPropagation()}>
                     <input type="checkbox"
-                           aria-label={`Select session ${s.method} ${s.status || 'pending'} ${s.host}${s.path}`}
+                           aria-label={`Select session ${s.displayMethod || s.method} ${s.status || 'pending'} ${s.host}${s.path}`}
                            checked={bulkSel?.has(s.id) || false}
                            onChange={() => onBulkToggle(s.id)} />
                   </td>
                 )}
-                <td><span className="cell-method" data-m={s.method}>{s.method}</span></td>
+                <td><span className="cell-method" data-m={s.displayMethod || s.method}>{s.displayMethod || s.method}</span></td>
                 <td>
                   <span className="cell-status" data-c={s.paused ? 'bp' : bucket}>
                     {s.paused ? '⏸' : s.pending ? '···' : (s.status || '—')}
@@ -234,11 +316,16 @@ function SessionsTable({ sessions, selectedId, onSelect, sort, onSort, bulkSel, 
                   {s.tags.includes('ws')      && <span className="tag-badge ws">WS</span>}
                   {s.tags.includes('sse')     && <span className="tag-badge sse">SSE</span>}
                 </td>
-                <td className="cell-type">{s.type}</td>
                 <td>
                   {(s.paused || s.pending) ? <span className="dim">—</span>
-                    : <span className="proto-badge" data-proto={protoBucket(s.proto)} title={s.proto}>{protoShort(s.proto)}</span>}
+                    : <span className="proto-badge" data-proto={appBucket(s.appProtocol)} title={s.appProtocol}>{appShort(s.appProtocol)}</span>}
                 </td>
+                <td>
+                  {(s.paused || s.pending) ? <span className="dim">—</span>
+                    : <span className="proto-badge" data-proto={protoBucket(s.wireProtocol)} title={s.wireProtocol}>{protoShort(s.wireProtocol)}</span>}
+                </td>
+                <td className="cell-type">{contentLabel(s.type)}</td>
+                <td className="cell-type" title={s.sourceLabel}>{s.sourceLabel}</td>
                 <td><span className={'tls-cell ' + tls}>{tls === 'ok' ? '🔒' : tls === 'tunnel' ? '⇿' : '○'}</span></td>
                 <td className="cell-num">{fmtBytes(s.resSize || s.reqSize)}</td>
                 <td className="cell-num">{(s.paused || s.pending) ? '—' : fmtMs(s.total)}</td>
@@ -260,6 +347,11 @@ function SessionsTable({ sessions, selectedId, onSelect, sort, onSort, bulkSel, 
           )}
         </tbody>
       </table>
+      {contextMenu && (
+        <SessionContextMenu
+          x={contextMenu.x} y={contextMenu.y} session={contextMenu.session}
+          onClose={() => setContextMenu(null)} />
+      )}
     </div>
   );
 }

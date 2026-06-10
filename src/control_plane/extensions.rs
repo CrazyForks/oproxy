@@ -41,18 +41,22 @@ pub(super) async fn update_mock_rule(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Json(updated): axum::extract::Json<MockRule>,
 ) -> impl IntoResponse {
-    let mut rules = state.mock_rules.write().await;
-    if let Some(r) = rules.iter_mut().find(|r| r.id == id) {
-        let preserved_count = r.call_count;
-        *r = updated;
-        r.call_count = preserved_count;
-        if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules).await {
-            return storage_error_response(e);
+    let updated_rule = {
+        let mut rules = state.mock_rules.write().await;
+        if let Some(r) = rules.iter_mut().find(|r| r.id == id) {
+            let preserved_count = r.call_count;
+            *r = updated;
+            r.call_count = preserved_count;
+            r.clone()
+        } else {
+            return (axum::http::StatusCode::NOT_FOUND, "mock rule not found").into_response();
         }
-        axum::Json(serde_json::json!({ "ok": true })).into_response()
-    } else {
-        (axum::http::StatusCode::NOT_FOUND, "mock rule not found").into_response()
+    };
+    let rules = state.mock_rules.read().await;
+    if let Err(e) = storage::save_mock_rules(&state.storage_path, &rules).await {
+        return storage_error_response(e);
     }
+    axum::Json(updated_rule).into_response()
 }
 
 pub(super) async fn delete_mock_rule(

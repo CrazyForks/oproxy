@@ -45,6 +45,7 @@ tests/browser/.yarn/install-state.gz
 # ── AI assistant workspace files ───────────────────────────────────────────────
 .roo/
 .claude/
+.commandcode/
 
 # ── Environment overrides ──────────────────────────────────────────────────────
 .env
@@ -64,3 +65,6 @@ src/design/certs/root.crt
 src/design/certs/root.key
 .gstack/
 tests/__generated_grpc__/
+
+tests/__pycache__/
+tests/fixtures/__pycache__/

@@ -118,6 +118,7 @@ mod tests {
             }),
             source: Default::default(),
             ws_frames: vec![],
+            events: vec![],
             note: None,
             tags: vec![],
             inspector_data: None,
@@ -125,6 +126,7 @@ mod tests {
             connection_id: Some("conn-9".to_string()),
             stream_id: Some(3),
             downstream_protocol: Some("HTTP/3".to_string()),
+            protocol_context: None,
         }
     }
 

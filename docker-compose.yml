@@ -11,6 +11,7 @@ services:
     #   - "8080:8080"   # HTTP proxy + admin UI
     #   - "8443:8443"   # HTTPS proxy listener (if OPROXY_HTTPS_PORT is set)
     #   - "1080:1080"   # SOCKS5 listener (if socks5_port is set in YAML config)
+    #   - "8443:8443/udp" # HTTP/3 (QUIC) listener (OPROXY_HTTP3_PORT)
 
     environment:
       # ── Core ─────────────────────────────────────────────────────────────────
@@ -29,6 +30,15 @@ services:
       # OPROXY_HTTPS_PORT: "8443"
       # SOCKS5 and upstream proxy chain have no env var override; configure them
       # in the YAML config file mounted at /app/configs/default.yaml (see volumes).
+      # HTTP/3 (QUIC) listener on a dedicated UDP port. The Docker image is built
+      # with --all-features, so the http3 feature is available; both env vars are
+      # required for the listener to start. Forwarded responses advertise it via
+      # alt-svc. Clients must trust the oproxy root CA for QUIC TLS.
+      OPROXY_HTTP3_ENABLED: "true"
+      OPROXY_HTTP3_PORT: "8443"
+      # SOCKS5 port currently comes from YAML (`socks5_port`); if/when an env var
+      # override lands, keep it aligned with the bridge port mapping above.
+      # OPROXY_SOCKS5_PORT: "1080"
 
       # ── Admin security ────────────────────────────────────────────────────────
       # Allow the admin UI/API to be reached from non-loopback clients (phones, VMs).
@@ -87,7 +97,7 @@ services:
       # reqwest's certificate store does not trust by default. It is also useful when
       # targeting dev servers with self-signed certs.
       # WARNING: disables all upstream cert validation — do not use in production.
-      OPROXY_INSECURE_UPSTREAM: 0
+      OPROXY_INSECURE_UPSTREAM: 1
 
     volumes:
       # ── Persistent data ───────────────────────────────────────────────────────
@@ -111,6 +121,30 @@ services:
 
     restart: unless-stopped
 
+  # ── Protocol fixtures (optional) ────────────────────────────────────────────
+  # Stable local protocol origins for testing oproxy without external services.
+  # Started only with the "fixtures" profile:
+  #   docker compose --profile fixtures up --build
+  # See docs/docker.md § Protocol Fixtures for the port/URL table.
+  protocol-fixtures:
+    profiles: ["fixtures"]
+    build:
+      context: .
+      dockerfile: tests/fixtures/Dockerfile
+    # Publish on host loopback so host-network oproxy, browser tests, and local
+    # CLI clients all target the same addresses (see docs/docker.md).
+    ports:
+      - "127.0.0.1:18080:18080" # HTTP/1.1 origin
+      - "127.0.0.1:18443:18443" # HTTP/2 TLS origin
+      - "127.0.0.1:18081:18081" # WebSocket echo origin
+      - "127.0.0.1:19090:19090" # gRPC TLS echo origin
+    volumes:
+      # Self-signed origin CAs written by the fixture container; trust these when
+      # connecting directly to the TLS fixtures (not through oproxy MITM).
+      - protocol-fixture-certs:/fixtures/certs
+    restart: unless-stopped
+
 volumes:
   oproxy-certs:
   oproxy-storage:
+  protocol-fixture-certs:

@@ -15,19 +15,21 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::debug;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, watch};
 
 use crate::core::engine::ProxyEngine;
+use crate::middleware::plugins::dns_override::DnsOverrides;
+use crate::middleware::plugins::mock::{MockBehavior, SharedMockRules, TunnelDecision};
 use crate::transport::lifecycle::wait_for_shutdown;
 use crate::transport::tls::{is_tls_port, mitm_intercept};
 
 #[derive(Clone)]
 pub struct ProxySocks5Service {
     pub engine: Arc<ProxyEngine>,
-    pub dns: Arc<RwLock<HashMap<String, String>>>,
+    pub dns: Arc<RwLock<DnsOverrides>>,
+    pub mock_rules: SharedMockRules,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
 }
@@ -51,6 +53,24 @@ impl ProxySocks5Service {
         };
 
         let resolved = resolve_target(target, self.dns.clone()).await;
+        if let Some((rule_id, decision)) = self.tunnel_decision_for(&resolved).await {
+            if decision.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(decision.delay_ms)).await;
+            }
+            self.engine
+                .record_socks5_mock_served(
+                    &resolved.host,
+                    resolved.port,
+                    rule_id,
+                    "tunnel_decision".to_string(),
+                )
+                .await;
+            if !decision.allow {
+                let _ = send_failure_reply(&mut stream, 0x02).await;
+                return;
+            }
+        }
+
         if self.engine.mitm_enabled
             && is_tls_port(resolved.port)
             && let Some(ca) = self.engine.ca.clone()
@@ -74,12 +94,29 @@ impl ProxySocks5Service {
             return;
         }
 
+        // Record the session at OPEN time so long-lived tunnels are visible in
+        // the dashboard while active and the close-time latency reflects the
+        // real tunnel duration (recording both events at close made it ~0 ms).
+        let session_id = self
+            .engine
+            .record_socks5_tunnel_opened(&resolved.host, resolved.port)
+            .await;
+
         let connection = tunnel_with_connect_timeout(stream, &resolved, self.connect_timeout);
         tokio::pin!(connection);
         tokio::select! {
             res = &mut connection => {
-                if let Err(e) = res {
-                    tracing::debug!(error=%e, "SOCKS5 tunnel error");
+                let (bytes_up, bytes_down) = match res {
+                    Ok(counts) => counts,
+                    Err(e) => {
+                        tracing::debug!(error=%e, "SOCKS5 tunnel error");
+                        (0, 0)
+                    }
+                };
+                if let Some(session_id) = session_id {
+                    self.engine
+                        .record_socks5_tunnel_closed(&session_id, bytes_up, bytes_down)
+                        .await;
                 }
             }
             _ = wait_for_shutdown(&mut shutdown) => {
@@ -87,17 +124,59 @@ impl ProxySocks5Service {
             }
         }
     }
+
+    async fn tunnel_decision_for(&self, target: &Socks5Target) -> Option<(String, TunnelDecision)> {
+        let ctx = socks5_request_context(target);
+        let snapshots = {
+            let rules = self.mock_rules.read().await;
+            rules
+                .iter()
+                .filter(|rule| rule.enabled)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for rule in snapshots {
+            let Some(MockBehavior::TunnelDecision { decision }) = rule.behavior.clone() else {
+                continue;
+            };
+            if !rule.matches(&ctx) {
+                continue;
+            }
+            // Look the live rule up by id, not snapshot index (rules may have
+            // been edited/reordered concurrently).
+            let mut rules = self.mock_rules.write().await;
+            if let Some(live) = rules.iter_mut().find(|r| r.id == rule.id) {
+                live.call_count += 1;
+            }
+            return Some((rule.id, decision));
+        }
+        None
+    }
 }
 
-async fn resolve_target(
-    target: Socks5Target,
-    dns: Arc<RwLock<HashMap<String, String>>>,
-) -> Socks5Target {
+fn socks5_request_context(target: &Socks5Target) -> crate::middleware::RequestContext {
+    crate::middleware::RequestContext {
+        method: "CONNECT".to_string(),
+        uri: format!("socks5://{}:{}", target.host, target.port),
+        host: target.host.clone(),
+        protocol_context: Some(crate::core::forward::ProtocolContext::socks5_tunnel()),
+        downstream_protocol: Some(
+            crate::core::forward::WireProtocol::Socks5
+                .label()
+                .to_string(),
+        ),
+        ..Default::default()
+    }
+}
+
+async fn resolve_target(target: Socks5Target, dns: Arc<RwLock<DnsOverrides>>) -> Socks5Target {
     let resolved_host = {
         let overrides = dns.read().await;
         overrides
             .get(&target.host)
-            .cloned()
+            .filter(|e| e.enabled)
+            .map(|e| e.ip.clone())
             .unwrap_or_else(|| target.host.clone())
     };
     Socks5Target {
@@ -259,7 +338,7 @@ pub async fn tunnel_with_connect_timeout(
     mut client: TcpStream,
     target: &Socks5Target,
     connect_timeout: Duration,
-) -> Result<(), Socks5Error> {
+) -> Result<(u64, u64), Socks5Error> {
     let addr = connect_addr(target);
     let mut upstream = match timeout(connect_timeout, TcpStream::connect(&addr)).await {
         Ok(Ok(upstream)) => upstream,
@@ -273,23 +352,75 @@ pub async fn tunnel_with_connect_timeout(
         }
     };
     send_success_reply(&mut client).await?;
-    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+    let (bytes_up, bytes_down) = tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await
         .map_err(|_| Socks5Error::Io)?;
-    Ok(())
+    Ok((bytes_up, bytes_down))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::matcher::{Location, MatchMode};
+    use crate::middleware::plugins::dns_override::{DnsEntry, DnsOverrides};
+    use crate::middleware::plugins::mock::MockRule;
+    use std::collections::HashMap;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
+    fn test_engine() -> Arc<ProxyEngine> {
+        Arc::new(ProxyEngine::new(
+            Arc::new(RwLock::new(crate::middleware::chain::MiddlewareChain::new())),
+            None,
+            false,
+            8080,
+            "127.0.0.1".to_string(),
+            30,
+            10 * 1024 * 1024,
+            10,
+            30,
+            None,
+        ))
+    }
+
+    fn test_service_with_mock_rules(rules: Vec<MockRule>) -> ProxySocks5Service {
+        ProxySocks5Service {
+            engine: test_engine(),
+            dns: Arc::new(RwLock::new(DnsOverrides::new())),
+            mock_rules: Arc::new(RwLock::new(rules)),
+            connect_timeout: Duration::from_millis(50),
+            handshake_timeout: Duration::from_millis(50),
+        }
+    }
+
+    fn tunnel_rule(id: &str, host: &str, allow: bool, delay_ms: u64) -> MockRule {
+        MockRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            location: Location {
+                host: Some(host.to_string()),
+                mode: MatchMode::Glob,
+                wire_protocol: Some("socks5".to_string()),
+                body_mode: Some("tunnel".to_string()),
+                ..Default::default()
+            },
+            behavior: Some(MockBehavior::TunnelDecision {
+                decision: TunnelDecision { allow, delay_ms },
+            }),
+            responses: Vec::new(),
+            call_count: 0,
+        }
+    }
+
     #[tokio::test]
     async fn resolve_target_applies_dns_override_without_changing_port() {
-        let dns = Arc::new(RwLock::new(HashMap::from([(
+        let dns = Arc::new(RwLock::new(DnsOverrides::from([(
             "example.test".to_string(),
-            "127.0.0.1".to_string(),
+            DnsEntry {
+                ip: "127.0.0.1".to_string(),
+                enabled: true,
+            },
         )])));
         let resolved = resolve_target(
             Socks5Target {
@@ -302,6 +433,48 @@ mod tests {
 
         assert_eq!(resolved.host, "127.0.0.1");
         assert_eq!(resolved.port, 8443);
+    }
+
+    #[tokio::test]
+    async fn tunnel_decision_matches_socks5_target_and_increments_count() {
+        let service =
+            test_service_with_mock_rules(vec![tunnel_rule("deny-api", "api.test", false, 25)]);
+
+        let (rule_id, decision) = service
+            .tunnel_decision_for(&Socks5Target {
+                host: "api.test".to_string(),
+                port: 443,
+            })
+            .await
+            .expect("matching tunnel rule");
+
+        assert_eq!(rule_id, "deny-api");
+        assert!(!decision.allow);
+        assert_eq!(decision.delay_ms, 25);
+        assert_eq!(service.mock_rules.read().await[0].call_count, 1);
+    }
+
+    #[tokio::test]
+    async fn tunnel_decision_ignores_legacy_http_mock_rules() {
+        let mut rule = tunnel_rule("http-only", "api.test", false, 0);
+        rule.behavior = None;
+        rule.responses = vec![crate::middleware::plugins::mock::MockResponse {
+            status: 200,
+            headers: HashMap::new(),
+            body: "nope".to_string(),
+            delay_ms: 0,
+        }];
+        let service = test_service_with_mock_rules(vec![rule]);
+
+        assert!(
+            service
+                .tunnel_decision_for(&Socks5Target {
+                    host: "api.test".to_string(),
+                    port: 443,
+                })
+                .await
+                .is_none()
+        );
     }
 
     /// Build a raw SOCKS5 no-auth greeting + IPv4 CONNECT request.

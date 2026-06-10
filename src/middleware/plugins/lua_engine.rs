@@ -351,6 +351,7 @@ impl Middleware for LuaEngineMiddleware {
                 headers,
                 body: Bytes::from(body),
                 tags: Vec::new(),
+                served_mock: None,
             });
             return MiddlewareAction::StopAndReturn;
         }

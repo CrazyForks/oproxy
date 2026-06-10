@@ -40,13 +40,14 @@ use assistant::{
 pub use auth::proxy_dispatch_layer;
 use auth::{admin_auth_layer, security_headers};
 use breakpoints::{
-    add_bp_rule, delete_bp_rule, list_bp_rules, list_pending_bp, resolve_bp, update_bp_rule,
+    add_bp_rule, delete_bp_rule, list_bp_diagnostics, list_bp_rules, list_pending_bp, resolve_bp,
+    update_bp_rule,
 };
 use extensions::{
     create_mock_rule, create_script, delete_mock_rule, delete_script, list_mock_rules,
     list_plugins, list_scripts, reset_mock_rule, start_playback, update_mock_rule, update_script,
 };
-use forward::forward_request;
+use forward::{forward_request, forward_websocket};
 use login::{get_login, post_login};
 pub(crate) use metrics::{SharedEndpointMetrics, new_endpoint_metrics};
 use metrics::{build_metrics_payload, endpoint_timing_payload, record_endpoint_timing};
@@ -55,9 +56,10 @@ use policy::{
     delete_access_rule, delete_dns, delete_map_local_fixture, delete_map_local_rule,
     delete_map_remote_rule, delete_rule_set, get_capture_filter, get_map_local_fixture,
     get_rule_set, get_throttling, list_access_rules, list_dns, list_map_local_fixtures,
-    list_map_local_rules, list_map_remote_rules, list_rule_sets, update_access_rule,
-    update_capture_filter, update_dns, update_map_local_rule, update_map_remote_rule,
-    update_rule_set, update_throttling, upload_map_local_fixture,
+    list_map_local_rules, list_map_remote_rules, list_rule_sets, reorder_rule_sets,
+    test_map_remote, update_access_rule, update_capture_filter, update_dns, update_map_local_rule,
+    update_map_remote_rule, update_rule_set, update_throttling, upload_map_local_fixture,
+    upsert_dns,
 };
 use sessions::{
     annotate_session, clear_sessions, diff_sessions, export_har, export_session, get_session,
@@ -107,7 +109,9 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/admin/throttling",
-            get(get_throttling).post(update_throttling),
+            get(get_throttling)
+                .put(update_throttling)
+                .post(update_throttling),
         )
         .route(
             "/admin/access-rules",
@@ -122,6 +126,10 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
             get(list_rule_sets).post(create_rule_set),
         )
         .route(
+            "/admin/rule-sets/reorder",
+            axum::routing::patch(reorder_rule_sets),
+        )
+        .route(
             "/admin/rule-sets/{id}",
             get(get_rule_set)
                 .put(update_rule_set)
@@ -132,6 +140,7 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
         .route("/admin/playback", axum::routing::post(start_playback))
         .route("/admin/breakpoints", get(list_bp_rules).post(add_bp_rule))
         .route("/admin/breakpoints/pending", get(list_pending_bp))
+        .route("/admin/breakpoints/diagnostics", get(list_bp_diagnostics))
         .route(
             "/admin/breakpoints/pending/{id}/resolve",
             axum::routing::post(resolve_bp),
@@ -148,7 +157,10 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
             get(get_capture_filter).post(update_capture_filter),
         )
         .route("/admin/dns", get(list_dns).post(update_dns))
-        .route("/admin/dns/{host}", axum::routing::delete(delete_dns))
+        .route(
+            "/admin/dns/{host}",
+            axum::routing::put(upsert_dns).delete(delete_dns),
+        )
         .route(
             "/admin/map-local-rules",
             get(list_map_local_rules).post(create_map_local_rule),
@@ -172,10 +184,18 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
             get(list_map_remote_rules).post(create_map_remote_rule),
         )
         .route(
+            "/admin/map-remote-rules/test",
+            axum::routing::post(test_map_remote),
+        )
+        .route(
             "/admin/map-remote-rules/{id}",
             axum::routing::put(update_map_remote_rule).delete(delete_map_remote_rule),
         )
         .route("/admin/forward", axum::routing::post(forward_request))
+        .route(
+            "/admin/forward/websocket",
+            axum::routing::post(forward_websocket),
+        )
         .route(
             "/admin/upstream-proxy",
             get(get_upstream_proxy).post(set_upstream_proxy_handler),

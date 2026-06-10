@@ -12,8 +12,12 @@ cases:
       method: POST
       endpoint: /admin/dns
       payload:
-        old.test.com: 10.0.0.1
-        api.test.com: 10.0.0.5
+        old.test.com:
+          ip: 10.0.0.1
+          enabled: true
+        api.test.com:
+          ip: 10.0.0.5
+          enabled: true
 
   - id: dns_delete_single_host
     prompt: delete DNS override for api.test.com
@@ -119,6 +123,73 @@ cases:
       payload:
         mode: allowlist
         hosts: [api.example.com]
+
+  - id: rewrite_grpc_protocol_match
+    prompt: add header x-debug=yes to gRPC calls over HTTP/2
+    expected_tool: propose_rewrite_rule
+    args:
+      wire_protocol: HTTP2
+      application_protocol: GRPC
+      applies_to: request
+      actions:
+        - type: set_header
+          name: x-debug
+          value: yes
+    expected_action:
+      method: POST
+      endpoint: /admin/rule-sets
+      payload:
+        location:
+          wire_protocol: http2
+          application_protocol: grpc
+        applies_to: request
+        actions:
+          - type: set_header
+            name: x-debug
+            value: yes
+
+  - id: mock_grpc_application_match
+    prompt: mock the gRPC method pkg.Svc/List with an empty 200
+    expected_tool: propose_mock_rule
+    args:
+      path: /pkg.Svc/List
+      application_protocol: grpc
+      body_mode: stream_messages
+      status: 200
+      content_type: application/grpc
+      body: ""
+    expected_action:
+      method: POST
+      endpoint: /admin/mock/rules
+      payload:
+        location:
+          path: /pkg.Svc/List
+          application_protocol: grpc
+          body_mode: stream_messages
+        responses:
+          - status: 200
+            headers:
+              content-type: application/grpc
+            body: ""
+            delay_ms: 0
+
+  - id: access_block_socks5_tunnels
+    prompt: block SOCKS5 tunnels to internal.example.com
+    expected_tool: propose_access_rule
+    args:
+      action: block
+      host: internal.example.com
+      wire_protocol: socks5
+      body_mode: tunnel
+    expected_action:
+      method: POST
+      endpoint: /admin/access-rules
+      payload:
+        location:
+          host: internal.example.com
+          wire_protocol: socks5
+          body_mode: tunnel
+        action: block
 
   - id: upstream_proxy_set
     prompt: set upstream proxy to http://proxy.local:3128

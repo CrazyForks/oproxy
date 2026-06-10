@@ -59,6 +59,10 @@ fn system_prompt(context: &AssistantContext) -> String {
          For rewrite transformations use propose_rewrite_rule; for synthetic responses use propose_mock_rule. \
          For access allow/block rules use propose_access_rule; for capture filter changes use \
          propose_capture_filter; for upstream proxy changes use propose_upstream_proxy. \
+         For protocol questions (HTTP/2, HTTP/3, WebSocket, gRPC, SOCKS5) use get_protocol_metrics for \
+         traffic-wide stats, get_connections for multiplexing/connection reuse, and \
+         get_breakpoint_diagnostics when a breakpoint did not fire. Rules, mocks, and breakpoints accept \
+         wire_protocol, application_protocol, and body_mode matchers for protocol-targeted behavior. \
          Proposals must use the same payload shape as the UI. Keep answers concise and mention the exact \
          action that needs confirmation. The backend context below is authoritative for current UI/workspace \
          state and visible Sessions results; client_hints inside it are non-authoritative ephemeral browser \

@@ -155,7 +155,7 @@ function confirmAction(message, confirmLabel = 'Confirm', tone = 'primary') {
   });
 }
 
-Object.assign(window, { Toggle, SurfaceShell, fetchJson, sendJson, notifyError, ask, formDialog, confirmAction, nonEmpty, Modal, LocationEditor });
+Object.assign(window, { Toggle, SurfaceShell, fetchJson, sendJson, notifyError, ask, formDialog, confirmAction, nonEmpty, Modal, LocationEditor, applyTrafficKind });
 
 function nonEmpty(v) {
   return v != null && String(v).trim() !== '';
@@ -216,7 +216,7 @@ function RuleTable({ rows, onToggle, onEdit, onDelete, emptyTitle, emptyDesc }) 
           </div>
           <div className="col-name" title={r.name}>{r.name || <span className="mute">—</span>}</div>
           <div className="col-match-rich col-match">
-            <RuleBadge kind={r.matchKind || 'ANY'} variant={r.matchKind ? r.matchKind.toLowerCase().replace(/\s+/g,'') : 'any'} />
+            <RuleBadge kind={r.matchKind || 'ANY'} variant={r.matchKind ? r.matchKind.toLowerCase().replace(/\s+/g, '') : 'any'} />
             {r.match && r.match !== r.name
               ? <code className="rule-pattern" title={r.match}>{r.match}</code>
               : <span className="mute" style={{ fontSize: 11 }}>all requests</span>}
@@ -224,6 +224,7 @@ function RuleTable({ rows, onToggle, onEdit, onDelete, emptyTitle, emptyDesc }) 
           <div className="col-action-rich">
             {r.actionKind && <RuleBadge kind={r.actionKind} variant="action" />}
             <span className="rule-action-text" title={r.action}>{r.action}</span>
+            {r.meta && <span className="meta">{r.meta}</span>}
           </div>
           <div className="col-act">
             {onEdit && <button className="copy-btn" onClick={() => onEdit(i, r)} aria-label={`Edit rule ${r.name || i + 1}`}>edit</button>}
@@ -237,7 +238,18 @@ function RuleTable({ rows, onToggle, onEdit, onDelete, emptyTitle, emptyDesc }) 
 
 // ─── Rules surface ──────────────────────────────────────────────────────
 
-const EMPTY_LOCATION = { host: null, path: null, port: null, protocol: null, query: null, methods: [], mode: 'glob' };
+const EMPTY_LOCATION = {
+  host: null,
+  path: null,
+  port: null,
+  protocol: null,
+  query: null,
+  methods: [],
+  wire_protocol: null,
+  application_protocol: null,
+  body_mode: null,
+  mode: 'glob',
+};
 
 function summarizeLocation(loc) {
   if (!loc) return null;
@@ -245,9 +257,12 @@ function summarizeLocation(loc) {
   if (loc.host) parts.push(loc.host);
   if (loc.path) parts.push(loc.path);
   if (loc.port) parts.push(`:${loc.port}`);
-  if (loc.protocol) parts.push(loc.protocol);
-  if (loc.methods && loc.methods.length) parts.push(loc.methods.join(' '));
   if (loc.query) parts.push(`?${loc.query}`);
+  if (loc.methods && loc.methods.length) parts.push(`method:${loc.methods.join(',')}`);
+  if (loc.protocol) parts.push(`scheme:${loc.protocol}`);
+  if (loc.wire_protocol) parts.push(`wire:${locationWireLabel(loc.wire_protocol)}`);
+  if (loc.application_protocol) parts.push(`app:${locationAppLabel(loc.application_protocol)}`);
+  if (loc.body_mode) parts.push(`body:${locationBodyLabel(loc.body_mode)}`);
   return parts.join(' · ') || null;
 }
 
@@ -262,8 +277,8 @@ function Modal({ title, onClose, onSave, saveLabel = 'Save', children }) {
   return (
     <div className="ui-dialog-backdrop" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="ui-dialog ui-form-dialog"
-           style={{ maxWidth: 660, width: '92vw', maxHeight: '92vh', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}
-           onClick={e => e.stopPropagation()}>
+        style={{ maxWidth: 660, width: '92vw', maxHeight: '92vh', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}
+        onClick={e => e.stopPropagation()}>
         <h3 style={{ margin: '0 0 12px', flexShrink: 0 }}>{title}</h3>
         <div style={{ flex: 1, minHeight: 0 }}>{children}</div>
         <div className="ui-dialog-actions" style={{ flexShrink: 0 }}>
@@ -287,7 +302,101 @@ function Field({ label, hint, children, row }) {
 
 // ── Location editor ─────────────────────────────────────────────────────
 
-const METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
+const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'CONNECT', 'OPTIONS', 'HEAD'];
+const WIRE_PROTOCOLS = [
+  ['http1', 'HTTP/1.1'],
+  ['http2', 'HTTP/2'],
+  ['http3', 'HTTP/3'],
+  ['socks5', 'SOCKS5'],
+  ['websocket', 'WebSocket upgrade'],
+];
+const APP_PROTOCOLS = [
+  ['http', 'HTTP'],
+  ['grpc', 'gRPC'],
+  ['sse', 'SSE'],
+  ['graphql', 'GraphQL'],
+  ['json', 'JSON'],
+  ['binary', 'Binary'],
+];
+const BODY_MODES = [
+  ['empty', 'Empty'],
+  ['full', 'Full'],
+  ['stream_bytes', 'Stream bytes'],
+  ['stream_messages', 'Stream messages'],
+  ['frames', 'Frames'],
+  ['tunnel', 'Tunnel'],
+];
+const TRAFFIC_KINDS = [
+  ['any', 'Any'],
+  ['http', 'HTTP'],
+  ['websocket', 'WS'],
+  ['grpc', 'gRPC'],
+  ['tunnel', 'Tunnel'],
+];
+
+const locationLabel = (pairs, value, fallback = value || '') => pairs.find(([v]) => v === value)?.[1] || fallback;
+const locationWireLabel = value => locationLabel(WIRE_PROTOCOLS, value);
+const locationAppLabel = value => locationLabel(APP_PROTOCOLS, value);
+const locationBodyLabel = value => locationLabel(BODY_MODES, value);
+
+function locationTrafficKind(loc = {}) {
+  if (loc.body_mode === 'tunnel' || loc.wire_protocol === 'socks5') return 'tunnel';
+  if (loc.body_mode === 'frames' || loc.wire_protocol === 'websocket') return 'websocket';
+  if (loc.application_protocol === 'grpc' || loc.body_mode === 'stream_messages') return 'grpc';
+  if (loc.application_protocol === 'http' || ['http1', 'http2', 'http3'].includes(loc.wire_protocol) || loc.protocol) return 'http';
+  return 'any';
+}
+
+function applyTrafficKind(loc, kind) {
+  const next = { ...loc };
+  if (kind === 'any') {
+    next.protocol = null;
+    next.wire_protocol = null;
+    next.application_protocol = null;
+    next.body_mode = null;
+  } else if (kind === 'http') {
+    next.application_protocol = next.application_protocol === 'grpc' ? null : (next.application_protocol || 'http');
+    if (next.wire_protocol === 'websocket' || next.wire_protocol === 'socks5') next.wire_protocol = null;
+    if (['frames', 'tunnel', 'stream_messages'].includes(next.body_mode)) next.body_mode = null;
+  } else if (kind === 'websocket') {
+    next.wire_protocol = 'websocket';
+    next.application_protocol = null;
+    next.body_mode = 'frames';
+  } else if (kind === 'grpc') {
+    next.wire_protocol = next.wire_protocol === 'websocket' || next.wire_protocol === 'socks5' ? 'http2' : (next.wire_protocol || 'http2');
+    next.application_protocol = 'grpc';
+    next.body_mode = 'stream_messages';
+  } else if (kind === 'tunnel') {
+    next.wire_protocol = 'socks5';
+    next.application_protocol = null;
+    next.body_mode = 'tunnel';
+  }
+  return next;
+}
+
+function locationHasAdvanced(loc) {
+  return !!(loc.query || loc.port || loc.protocol || loc.wire_protocol || loc.application_protocol || loc.body_mode);
+}
+
+// Live example of what the pattern would match, used below the Path+Mode row
+function patternExample(path, mode) {
+  if (!path) return null;
+  try {
+    if (mode === 'regex') {
+      const re = new RegExp(path);
+      const samples = ['/api/123', '/api/users/456', '/api/v2/items'];
+      const matches = samples.filter(s => re.test(s));
+      return matches.length ? `e.g. matches: ${matches.join(', ')}` : 'no sample matches — check pattern';
+    } else {
+      // glob: * matches segment chars, ** matches across /
+      const escaped = path.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '__DSTAR__').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/__DSTAR__/g, '.*');
+      const re = new RegExp(`^${escaped}$`);
+      const samples = ['/api/users', '/api/v2/users', path.replace(/\*/g, 'foo')];
+      const matches = [...new Set(samples)].filter(s => re.test(s));
+      return matches.length ? `e.g. matches: ${matches.join(', ')}` : null;
+    }
+  } catch { return null; }
+}
 
 function LocationEditor({ loc, onChange }) {
   const set = (k, v) => onChange({ ...loc, [k]: v || null });
@@ -295,39 +404,47 @@ function LocationEditor({ loc, onChange }) {
     const cur = loc.methods || [];
     onChange({ ...loc, methods: cur.includes(m) ? cur.filter(x => x !== m) : [...cur, m] });
   };
+  const [advOpen, setAdvOpen] = React.useState(() => locationHasAdvanced(loc));
   const lbl = { fontSize: 12, color: 'var(--text-faint)', whiteSpace: 'nowrap' };
+  const example = patternExample(loc.path, loc.mode || 'glob');
 
   return (
     <div style={{ background: 'rgba(0,0,0,0.04)', borderRadius: 6, padding: '10px 12px', marginBottom: 10 }}>
       <div style={{ fontSize: 10.5, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--text-faint)', marginBottom: 8 }}>
         Location — leave blank to match all
       </div>
-      {/* 4-column inline grid: label | input | label | input */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr max-content 1fr', gap: '5px 10px', alignItems: 'center', marginBottom: 6 }}>
+      {/* Traffic kind chips */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px 10px', flexWrap: 'wrap', marginBottom: 8 }}>
+        <span style={lbl}>Kind</span>
+        <div className="chip-group">
+          {TRAFFIC_KINDS.map(([value, label]) => (
+            <button key={value} type="button"
+              className={'chip' + (locationTrafficKind(loc) === value ? ' on' : '')}
+              aria-pressed={locationTrafficKind(loc) === value}
+              onClick={() => onChange(applyTrafficKind(loc, value))}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {/* Host + Path side by side */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr max-content 1fr', gap: '5px 10px', alignItems: 'center', marginBottom: 4 }}>
         <span style={lbl}>Host</span>
         <input className="cmp-input" value={loc.host || ''} onChange={e => set('host', e.target.value)} placeholder="api.example.com" />
         <span style={lbl}>Path</span>
-        <input className="cmp-input" value={loc.path || ''} onChange={e => set('path', e.target.value)} placeholder="/api/*" />
-
-        <span style={lbl}>Query</span>
-        <input className="cmp-input" value={loc.query || ''} onChange={e => set('query', e.target.value)} placeholder="key=value*" />
-        <span style={lbl}>Port</span>
-        <input className="cmp-input" type="number" min="1" max="65535" value={loc.port || ''} onChange={e => set('port', e.target.value ? Number(e.target.value) : null)} placeholder="any" />
-
-        <span style={lbl}>Protocol</span>
-        <select className="cmp-input" value={loc.protocol || ''} onChange={e => set('protocol', e.target.value)}>
-          <option value="">any</option>
-          <option value="http">http</option>
-          <option value="https">https</option>
-        </select>
-        <span style={lbl}>Match mode</span>
-        <select className="cmp-input" value={loc.mode || 'glob'} onChange={e => onChange({ ...loc, mode: e.target.value })}>
-          <option value="glob">Glob (* ? wildcards)</option>
-          <option value="regex">Regex (unanchored)</option>
-        </select>
+        {/* Path + mode selector inline */}
+        <div style={{ display: 'flex', gap: 4 }}>
+          <input className="cmp-input" style={{ flex: 1 }} value={loc.path || ''} onChange={e => set('path', e.target.value)} placeholder="/api/*" />
+          <select className="cmp-input" style={{ flexShrink: 0, width: 90 }} value={loc.mode || 'glob'} onChange={e => onChange({ ...loc, mode: e.target.value })}>
+            <option value="glob">Glob</option>
+            <option value="regex">Regex</option>
+          </select>
+        </div>
       </div>
-      {/* Methods on a single row */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '4px 10px', flexWrap: 'wrap' }}>
+      {/* Live pattern example */}
+      {example && <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 6, paddingLeft: 2 }}>{example}</div>}
+      {/* Methods row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px 10px', flexWrap: 'wrap', marginBottom: 6 }}>
         <span style={{ ...lbl, marginRight: 2 }}>Methods</span>
         {METHODS.map(m => (
           <label key={m} style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' }}>
@@ -337,6 +454,43 @@ function LocationEditor({ loc, onChange }) {
         ))}
         <span style={{ fontSize: 11, color: 'var(--text-faint)', marginLeft: 2 }}>(blank = any)</span>
       </div>
+      {/* Advanced toggle */}
+      <button type="button" onClick={() => setAdvOpen(o => !o)}
+        style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 11, color: 'var(--text-faint)', padding: '2px 0', display: 'flex', alignItems: 'center', gap: 4 }}>
+        <span style={{ display: 'inline-block', transform: advOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s', fontSize: 10 }}>▶</span>
+        Advanced filters {locationHasAdvanced(loc) ? <span style={{ color: 'var(--c-2xx)', fontSize: 10 }}>●</span> : null}
+      </button>
+      {advOpen && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr max-content 1fr', gap: '5px 10px', alignItems: 'center', marginTop: 8 }}>
+          <span style={lbl}>Query</span>
+          <input className="cmp-input" value={loc.query || ''} onChange={e => set('query', e.target.value)} placeholder="key=value*" />
+          <span style={lbl}>Port</span>
+          <input className="cmp-input" type="number" min="1" max="65535" value={loc.port || ''} onChange={e => set('port', e.target.value ? Number(e.target.value) : null)} placeholder="any" />
+
+          <span style={lbl}>Scheme</span>
+          <select className="cmp-input" value={loc.protocol || ''} onChange={e => set('protocol', e.target.value)}>
+            <option value="">any</option>
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+          <span style={lbl}>Wire</span>
+          <select className="cmp-input" value={loc.wire_protocol || ''} onChange={e => set('wire_protocol', e.target.value)}>
+            <option value="">any</option>
+            {WIRE_PROTOCOLS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+
+          <span style={lbl}>App</span>
+          <select className="cmp-input" value={loc.application_protocol || ''} onChange={e => set('application_protocol', e.target.value)}>
+            <option value="">any</option>
+            {APP_PROTOCOLS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+          <span style={lbl}>Body</span>
+          <select className="cmp-input" value={loc.body_mode || ''} onChange={e => set('body_mode', e.target.value)}>
+            <option value="">any</option>
+            {BODY_MODES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </div>
+      )}
     </div>
   );
 }
@@ -344,33 +498,33 @@ function LocationEditor({ loc, onChange }) {
 // ── Actions editor (for RewriteRuleSet) ────────────────────────────────
 
 const ACTION_TYPES = [
-  { value: 'set_header',        label: 'Set header' },
-  { value: 'append_header',     label: 'Append header' },
-  { value: 'remove_header',     label: 'Remove header' },
-  { value: 'set_query_param',   label: 'Set query param' },
-  { value: 'remove_query_param',label: 'Remove query param' },
-  { value: 'set_host',          label: 'Set host' },
-  { value: 'set_path',          label: 'Set path' },
-  { value: 'set_status',        label: 'Set status code' },
-  { value: 'replace_body',      label: 'Replace body' },
-  { value: 'redirect',          label: 'Redirect' },
-  { value: 'block',             label: 'Block' },
+  { value: 'set_header', label: 'Set header' },
+  { value: 'append_header', label: 'Append header' },
+  { value: 'remove_header', label: 'Remove header' },
+  { value: 'set_query_param', label: 'Set query param' },
+  { value: 'remove_query_param', label: 'Remove query param' },
+  { value: 'set_host', label: 'Set host' },
+  { value: 'set_path', label: 'Set path' },
+  { value: 'set_status', label: 'Set status code' },
+  { value: 'replace_body', label: 'Replace body' },
+  { value: 'redirect', label: 'Redirect' },
+  { value: 'block', label: 'Block' },
 ];
 
 function defaultAction(type) {
   switch (type) {
-    case 'set_header':         return { type, name: '', value: '' };
-    case 'append_header':      return { type, name: '', value: '' };
-    case 'remove_header':      return { type, name: '' };
-    case 'set_query_param':    return { type, name: '', value: '' };
+    case 'set_header': return { type, name: '', value: '' };
+    case 'append_header': return { type, name: '', value: '' };
+    case 'remove_header': return { type, name: '' };
+    case 'set_query_param': return { type, name: '', value: '' };
     case 'remove_query_param': return { type, name: '' };
-    case 'set_host':           return { type, value: '' };
-    case 'set_path':           return { type, pattern: '', replacement: '' };
-    case 'set_status':         return { type, code: 200 };
-    case 'replace_body':       return { type, pattern: '', replacement: '' };
-    case 'redirect':           return { type, status: 302, location: '' };
-    case 'block':              return { type, status: 403 };
-    default:                   return { type: 'set_header', name: '', value: '' };
+    case 'set_host': return { type, value: '' };
+    case 'set_path': return { type, pattern: '', replacement: '' };
+    case 'set_status': return { type, code: 200 };
+    case 'replace_body': return { type, pattern: '', replacement: '' };
+    case 'redirect': return { type, status: 302, location: '' };
+    case 'block': return { type, status: 403 };
+    default: return { type: 'set_header', name: '', value: '' };
   }
 }
 
@@ -378,18 +532,18 @@ function summarizeActions(actions) {
   if (!actions || !actions.length) return 'no actions';
   return actions.map(a => {
     switch (a.type) {
-      case 'set_header':         return `set ${a.name}`;
-      case 'append_header':      return `append ${a.name}`;
-      case 'remove_header':      return `rm ${a.name}`;
-      case 'set_query_param':    return `?${a.name}=…`;
+      case 'set_header': return `set ${a.name}`;
+      case 'append_header': return `append ${a.name}`;
+      case 'remove_header': return `rm ${a.name}`;
+      case 'set_query_param': return `?${a.name}=…`;
       case 'remove_query_param': return `rm ?${a.name}`;
-      case 'set_host':           return `host→${a.value}`;
-      case 'set_path':           return `path ${a.pattern}→${a.replacement}`;
-      case 'set_status':         return `${a.code}`;
-      case 'replace_body':       return `body ${a.pattern}→${a.replacement}`;
-      case 'redirect':           return `→${a.location || a.status}`;
-      case 'block':              return `block ${a.status}`;
-      default:                   return a.type;
+      case 'set_host': return `host→${a.value}`;
+      case 'set_path': return `path ${a.pattern}→${a.replacement}`;
+      case 'set_status': return `${a.code}`;
+      case 'replace_body': return `body ${a.pattern}→${a.replacement}`;
+      case 'redirect': return `→${a.location || a.status}`;
+      case 'block': return `block ${a.status}`;
+      default: return a.type;
     }
   }).join(', ');
 }
@@ -400,15 +554,26 @@ function ActionRow({ action, onChange, onRemove }) {
   return (
     <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
       <select className="cmp-input" style={{ flexShrink: 0, width: 160 }}
-              value={action.type} onChange={e => onChange(defaultAction(e.target.value))}>
+        value={action.type} onChange={e => onChange(defaultAction(e.target.value))}>
         {ACTION_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
       </select>
       {(action.type === 'set_header' || action.type === 'append_header') && <>
-        {inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'header-name', style: { flex: 1, minWidth: 60 } })}
+        <div style={{ flex: 1, minWidth: 60, position: 'relative' }}>
+          {inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'header-name', style: { width: '100%', boxSizing: 'border-box', ...(((action.name || '').toLowerCase().startsWith('x-oproxy-')) ? { borderColor: 'var(--c-warn, #f5a623)' } : {}) } })}
+          {((action.name || '').toLowerCase().startsWith('x-oproxy-')) && (
+            <span title="x-oproxy-* headers are reserved for internal use and will be stripped from requests and recordings." style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', color: 'var(--c-warn, #f5a623)', fontSize: 13, pointerEvents: 'none', userSelect: 'none' }}>⚠</span>
+          )}
+        </div>
         {inp({ value: action.value || '', onChange: e => set('value', e.target.value), placeholder: 'value' })}
       </>}
-      {action.type === 'remove_header' &&
-        inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'header-name' })}
+      {action.type === 'remove_header' && <>
+        <div style={{ flex: 1, minWidth: 60, position: 'relative' }}>
+          {inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'header-name', style: { width: '100%', boxSizing: 'border-box', ...(((action.name || '').toLowerCase().startsWith('x-oproxy-')) ? { borderColor: 'var(--c-warn, #f5a623)' } : {}) } })}
+          {((action.name || '').toLowerCase().startsWith('x-oproxy-')) && (
+            <span title="x-oproxy-* headers are reserved for internal use and will be stripped from requests and recordings." style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', color: 'var(--c-warn, #f5a623)', fontSize: 13, pointerEvents: 'none', userSelect: 'none' }}>⚠</span>
+          )}
+        </div>
+      </>}
       {(action.type === 'set_query_param') && <>
         {inp({ value: action.name || '', onChange: e => set('name', e.target.value), placeholder: 'param' })}
         {inp({ value: action.value || '', onChange: e => set('value', e.target.value), placeholder: 'value' })}
@@ -423,20 +588,20 @@ function ActionRow({ action, onChange, onRemove }) {
       </>}
       {action.type === 'set_status' &&
         <input className="cmp-input" type="number" min="100" max="599" style={{ width: 80 }}
-               value={action.code || 200} onChange={e => set('code', Number(e.target.value))} />}
+          value={action.code || 200} onChange={e => set('code', Number(e.target.value))} />}
       {action.type === 'replace_body' && <>
         {inp({ value: action.pattern || '', onChange: e => set('pattern', e.target.value), placeholder: 'find regex' })}
         <textarea className="cmp-input" rows={2} style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 12 }}
-                  value={action.replacement || ''} onChange={e => set('replacement', e.target.value)} placeholder="replacement" />
+          value={action.replacement || ''} onChange={e => set('replacement', e.target.value)} placeholder="replacement" />
       </>}
       {action.type === 'redirect' && <>
         <input className="cmp-input" type="number" min="300" max="399" style={{ width: 70 }}
-               value={action.status || 302} onChange={e => set('status', Number(e.target.value))} />
+          value={action.status || 302} onChange={e => set('status', Number(e.target.value))} />
         {inp({ value: action.location || '', onChange: e => set('location', e.target.value), placeholder: 'https://…' })}
       </>}
       {action.type === 'block' &&
         <input className="cmp-input" type="number" min="400" max="599" style={{ width: 80 }}
-               value={action.status || 403} onChange={e => set('status', Number(e.target.value))} />}
+          value={action.status || 403} onChange={e => set('status', Number(e.target.value))} />}
       <button className="copy-btn" onClick={onRemove} title="Remove action" style={{ flexShrink: 0 }}>×</button>
     </div>
   );
@@ -446,13 +611,31 @@ function ActionsEditor({ actions, onChange }) {
   const add = () => onChange([...actions, defaultAction('set_header')]);
   const update = (i, a) => onChange(actions.map((x, j) => j === i ? a : x));
   const remove = (i) => onChange(actions.filter((_, j) => j !== i));
+  const dragIdx = React.useRef(null);
+  const onDragStart = (i) => { dragIdx.current = i; };
+  const onDragOver = (e, i) => {
+    e.preventDefault();
+    if (dragIdx.current === null || dragIdx.current === i) return;
+    const next = [...actions];
+    const [moved] = next.splice(dragIdx.current, 1);
+    next.splice(i, 0, moved);
+    dragIdx.current = i;
+    onChange(next);
+  };
   return (
     <div>
       <div style={{ fontSize: 10.5, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--text-faint)', marginBottom: 8 }}>
-        Actions  <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, fontSize: 11 }}>— applied in order</span>
+        Actions  <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, fontSize: 11 }}>— applied in order, drag to reorder</span>
       </div>
       {actions.map((a, i) => (
-        <ActionRow key={i} action={a} onChange={a2 => update(i, a2)} onRemove={() => remove(i)} />
+        <div key={i} draggable onDragStart={() => onDragStart(i)} onDragOver={e => onDragOver(e, i)} onDragEnd={() => { dragIdx.current = null; }}
+          style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginBottom: 6 }}>
+          <span style={{ color: 'var(--text-faint)', fontSize: 11, cursor: 'grab', padding: '6px 2px', userSelect: 'none', lineHeight: 1 }} title="Drag to reorder">⠿</span>
+          <span style={{ fontSize: 10, color: 'var(--text-faint)', minWidth: 14, textAlign: 'right', paddingTop: 8, flexShrink: 0 }}>{i + 1}</span>
+          <div style={{ flex: 1 }}>
+            <ActionRow action={a} onChange={a2 => update(i, a2)} onRemove={() => remove(i)} />
+          </div>
+        </div>
       ))}
       {actions.length === 0 && (
         <div style={{ fontSize: 12, color: 'var(--text-faint)', marginBottom: 8 }}>No actions yet — add at least one.</div>
@@ -464,8 +647,40 @@ function ActionsEditor({ actions, onChange }) {
 
 // ── RuleSet modal ───────────────────────────────────────────────────────
 
+function validateActions(actions) {
+  for (let i = 0; i < actions.length; i++) {
+    const a = actions[i];
+    const idx = `Action ${i + 1} (${ACTION_TYPES.find(t => t.value === a.type)?.label || a.type})`;
+    if (a.type === 'set_header' || a.type === 'append_header' || a.type === 'remove_header') {
+      if (!a.name?.trim()) return `${idx}: header name is required`;
+    }
+    if (a.type === 'set_header' || a.type === 'append_header') {
+      if (!a.value?.trim()) return `${idx}: header value is required`;
+    }
+    if (a.type === 'set_query_param' || a.type === 'remove_query_param') {
+      if (!a.name?.trim()) return `${idx}: param name is required`;
+    }
+    if (a.type === 'set_query_param') {
+      if (!a.value?.trim()) return `${idx}: param value is required`;
+    }
+    if (a.type === 'set_host') {
+      if (!a.value?.trim()) return `${idx}: target host is required`;
+    }
+    if (a.type === 'set_path') {
+      if (!a.pattern?.trim()) return `${idx}: path pattern is required`;
+    }
+    if (a.type === 'replace_body') {
+      if (!a.pattern?.trim()) return `${idx}: body find pattern is required`;
+    }
+    if (a.type === 'redirect') {
+      if (!a.location?.trim()) return `${idx}: redirect location is required`;
+    }
+  }
+  return null;
+}
+
 function RuleSetModal({ rule, onClose, onSave }) {
-  const isNew = !rule;
+  const isNew = !rule?.id;
   const [name, setName] = React.useState(rule?.name || '');
   const [enabled, setEnabled] = React.useState(rule ? rule.enabled : true);
   const [appliesTo, setAppliesTo] = React.useState((rule?.applies_to || 'both').toLowerCase());
@@ -474,6 +689,8 @@ function RuleSetModal({ rule, onClose, onSave }) {
 
   const save = async () => {
     if (!name.trim()) { notifyError('Name is required'); return; }
+    const actionError = validateActions(actions);
+    if (actionError) { notifyError(actionError); return; }
     const body = { id: rule?.id || '', name: name.trim(), enabled, applies_to: appliesTo, location: loc, actions };
     try {
       if (isNew) {
@@ -612,16 +829,16 @@ function SimpleRuleModal({ title, rule, extraFields, onClose, onSave }) {
           <span style={{ fontSize: 12, color: 'var(--text-faint)', whiteSpace: 'nowrap', marginTop: f.type === 'file' ? 7 : 0 }}>{f.label}</span>
           {f.type === 'file'
             ? <MapLocalPathField
-                value={extra[f.key] ?? ''}
-                onChange={v => setE(f.key, v)}
-                onInline={b => setExtra(p => ({ ...p, inline_body: b == null ? undefined : b }))}
-                inlineBody={extra.inline_body}
-                hint={f.hint} placeholder={f.placeholder} />
+              value={extra[f.key] ?? ''}
+              onChange={v => setE(f.key, v)}
+              onInline={b => setExtra(p => ({ ...p, inline_body: b == null ? undefined : b }))}
+              inlineBody={extra.inline_body}
+              hint={f.hint} placeholder={f.placeholder} />
             : f.type === 'select'
-            ? <select className="cmp-input" value={extra[f.key] ?? ''} onChange={e => setE(f.key, e.target.value)}>
+              ? <select className="cmp-input" value={extra[f.key] ?? ''} onChange={e => setE(f.key, e.target.value)}>
                 {(f.options || []).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
-            : <input className="cmp-input" value={extra[f.key] ?? ''} onChange={e => setE(f.key, e.target.value)} placeholder={f.placeholder} />
+              : <input className="cmp-input" value={extra[f.key] ?? ''} onChange={e => setE(f.key, e.target.value)} placeholder={f.placeholder} />
           }
           {f.hint && f.type !== 'file' && <span style={{ fontSize: 11, color: 'var(--text-faint)', gridColumn: '2', marginTop: -2 }}>{f.hint}</span>}
         </div>
@@ -669,9 +886,14 @@ function GenericRuleList({ rules, renderExtra, onToggle, onEdit, onDelete, empty
   );
 }
 
+const APPLIES_TO_LABEL = { request: '↑ Req', response: '↓ Resp', both: '↕ Both' };
+
 // ── Rules tab (RewriteRuleSet) ──────────────────────────────────────────
 
-function RuleSetTab({ rules, onReload, onAdd, editTarget, setEditTarget }) {
+function RuleSetTab({ rules, onReload, onAdd, editTarget, setEditTarget, showDisabled }) {
+  const dragIdx = React.useRef(null);
+  const [dragOver, setDragOver] = React.useState(null);
+
   const toggle = async (r, v) => {
     try { await sendJson(`/admin/rule-sets/${r.id}`, 'PUT', { ...r, enabled: v }); await onReload(); }
     catch (e) { notifyError(e.message || e); }
@@ -682,24 +904,51 @@ function RuleSetTab({ rules, onReload, onAdd, editTarget, setEditTarget }) {
     catch (e) { notifyError(e.message || e); }
   };
 
+  const onDragStart = (i) => { dragIdx.current = i; };
+  const onDragOver = (e, i) => {
+    e.preventDefault();
+    setDragOver(i);
+  };
+  const onDrop = async (i) => {
+    setDragOver(null);
+    if (dragIdx.current === null || dragIdx.current === i) { dragIdx.current = null; return; }
+    const next = [...rules];
+    const [moved] = next.splice(dragIdx.current, 1);
+    next.splice(i, 0, moved);
+    dragIdx.current = null;
+    try { await sendJson('/admin/rule-sets/reorder', 'PATCH', { ids: next.map(r => r.id) }); await onReload(); }
+    catch (e) { notifyError(e.message || e); }
+  };
+
+  const visible = showDisabled ? rules : rules.filter(r => r.enabled);
+
   return (
     <>
       <div className="rule-list">
-        {rules.length === 0 && (
+        {visible.length === 0 && (
           <div className="empty" style={{ padding: '40px 24px', textAlign: 'left', maxWidth: 520 }}>
-            <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>No rule sets</div>
+            <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text)' }}>{rules.length === 0 ? 'No rule sets' : 'All rules are disabled'}</div>
             <div style={{ fontSize: 12, color: 'var(--text-mid)', lineHeight: 1.6 }}>
-              Rule sets match by location and run an ordered list of actions — set headers, redirect, block, rewrite paths, and more.
+              {rules.length === 0 ? 'Rule sets match by location and run an ordered list of actions — set headers, redirect, block, rewrite paths, and more.' : 'Toggle "Show disabled" to see them.'}
             </div>
-            <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-faint)' }}>Press <span className="key">+</span> to add one.</div>
+            {rules.length === 0 && <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-faint)' }}>Press <span className="key">+</span> to add one.</div>}
           </div>
         )}
-        {rules.map((r, i) => {
+        {visible.map((r, i) => {
           const locStr = summarizeLocation(r.location);
           const actStr = summarizeActions(r.actions);
+          const appLabel = APPLIES_TO_LABEL[(r.applies_to || 'both').toLowerCase()] || '↕ Both';
           return (
-            <div key={r.id || i} className={'rule-row rule-row-rich' + (r.enabled ? '' : ' off')}>
-              <div className="col-toggle">
+            <div key={r.id || i}
+              draggable
+              onDragStart={() => onDragStart(rules.indexOf(r))}
+              onDragOver={e => onDragOver(e, rules.indexOf(r))}
+              onDrop={() => onDrop(rules.indexOf(r))}
+              onDragEnd={() => { dragIdx.current = null; setDragOver(null); }}
+              className={'rule-row rule-row-rich' + (r.enabled ? '' : ' off') + (dragOver === rules.indexOf(r) ? ' drag-over' : '')}
+              style={{ cursor: 'default' }}>
+              <div className="col-toggle" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ color: 'var(--text-faint)', cursor: 'grab', fontSize: 14, userSelect: 'none', lineHeight: 1 }} title="Drag to reorder">⠿</span>
                 <Toggle label={`Toggle ${r.name}`} on={!!r.enabled} onChange={v => toggle(r, v)} />
               </div>
               <div className="col-name" title={r.name}>{r.name || <span className="mute">—</span>}</div>
@@ -709,7 +958,7 @@ function RuleSetTab({ rules, onReload, onAdd, editTarget, setEditTarget }) {
                   : <span className="mute" style={{ fontSize: 11 }}>all requests</span>}
               </div>
               <div className="col-action-rich" style={{ fontSize: 12 }}>
-                <RuleBadge kind={r.applies_to || 'Both'} variant="action" />
+                <RuleBadge kind={appLabel} variant="action" />
                 <span className="rule-action-text" title={actStr}>{actStr}</span>
               </div>
               <div className="col-act">
@@ -734,6 +983,8 @@ function RuleSetTab({ rules, onReload, onAdd, editTarget, setEditTarget }) {
 // ── Map Remote tab ──────────────────────────────────────────────────────
 
 function MapRemoteTab({ rules, onReload, editTarget, setEditTarget }) {
+  const [testResults, setTestResults] = React.useState({}); // id -> {loading, ok, status, error}
+
   const toggle = async (r, v) => {
     try { await sendJson(`/admin/map-remote-rules/${r.id}`, 'PUT', { ...r, enabled: v }); await onReload(); }
     catch (e) { notifyError(e.message || e); }
@@ -752,6 +1003,17 @@ function MapRemoteTab({ rules, onReload, editTarget, setEditTarget }) {
     setEditTarget(undefined);
     await onReload();
   };
+  const testConnection = async (r) => {
+    setTestResults(prev => ({ ...prev, [r.id]: { loading: true } }));
+    try {
+      const res = await sendJson('/admin/map-remote-rules/test', 'POST', { destination: r.destination });
+      const body = await res.json().catch(() => ({}));
+      setTestResults(prev => ({ ...prev, [r.id]: { loading: false, ok: body.ok, status: body.status, error: body.error } }));
+    } catch (e) {
+      setTestResults(prev => ({ ...prev, [r.id]: { loading: false, ok: false, error: e.message || String(e) } }));
+    }
+    setTimeout(() => setTestResults(prev => { const n = { ...prev }; delete n[r.id]; return n; }), 6000);
+  };
 
   const fields = [{ key: 'destination', label: 'Destination URL', placeholder: 'http://10.0.0.1:3000', hint: 'Origin is replaced; path and query are preserved.' }];
 
@@ -759,7 +1021,22 @@ function MapRemoteTab({ rules, onReload, editTarget, setEditTarget }) {
     <>
       <GenericRuleList
         rules={rules}
-        renderExtra={r => <code className="rule-pattern" style={{ color: 'var(--c-2xx)' }}>{r.destination}</code>}
+        renderExtra={r => {
+          const tr = testResults[r.id];
+          return (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <code className="rule-pattern" style={{ color: 'var(--c-2xx)' }}>{r.destination}</code>
+              <button className="copy-btn" onClick={e => { e.stopPropagation(); testConnection(r); }} disabled={tr?.loading} title="Test connection to destination">
+                {tr?.loading ? '…' : 'Test'}
+              </button>
+              {tr && !tr.loading && (
+                <span style={{ fontSize: 11, color: tr.ok ? 'var(--c-2xx)' : 'var(--c-5xx)', whiteSpace: 'nowrap' }}>
+                  {tr.ok ? `✓ ${tr.status || 'ok'}` : `✗ ${tr.error || 'unreachable'}`}
+                </span>
+              )}
+            </div>
+          );
+        }}
         onToggle={toggle} onEdit={setEditTarget} onDelete={del}
         emptyTitle="No Map Remote rules"
         emptyDesc="Map Remote routes matching requests to a different upstream origin. The path and query string are preserved — only the origin changes." />
@@ -779,6 +1056,8 @@ function MapRemoteTab({ rules, onReload, editTarget, setEditTarget }) {
 // ── Map Local tab ───────────────────────────────────────────────────────
 
 function MapLocalTab({ rules, onReload, editTarget, setEditTarget }) {
+  const [preview, setPreview] = React.useState(null); // {name, content}
+
   const toggle = async (r, v) => {
     try { await sendJson(`/admin/map-local-rules/${r.id}`, 'PUT', { ...r, enabled: v }); await onReload(); }
     catch (e) { notifyError(e.message || e); }
@@ -798,13 +1077,32 @@ function MapLocalTab({ rules, onReload, editTarget, setEditTarget }) {
     await onReload();
   };
 
+  const previewFixture = async (filePath) => {
+    const name = filePath.split('/').pop();
+    try {
+      const res = await fetch(`/admin/map-local-rules/fixtures/${encodeURIComponent(name)}`);
+      if (!res.ok) { notifyError(`Cannot preview: ${res.status} ${res.statusText}`); return; }
+      const text = await res.text();
+      setPreview({ name, content: text });
+    } catch (e) { notifyError(e.message || e); }
+  };
+
   const fields = [{ key: 'file_path', label: 'Local path', type: 'file', placeholder: 'users.json or /absolute/path/or/dir', hint: 'Upload or paste to store a fixture in storage/map-local/, or type any path. A file is returned for every matching request; a directory maps the request path to a file inside it.' }];
 
   return (
     <>
       <GenericRuleList
         rules={rules}
-        renderExtra={r => <code className="rule-pattern" style={{ fontSize: 11, wordBreak: 'break-all' }}>{r.file_path}</code>}
+        renderExtra={r => (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <code className="rule-pattern" style={{ fontSize: 11, wordBreak: 'break-all' }}>{r.file_path}</code>
+            {r.file_path && !r.file_path.endsWith('/') && (
+              <button className="copy-btn" style={{ flexShrink: 0 }} onClick={e => { e.stopPropagation(); previewFixture(r.file_path); }} title="Preview fixture content">
+                Preview
+              </button>
+            )}
+          </div>
+        )}
         onToggle={toggle} onEdit={setEditTarget} onDelete={del}
         emptyTitle="No Map Local rules"
         emptyDesc="Map Local serves a local file (or directory) as the response for matching requests, bypassing the upstream entirely. Great for mocking API endpoints from fixture files." />
@@ -817,7 +1115,110 @@ function MapLocalTab({ rules, onReload, editTarget, setEditTarget }) {
           onSave={saveRule}
         />
       )}
+      {preview && (
+        <Modal title={`Preview — ${preview.name}`} onClose={() => setPreview(null)}>
+          <pre style={{ fontFamily: 'var(--font-mono)', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 400, overflow: 'auto', background: 'var(--bg-deep)', padding: 12, borderRadius: 6, margin: 0 }}>
+            {preview.content}
+          </pre>
+        </Modal>
+      )}
     </>
+  );
+}
+
+// ── Fixtures browser tab ────────────────────────────────────────────────
+
+function FixturesTab({ onReload }) {
+  const [fixtures, setFixtures] = React.useState([]);
+  const [preview, setPreview] = React.useState(null); // {name, content}
+  const [uploading, setUploading] = React.useState(false);
+
+  const load = React.useCallback(() => {
+    fetchJson('/admin/map-local-rules/fixtures', []).then(data => setFixtures(data || []));
+  }, []);
+
+  React.useEffect(() => { load(); }, [load]);
+
+  const previewFixture = async (name) => {
+    try {
+      const res = await fetch(`/admin/map-local-rules/fixtures/${encodeURIComponent(name)}`);
+      if (!res.ok) { notifyError(`Cannot preview: ${res.statusText}`); return; }
+      setPreview({ name, content: await res.text() });
+    } catch (e) { notifyError(e.message || e); }
+  };
+
+  const deleteFixture = async (name) => {
+    if (!await confirmAction(`Delete fixture "${name}"?`, 'Delete', 'danger')) return;
+    try {
+      await fetch(`/admin/map-local-rules/fixtures/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      load();
+      if (onReload) onReload();
+    } catch (e) { notifyError(e.message || e); }
+  };
+
+  const uploadFixture = async () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.onchange = async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      setUploading(true);
+      try {
+        const text = await file.text();
+        // JSON validation for .json files
+        if (file.name.endsWith('.json')) {
+          try { JSON.parse(text); }
+          catch (err) {
+            if (!await confirmAction(`"${file.name}" is not valid JSON: ${err.message}\n\nUpload anyway?`, 'Upload', 'warn')) {
+              setUploading(false); return;
+            }
+          }
+        }
+        await fetch(`/admin/map-local-rules/fixtures/${encodeURIComponent(file.name)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: text,
+        });
+        load();
+      } catch (err) { notifyError(err.message || err); }
+      setUploading(false);
+    };
+    input.click();
+  };
+
+  return (
+    <div style={{ padding: '12px 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+        <div style={{ fontSize: 10.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+          {fixtures.length} fixture{fixtures.length !== 1 ? 's' : ''} in storage/map-local/
+        </div>
+        <button className="btn ghost" onClick={uploadFixture} disabled={uploading}>
+          {uploading ? 'Uploading…' : '↑ Upload fixture'}
+        </button>
+      </div>
+      {fixtures.length === 0 && (
+        <div className="empty">No fixture files. Upload a file or use the Map Local inline editor to create one.</div>
+      )}
+      {fixtures.map(f => (
+        <div key={f.name} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 0', borderBottom: '1px solid var(--border-soft)' }}>
+          <code style={{ flex: 1, fontSize: 12, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {f.name}
+          </code>
+          <span style={{ fontSize: 11, color: 'var(--text-faint)', whiteSpace: 'nowrap' }}>
+            {f.size != null ? (f.size < 1024 ? `${f.size} B` : `${(f.size / 1024).toFixed(1)} KB`) : ''}
+          </span>
+          <button className="copy-btn" onClick={() => previewFixture(f.name)}>Preview</button>
+          <button className="copy-btn" onClick={() => deleteFixture(f.name)} style={{ color: 'var(--c-5xx)' }}>Delete</button>
+        </div>
+      ))}
+      {preview && (
+        <Modal title={`Preview — ${preview.name}`} onClose={() => setPreview(null)}>
+          <pre style={{ fontFamily: 'var(--font-mono)', fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 400, overflow: 'auto', background: 'var(--bg-deep)', padding: 12, borderRadius: 6, margin: 0 }}>
+            {preview.content}
+          </pre>
+        </Modal>
+      )}
+    </div>
   );
 }
 
@@ -881,13 +1282,19 @@ function AccessTab({ rules, onReload, editTarget, setEditTarget }) {
 
 // ── Main RulesSurface ───────────────────────────────────────────────────
 
-function RulesSurface() {
-  const [tab, setTab] = React.useState('rules');
+function RulesSurface({ createFrom, initialTab }) {
+  const [tab, setTab] = React.useState(initialTab || 'rules');
+
+  // Apply assistant-driven tab navigation (workspace rules.open_tab action)
+  React.useEffect(() => {
+    if (initialTab) setTab(initialTab);
+  }, [initialTab]);
   const [ruleSets, setRuleSets] = React.useState([]);
   const [mapRemote, setMapRemote] = React.useState([]);
   const [mapLocal, setMapLocal] = React.useState([]);
   const [access, setAccess] = React.useState([]);
   const [throttle, setThrottle] = React.useState({ enabled: false, preset: 'off', latency: 0, downKbps: 0 });
+  const [showDisabled, setShowDisabled] = React.useState(true);
   // editTarget: undefined = modal closed, null = new rule, object = editing that rule
   const [rsEdit, setRsEdit] = React.useState(undefined);
   const [mrEdit, setMrEdit] = React.useState(undefined);
@@ -916,9 +1323,16 @@ function RulesSurface() {
 
   React.useEffect(() => { load(); }, [load]);
 
+  // Pre-fill from create-from-session action
+  React.useEffect(() => {
+    if (!createFrom) return;
+    setTab('rules');
+    setRsEdit(createFrom);
+  }, [createFrom]);
+
   const saveThrottle = async (cfg) => {
     try {
-      await sendJson('/admin/throttling', 'POST', {
+      await sendJson('/admin/throttling', 'PUT', {
         enabled: !!cfg.enabled,
         latency_ms: Number(cfg.latency) || 0,
         bandwidth_limit_kbps: Number(cfg.downKbps) || 0,
@@ -928,24 +1342,63 @@ function RulesSurface() {
   };
 
   const openAdd = () => {
-    if (tab === 'rules')     setRsEdit(null);
+    if (tab === 'rules') setRsEdit(null);
     if (tab === 'mapremote') setMrEdit(null);
-    if (tab === 'maplocal')  setMlEdit(null);
-    if (tab === 'access')    setAcEdit(null);
+    if (tab === 'maplocal') setMlEdit(null);
+    if (tab === 'access') setAcEdit(null);
+    // 'fixtures' and 'throttle' have no add-rule action
+  };
+
+  // Export: download the current tab's rules as JSON
+  const exportRules = () => {
+    const data = tab === 'rules' ? ruleSets : tab === 'mapremote' ? mapRemote : tab === 'maplocal' ? mapLocal : access;
+    const filename = `oproxy-${tab}-${new Date().toISOString().slice(0, 10)}.json`;
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  };
+
+  // Import: upload JSON and POST each rule
+  const importRules = async () => {
+    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json';
+    input.onchange = async (e) => {
+      const file = e.target.files?.[0]; if (!file) return;
+      try {
+        const data = JSON.parse(await file.text());
+        const arr = Array.isArray(data) ? data : [data];
+        const endpoint = tab === 'rules' ? '/admin/rule-sets' : tab === 'mapremote' ? '/admin/map-remote-rules' : tab === 'maplocal' ? '/admin/map-local-rules' : '/admin/access-rules';
+        let ok = 0;
+        for (const rule of arr) {
+          try { await sendJson(endpoint, 'POST', { ...rule, id: '' }); ok++; }
+          catch (err) { notifyError(`Failed to import "${rule.name || '?'}": ${err.message || err}`); }
+        }
+        notifyOk(`Imported ${ok} rule${ok === 1 ? '' : 's'}`);
+        await load();
+      } catch (err) { notifyError(`Invalid JSON: ${err.message}`); }
+    };
+    input.click();
   };
 
   const tabs = [
-    { key: 'rules',     label: 'Rules',      ariaLabel: 'Rule sets', count: ruleSets.length },
-    { key: 'mapremote', label: 'Map Remote',  count: mapRemote.length },
-    { key: 'maplocal',  label: 'Map Local',   count: mapLocal.length },
-    { key: 'access',    label: 'Access',      count: access.length },
-    { key: 'throttle',  label: 'Throttling',  count: throttle.enabled ? '●' : null },
+    { key: 'rules', label: 'Rules', ariaLabel: 'Rule sets', count: ruleSets.length },
+    { key: 'mapremote', label: 'Map Remote', count: mapRemote.length },
+    { key: 'maplocal', label: 'Map Local', count: mapLocal.length },
+    { key: 'fixtures', label: 'Fixtures' },
+    { key: 'access', label: 'Access', count: access.length },
+    { key: 'throttle', label: 'Throttling', count: throttle.enabled ? '●' : null },
   ];
 
-  const actions = tab !== 'throttle' && (
-    <button className="btn primary" onClick={openAdd}>
-      <span style={{ fontSize: 14, lineHeight: 0 }}>＋</span> Add rule
-    </button>
+  const actions = tab !== 'throttle' && tab !== 'fixtures' && (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--text-faint)', cursor: 'pointer', userSelect: 'none' }}>
+        <input type="checkbox" checked={showDisabled} onChange={e => setShowDisabled(e.target.checked)} style={{ cursor: 'pointer' }} />
+        Show disabled
+      </label>
+      <button className="btn ghost" onClick={importRules} title="Import rules from JSON">Import</button>
+      <button className="btn ghost" onClick={exportRules} title="Export rules as JSON">Export</button>
+      <button className="btn primary" onClick={openAdd}>
+        <span style={{ fontSize: 14, lineHeight: 0 }}>＋</span> Add rule
+      </button>
+    </div>
   );
 
   return (
@@ -954,11 +1407,12 @@ function RulesSurface() {
       sub="location-based rules evaluated in order on every proxied request"
       tabs={tabs} activeTab={tab} onTab={setTab}
       actions={actions}>
-      {tab === 'rules'     && <RuleSetTab     rules={ruleSets} onReload={load} editTarget={rsEdit} setEditTarget={setRsEdit} />}
-      {tab === 'mapremote' && <MapRemoteTab   rules={mapRemote} onReload={load} editTarget={mrEdit} setEditTarget={setMrEdit} />}
-      {tab === 'maplocal'  && <MapLocalTab    rules={mapLocal}  onReload={load} editTarget={mlEdit} setEditTarget={setMlEdit} />}
-      {tab === 'access'    && <AccessTab      rules={access}    onReload={load} editTarget={acEdit} setEditTarget={setAcEdit} />}
-      {tab === 'throttle'  && <ThrottleControls cfg={throttle} onChange={setThrottle} onSave={saveThrottle} />}
+      {tab === 'rules' && <RuleSetTab rules={ruleSets} onReload={load} editTarget={rsEdit} setEditTarget={setRsEdit} showDisabled={showDisabled} />}
+      {tab === 'mapremote' && <MapRemoteTab rules={mapRemote} onReload={load} editTarget={mrEdit} setEditTarget={setMrEdit} />}
+      {tab === 'maplocal' && <MapLocalTab rules={mapLocal} onReload={load} editTarget={mlEdit} setEditTarget={setMlEdit} />}
+      {tab === 'fixtures' && <FixturesTab onReload={load} />}
+      {tab === 'access' && <AccessTab rules={access} onReload={load} editTarget={acEdit} setEditTarget={setAcEdit} />}
+      {tab === 'throttle' && <ThrottleControls cfg={throttle} onChange={setThrottle} onSave={saveThrottle} />}
     </SurfaceShell>
   );
 }
@@ -967,10 +1421,10 @@ function RulesSurface() {
 
 function ThrottleControls({ cfg, onChange, onSave }) {
   const PRESETS = [
-    { id: 'wifi',    name: 'Wifi',      latency: 2,   down: 30000 },
-    { id: '3g-fast', name: '3G fast',   latency: 80,  down: 1600 },
-    { id: '3g-slow', name: '3G slow',   latency: 200, down: 400 },
-    { id: 'edge',    name: 'Edge / 2G', latency: 800, down: 240 },
+    { id: 'wifi', name: 'Wifi', latency: 2, down: 30000 },
+    { id: '3g-fast', name: '3G fast', latency: 80, down: 1600 },
+    { id: '3g-slow', name: '3G slow', latency: 200, down: 400 },
+    { id: 'edge', name: 'Edge / 2G', latency: 800, down: 240 },
   ];
   const applyPreset = (p) => onChange({ ...cfg, enabled: true, preset: p.id, latency: p.latency, downKbps: p.down });
   return (
@@ -1017,15 +1471,27 @@ const BP_INITIAL = [];
 
 // ── Breakpoint modal ────────────────────────────────────────────────────
 
-const EMPTY_BP_LOC = { host: null, path: null, port: null, protocol: null, query: null, methods: [], mode: 'glob' };
+const EMPTY_BP_LOC = {
+  host: null,
+  path: null,
+  port: null,
+  protocol: null,
+  query: null,
+  methods: [],
+  wire_protocol: null,
+  application_protocol: null,
+  body_mode: null,
+  mode: 'glob',
+};
 
 function BreakpointModal({ rule, onClose, onSave }) {
   const isNew = !rule?.id;
   const [loc, setLoc] = React.useState(rule?.location || EMPTY_BP_LOC);
   const [bpType, setBpType] = React.useState(rule?.bp_type || 'Request');
+  const [tier, setTier] = React.useState(rule?.tier || 'body');
   const lbl = { fontSize: 12, color: 'var(--text-faint)', whiteSpace: 'nowrap' };
   const save = async () => {
-    try { await onSave({ location: loc, bp_type: bpType }); }
+    try { await onSave({ location: loc, bp_type: bpType, tier }); }
     catch (e) { notifyError(e.message || e); }
   };
   return (
@@ -1036,6 +1502,18 @@ function BreakpointModal({ rule, onClose, onSave }) {
           <option value="Request">Requests</option>
           <option value="Response">Responses</option>
         </select>
+        <span style={{ ...lbl, marginLeft: 6 }}>tier</span>
+        <select className="cmp-input" style={{ width: 'auto' }} value={tier} onChange={e => {
+          const nextTier = e.target.value;
+          setTier(nextTier);
+          if (nextTier === 'frame') setLoc(prev => applyTrafficKind(prev, 'websocket'));
+          if (nextTier === 'tunnel') setLoc(prev => applyTrafficKind(prev, 'tunnel'));
+        }}>
+          <option value="body">Body</option>
+          <option value="head">Head</option>
+          <option value="frame">Frame</option>
+          <option value="tunnel">Tunnel</option>
+        </select>
         <span style={{ ...lbl, marginLeft: 6 }}>matching</span>
       </div>
       <LocationEditor loc={loc} onChange={setLoc} />
@@ -1043,25 +1521,84 @@ function BreakpointModal({ rule, onClose, onSave }) {
   );
 }
 
-function BreakpointsSurface({ sessions, onResume, onAbort }) {
+function BreakpointsSurface({ sessions, onResume, onAbort, createFrom }) {
   const [bps, setBps] = React.useState(BP_INITIAL);
   const [pending, setPending] = React.useState([]);
+  const [diagnostics, setDiagnostics] = React.useState([]);
   const [bpEdit, setBpEdit] = React.useState(undefined); // undefined=closed, null=new, obj=editing
+  const [expandedId, setExpandedId] = React.useState(null);
+  const [editContexts, setEditContexts] = React.useState({}); // id -> {body, headers}
+  const [diagOpen, setDiagOpen] = React.useState(false);
+
+  const parseBps = React.useCallback((rules) => (rules || []).map(r => {
+    const loc = r.location || {};
+    const parts = [loc.host, loc.path, loc.query].filter(Boolean);
+    const match = parts.length ? parts.join(' · ') : 'any';
+    return { name: match, match, action: r.bp_type, meta: `${r.tier || 'body'} · ${loc.mode || 'glob'}`, on: !!r.enabled, raw: r };
+  }), []);
+
   const load = React.useCallback(async () => {
-    const [rules, held] = await Promise.all([
+    const [rules, held, diag] = await Promise.all([
       fetchJson('/admin/breakpoints', []),
       fetchJson('/admin/breakpoints/pending', []),
+      fetchJson('/admin/breakpoints/diagnostics', []),
     ]);
-    setBps((rules || []).map(r => {
-      const loc = r.location || {};
-      const parts = [loc.host, loc.path, loc.query].filter(Boolean);
-      const match = parts.length ? parts.join(' · ') : 'any';
-      return { name: match, match, action: r.bp_type, meta: loc.mode || 'glob', on: !!r.enabled, raw: r };
-    }));
+    setBps(parseBps(rules));
     setPending(held || []);
+    setDiagnostics((diag || []).slice(-5).reverse());
+  }, [parseBps]);
+
+  const loadPending = React.useCallback(async () => {
+    const [held, diag] = await Promise.all([
+      fetchJson('/admin/breakpoints/pending', []),
+      fetchJson('/admin/breakpoints/diagnostics', []),
+    ]);
+    setPending(held || []);
+    setDiagnostics((diag || []).slice(-5).reverse());
   }, []);
-  React.useEffect(() => { load(); const id = setInterval(load, 2000); return () => clearInterval(id); }, [load]);
+
+  // Pre-fill from create-from-session action
+  React.useEffect(() => { if (createFrom) setBpEdit(createFrom); }, [createFrom]);
+
+  // SSE-driven queue — react to paused/resumed sessions immediately, no polling
+  React.useEffect(() => {
+    load();
+    let es, debounceTimer;
+    function connect() {
+      if (es) { try { es.close(); } catch (_) { } }
+      es = new EventSource('/api/sessions/stream');
+      es.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data);
+          if (ev.kind === 'SessionPaused' || ev.kind === 'SessionUpdated' || ev.kind === 'reload') {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(loadPending, 120);
+          }
+        } catch (_) { }
+      };
+      es.onerror = () => { clearTimeout(debounceTimer); debounceTimer = setTimeout(connect, 3000); };
+    }
+    connect();
+    return () => { clearTimeout(debounceTimer); try { es?.close(); } catch (_) { } };
+  }, [load, loadPending]);
+
   const paused = pending;
+
+  // Expand a pending row and initialise its edit state from context
+  const expandPending = (id) => {
+    setExpandedId(prev => {
+      if (prev === id) return null;
+      const item = pending.find(p => p.id === id);
+      if (item && !editContexts[id]) {
+        const ctx = item.context?.Request || item.context?.Response;
+        if (ctx) {
+          const headersStr = Object.entries(ctx.headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n');
+          setEditContexts(prev2 => ({ ...prev2, [id]: { body: ctx.body || '', headers: headersStr } }));
+        }
+      }
+      return id;
+    });
+  };
 
   const saveBp = async (data) => {
     if (bpEdit?.id) {
@@ -1084,33 +1621,58 @@ function BreakpointsSurface({ sessions, onResume, onAbort }) {
     await load();
   };
   const disableAll = async () => {
-    for (const row of bps) {
-      if (row.on) {
-        await sendJson(`/admin/breakpoints/${encodeURIComponent(row.raw.id)}`, 'PUT', { ...row.raw, enabled: false }).catch(e => notifyError(e.message || e));
-      }
-    }
+    await Promise.all(
+      bps.filter(row => row.on).map(row =>
+        sendJson(`/admin/breakpoints/${encodeURIComponent(row.raw.id)}`, 'PUT', { ...row.raw, enabled: false })
+          .catch(e => notifyError(e.message || e))
+      )
+    );
     const heldNow = await fetchJson('/admin/breakpoints/pending', pending);
-    for (const held of heldNow || []) {
-      await sendJson(`/admin/breakpoints/pending/${encodeURIComponent(held.id)}/resolve`, 'POST', { action: 'continue' }).catch(e => notifyError(e.message || e));
-    }
+    await Promise.all(
+      (heldNow || []).map(held =>
+        sendJson(`/admin/breakpoints/pending/${encodeURIComponent(held.id)}/resolve`, 'POST', { action: 'continue' })
+          .catch(e => notifyError(e.message || e))
+      )
+    );
     await load();
   };
+
   const resolvePending = async (id, action) => {
-    await sendJson(`/admin/breakpoints/pending/${encodeURIComponent(id)}/resolve`, 'POST', { action }).catch(e => notifyError(e.message || e));
-    await load();
+    let body = { action };
+    if (action === 'modify') {
+      const item = pending.find(p => p.id === id);
+      const ec = editContexts[id];
+      if (item && ec) {
+        const isRequest = !!item.context?.Request;
+        const origCtx = item.context?.Request || item.context?.Response || {};
+        const headersObj = {};
+        (ec.headers || '').split('\n').forEach(line => {
+          const colon = line.indexOf(':');
+          if (colon > 0) headersObj[line.slice(0, colon).trim()] = line.slice(colon + 1).trim();
+        });
+        const modCtx = { ...origCtx, body: ec.body, headers: headersObj };
+        body = { action: 'modify', context: isRequest ? { Request: modCtx } : { Response: modCtx } };
+      } else {
+        body = { action: 'continue' };
+      }
+    }
+    await sendJson(`/admin/breakpoints/pending/${encodeURIComponent(id)}/resolve`, 'POST', body).catch(e => notifyError(e.message || e));
+    setEditContexts(prev => { const n = { ...prev }; delete n[id]; return n; });
+    setExpandedId(null);
+    await loadPending();
   };
 
   const actions = (
     <>
       <button className="btn ghost" onClick={disableAll}>Disable all</button>
-      <button className="btn primary" onClick={() => setBpEdit(null)}><span style={{fontSize:14, lineHeight:0}}>＋</span> Add breakpoint</button>
+      <button className="btn primary" onClick={() => setBpEdit(null)}><span style={{ fontSize: 14, lineHeight: 0 }}>＋</span> Add breakpoint</button>
     </>
   );
 
   return (
     <SurfaceShell
       title="Breakpoints"
-      sub={`${paused.length} request${paused.length === 1 ? '' : 's'} currently held · ${bps.filter(b=>b.on).length} of ${bps.length} rules active`}
+      sub={`${paused.length} request${paused.length === 1 ? '' : 's'} currently held · ${bps.filter(b => b.on).length} of ${bps.length} rules active`}
       actions={actions}>
       <div style={{ padding: '16px 16px 8px' }}>
         <div style={{ fontSize: 10.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
@@ -1120,25 +1682,91 @@ function BreakpointsSurface({ sessions, onResume, onAbort }) {
       <div className="queue">
         {paused.length === 0 && <div className="empty-q">No requests are paused. Triggering rules will hold them here.</div>}
         {paused.map(s => {
+          const isReq = !!s.context?.Request;
           const ctx = s.context?.Request || s.context?.Response || s;
+          const isExpanded = expandedId === s.id;
+          const ec = editContexts[s.id] || { body: '', headers: '' };
           return (
-            <div key={s.id} className="qrow">
-              <span className="cell-method" data-m={ctx.method || 'GET'} style={{ fontSize: 11 }}>{ctx.method || 'RESP'}</span>
-              <span className="tag-badge bp">BP</span>
-              <div>
-                <div className="url">
-                  <span className="host">{ctx.host || ''}</span><span className="path">{ctx.uri || ctx.request_uri || ''}</span>
+            <React.Fragment key={s.id}>
+              <div className="qrow" style={{ cursor: 'pointer' }} onClick={() => expandPending(s.id)}>
+                <span className="cell-method" data-m={ctx.method || (isReq ? 'GET' : 'RESP')} style={{ fontSize: 11 }}>
+                  {ctx.method || (isReq ? 'GET' : 'RESP')}
+                </span>
+                <span className="tag-badge bp">BP</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="url">
+                    <span className="host">{ctx.host || ''}</span>
+                    <span className="path">{ctx.uri || ctx.request_uri || ''}</span>
+                  </div>
+                  <div className="when">
+                    {isReq ? 'request' : `response ${ctx.status || ''}`} · held · {s.bp_type || ''} {isExpanded ? '▾' : '▸'}
+                  </div>
                 </div>
-                <div className="when">held by breakpoint until resumed · {s.bp_type || s.note || ''}</div>
+                <div className="acts" onClick={e => e.stopPropagation()}>
+                  <button className="btn sm" onClick={() => resolvePending(s.id, 'drop')}>Abort</button>
+                  <button className="btn sm primary" onClick={() => resolvePending(s.id, 'continue')}><Icon name="resume" size={10} /> Resume</button>
+                </div>
               </div>
-              <div className="acts">
-                <button className="btn sm" onClick={() => pending.length ? resolvePending(s.id, 'drop') : onAbort(s.id)}>Abort</button>
-                <button className="btn sm primary" onClick={() => pending.length ? resolvePending(s.id, 'continue') : onResume(s.id)}><Icon name="resume" size={10} /> Resume</button>
-              </div>
-            </div>
+              {isExpanded && (
+                <div style={{ background: 'var(--surface-2)', padding: '10px 16px 14px', borderBottom: '1px solid var(--border)' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>
+                        {isReq ? 'Request Body' : 'Response Body'}
+                      </div>
+                      <textarea className="cmp-input" rows={5}
+                        style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12, boxSizing: 'border-box' }}
+                        value={ec.body}
+                        onChange={e => setEditContexts(prev => ({ ...prev, [s.id]: { ...ec, body: e.target.value } }))}
+                        placeholder="(empty body)" />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 4 }}>Headers <span style={{ opacity: 0.6 }}>(Name: Value, one per line)</span></div>
+                      <textarea className="cmp-input" rows={5}
+                        style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12, boxSizing: 'border-box' }}
+                        value={ec.headers}
+                        onChange={e => setEditContexts(prev => ({ ...prev, [s.id]: { ...ec, headers: e.target.value } }))}
+                        placeholder="Content-Type: application/json" />
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10, justifyContent: 'flex-end' }}>
+                    <button className="btn sm" onClick={() => resolvePending(s.id, 'drop')}>Abort</button>
+                    <button className="btn sm" onClick={() => resolvePending(s.id, 'continue')}>Resume unchanged</button>
+                    <button className="btn sm primary" onClick={() => resolvePending(s.id, 'modify')}>Modify &amp; Resume</button>
+                  </div>
+                </div>
+              )}
+            </React.Fragment>
           );
         })}
       </div>
+      {/* Diagnostics — collapsible, shown above rules */}
+      {diagnostics.length > 0 && (
+        <div style={{ padding: '12px 16px 0' }}>
+          <button
+            className="copy-btn"
+            style={{ fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-faint)', padding: '2px 0', marginBottom: diagOpen ? 8 : 0 }}
+            onClick={() => setDiagOpen(o => !o)}
+            aria-expanded={diagOpen}>
+            {diagOpen ? '▾' : '▸'} Diagnostics ({diagnostics.length})
+          </button>
+          {diagOpen && (
+            <div className="queue">
+              {diagnostics.map((d, i) => (
+                <div key={`${d.at || i}-${d.rule_id || i}`} className="qrow">
+                  <span className="tag-badge bp">{d.tier || 'bp'}</span>
+                  <div>
+                    <div className="url">
+                      <span className="host">{d.host || ''}</span><span className="path">{d.path || ''}</span>
+                    </div>
+                    <div className="when">{d.reason || 'Breakpoint rule skipped'} · {d.body_mode || 'unknown body mode'} · {d.wire_protocol || 'unknown protocol'}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
       <div style={{ padding: '20px 16px 8px' }}>
         <div style={{ fontSize: 10.5, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
           Breakpoint rules
@@ -1147,6 +1775,7 @@ function BreakpointsSurface({ sessions, onResume, onAbort }) {
       <RuleTable
         rows={bps}
         onToggle={toggleBreakpoint}
+        onEdit={(i, row) => setBpEdit(row.raw)}
         onDelete={deleteBreakpoint}
       />
       {bpEdit !== undefined && (
@@ -1162,20 +1791,20 @@ function BreakpointsSurface({ sessions, onResume, onAbort }) {
 
 // ─── Inspectors surface ────────────────────────────────────────────────
 const PLUGIN_META = {
-  AccessControlMiddleware:   { icon: 'shield',    label: 'Access Control',     desc: 'Blocks or allows requests based on Location rules (host, path, method). Block rules 403 on match; Allow rules create an allowlist.', config: '/rules' },
-  CaptureFilterMiddleware:   { icon: 'filter',    label: 'Capture Filter',     desc: 'Controls which hosts are recorded into the session log. Configure in the Capture Filter surface.',         config: '/capture-filter' },
-  DnsOverrideMiddleware:     { icon: 'globe',     label: 'DNS Override',       desc: 'Resolves specific hostnames to fixed IPs before forwarding. Configure in the DNS Override surface.',         config: '/dns' },
-  MapRemoteMiddleware:       { icon: 'route',     label: 'Map Remote',         desc: 'Routes matching requests to a different upstream origin. Path and query string are preserved. Configure in Rules → Map Remote.',  config: '/rules' },
-  ThrottlingMiddleware:      { icon: 'activity',  label: 'Throttle',           desc: 'Injects latency and clamps bandwidth on proxied responses. Configure in Rules → Throttling.',               config: '/rules' },
-  UnifiedRewriteMiddleware:  { icon: 'edit',      label: 'Rewrite Rules',      desc: 'Applies Location-matched rule sets: set/remove headers, redirect, block, rewrite host/path/query, and more.', config: '/rules' },
-  BreakpointMiddleware:      { icon: 'pause',     label: 'Breakpoints',        desc: 'Pauses requests or responses matching a pattern, allowing manual inspection and editing before forwarding.', config: '/breakpoints' },
-  JwtInspectorMiddleware:    { icon: 'key',       label: 'JWT Inspector',      desc: 'Decodes JWT tokens in Authorization and cookie headers. Decoded claims appear in the session detail panel.', config: null },
-  GraphQLInspectorMiddleware:{ icon: 'filter',    label: 'GraphQL Inspector',  desc: 'Parses GraphQL operations from request bodies. Operation name and type shown in the session detail panel.',  config: null },
-  GrpcInspectorMiddleware:   { icon: 'layers',    label: 'gRPC Inspector',     desc: 'Decodes gRPC frames (application/grpc). Frame type and message shown in the session detail panel.',          config: null },
-  InspectionMiddleware:      { icon: 'inspector', label: 'Traffic Inspector',  desc: 'Records request/response pairs to the session log and broadcasts change events via SSE.',                   config: null },
-  MapLocalMiddleware:        { icon: 'folder',    label: 'Map Local',          desc: 'Serves local files as responses for matching requests, bypassing the upstream. Configure in Rules → Map Local.', config: '/rules' },
-  MockMiddleware:            { icon: 'shield',    label: 'Mock Server',        desc: 'Returns synthetic responses for matching path patterns, short-circuiting the real upstream.',                config: '/mock' },
-  LuaEngineMiddleware:       { icon: 'bolt',      label: 'Lua Engine',         desc: 'Runs sandboxed Lua 5.4 scripts per-request. Scripts managed in the Lua Scripts surface.',                   config: '/lua' },
+  AccessControlMiddleware: { icon: 'shield', label: 'Access Control', desc: 'Blocks or allows requests based on Location rules (host, path, method). Block rules 403 on match; Allow rules create an allowlist.', config: '/rules' },
+  CaptureFilterMiddleware: { icon: 'filter', label: 'Capture Filter', desc: 'Controls which hosts are recorded into the session log. Configure in the Capture Filter surface.', config: '/capture-filter' },
+  DnsOverrideMiddleware: { icon: 'globe', label: 'DNS Override', desc: 'Resolves specific hostnames to fixed IPs before forwarding. Configure in the DNS Override surface.', config: '/dns' },
+  MapRemoteMiddleware: { icon: 'route', label: 'Map Remote', desc: 'Routes matching requests to a different upstream origin. Path and query string are preserved. Configure in Rules → Map Remote.', config: '/rules' },
+  ThrottlingMiddleware: { icon: 'activity', label: 'Throttle', desc: 'Injects latency and clamps bandwidth on proxied responses. Configure in Rules → Throttling.', config: '/rules' },
+  UnifiedRewriteMiddleware: { icon: 'edit', label: 'Rewrite Rules', desc: 'Applies Location-matched rule sets: set/remove headers, redirect, block, rewrite host/path/query, and more.', config: '/rules' },
+  BreakpointMiddleware: { icon: 'pause', label: 'Breakpoints', desc: 'Pauses requests or responses matching a pattern, allowing manual inspection and editing before forwarding.', config: '/breakpoints' },
+  JwtInspectorMiddleware: { icon: 'key', label: 'JWT Inspector', desc: 'Decodes JWT tokens in Authorization and cookie headers. Decoded claims appear in the session detail panel.', config: null },
+  GraphQLInspectorMiddleware: { icon: 'filter', label: 'GraphQL Inspector', desc: 'Parses GraphQL operations from request bodies. Operation name and type shown in the session detail panel.', config: null },
+  GrpcInspectorMiddleware: { icon: 'layers', label: 'gRPC Inspector', desc: 'Decodes gRPC frames (application/grpc). Frame type and message shown in the session detail panel.', config: null },
+  InspectionMiddleware: { icon: 'inspector', label: 'Traffic Inspector', desc: 'Records request/response pairs to the session log and broadcasts change events via SSE.', config: null },
+  MapLocalMiddleware: { icon: 'folder', label: 'Map Local', desc: 'Serves local files as responses for matching requests, bypassing the upstream. Configure in Rules → Map Local.', config: '/rules' },
+  MockMiddleware: { icon: 'shield', label: 'Mock Server', desc: 'Returns synthetic responses for matching path patterns, short-circuiting the real upstream.', config: '/mock' },
+  LuaEngineMiddleware: { icon: 'bolt', label: 'Lua Engine', desc: 'Runs sandboxed Lua 5.4 scripts per-request. Scripts managed in the Lua Scripts surface.', config: '/lua' },
 };
 
 function InspectorsSurface() {

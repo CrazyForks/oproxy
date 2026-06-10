@@ -1,4 +1,4 @@
-/// HTTP/3 (QUIC) listener and upstream client.
+/// HTTP/3 (QUIC) listener.
 ///
 /// Compiled only with the `http3` Cargo feature. The listener accepts QUIC
 /// connections, demultiplexes h3 request streams, normalises each request into
@@ -14,8 +14,6 @@ mod inner {
     use futures_util::StreamExt;
     use h3::server::RequestStream;
     use tokio::sync::watch;
-
-    pub use h3_quinn::quinn;
 
     use crate::{core::engine::ProxyEngine, transport::lifecycle::wait_for_shutdown};
 
@@ -43,7 +41,19 @@ mod inner {
                 .unwrap_or("localhost")
                 .to_string();
             // Bridge async cert issuance to the synchronous rustls trait using
-            // block_in_place (safe on multi-thread tokio workers).
+            // block_in_place — only safe on multi-thread tokio workers. On a
+            // current-thread runtime block_in_place panics, so fail the handshake
+            // gracefully instead of taking the process down.
+            let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
+                .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+                .unwrap_or(false);
+            if !on_multi_thread_runtime {
+                tracing::warn!(
+                    "HTTP/3 certificate resolution requires a multi-thread tokio runtime; \
+                     refusing QUIC handshake"
+                );
+                return None;
+            }
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(self.ca.get_certificate_for_domain(&sni))
             });
@@ -82,7 +92,6 @@ mod inner {
         let server_cfg = build_quic_server_config(ca)?;
         let addr: SocketAddr = format!("{}:{}", bind_host, port).parse()?;
         let endpoint = quinn::Endpoint::server(server_cfg, addr)?;
-        tracing::info!("oproxy HTTP/3 listener on udp://{}", addr);
         Ok(endpoint)
     }
 
@@ -180,12 +189,31 @@ mod inner {
     ) {
         let (parts, _) = req.into_parts();
 
-        // Read body DATA frames from the h3 stream.
+        // Read body DATA frames from the h3 stream, enforcing `max_body_bytes`
+        // DURING the read so a client cannot exhaust memory before the engine's
+        // own cap (which only applies after this pre-buffering) kicks in.
+        let max_body = engine.max_body_bytes();
         let mut body_chunks: Vec<Bytes> = Vec::new();
+        let mut body_len: usize = 0;
         while let Ok(Some(chunk)) = stream.recv_data().await {
             let mut buf = chunk;
             use bytes::Buf;
-            body_chunks.push(buf.copy_to_bytes(buf.remaining()));
+            let chunk = buf.copy_to_bytes(buf.remaining());
+            body_len = body_len.saturating_add(chunk.len());
+            if body_len > max_body {
+                tracing::warn!(
+                    max_body_bytes = max_body,
+                    "h3 request body exceeded max_body_bytes; rejecting"
+                );
+                let resp = axum::http::Response::builder()
+                    .status(413)
+                    .body(())
+                    .unwrap();
+                let _ = stream.send_response(resp).await;
+                let _ = stream.finish().await;
+                return;
+            }
+            body_chunks.push(chunk);
         }
         let body_bytes: Bytes = body_chunks.into_iter().fold(Bytes::new(), |acc, chunk| {
             // Concat without allocation when possible.
@@ -274,156 +302,7 @@ mod inner {
 
         builder.body(Body::from(body)).ok()
     }
-
-    // ── H3Quinn upstream transport ──────────────────────────────────────────
-
-    /// `UpstreamTransport` that sends requests via HTTP/3.
-    pub struct H3Quinn {
-        endpoint: quinn::Endpoint,
-    }
-
-    impl H3Quinn {
-        /// Build a client endpoint that trusts standard WebPKI roots.
-        pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-            let mut root_store = rustls::RootCertStore::empty();
-            for cert in webpki_roots::TLS_SERVER_ROOTS.iter().cloned() {
-                root_store.roots.push(cert);
-            }
-            let crypto = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            let client_cfg = quinn::ClientConfig::new(Arc::new(
-                quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-            ));
-            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-            endpoint.set_default_client_config(client_cfg);
-            Ok(Self { endpoint })
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::core::forward::UpstreamTransport for H3Quinn {
-        async fn connect(
-            &self,
-            origin: &crate::core::forward::Origin,
-            _certs: &dyn crate::core::forward::CertResolver,
-        ) -> Result<Box<dyn crate::core::forward::UpstreamConn>, crate::core::forward::TransportError>
-        {
-            let addr_str = format!("{}:{}", origin.host, origin.port);
-            let addr: SocketAddr = addr_str
-                .parse()
-                .map_err(|_| crate::core::forward::TransportError::Connect(addr_str.clone()))?;
-
-            let conn = self
-                .endpoint
-                .connect(addr, &origin.host)
-                .map_err(|e| crate::core::forward::TransportError::Connect(e.to_string()))?
-                .await
-                .map_err(|e| crate::core::forward::TransportError::Connect(e.to_string()))?;
-
-            let h3_conn = h3_quinn::Connection::new(conn);
-            let (mut driver, send_request) = h3::client::builder()
-                .build::<_, _, Bytes>(h3_conn)
-                .await
-                .map_err(|e| crate::core::forward::TransportError::Connect(e.to_string()))?;
-
-            tokio::spawn(async move {
-                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            });
-
-            Ok(Box::new(H3Conn { send_request }))
-        }
-    }
-
-    struct H3Conn {
-        send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::core::forward::UpstreamConn for H3Conn {
-        fn protocol(&self) -> crate::core::forward::NegotiatedProtocol {
-            crate::core::forward::NegotiatedProtocol::H3
-        }
-
-        fn max_concurrent_streams(&self) -> usize {
-            100
-        }
-
-        async fn send_request(
-            &self,
-            head: crate::core::forward::RequestHead,
-            mut body: crate::core::forward::BodyRx,
-        ) -> Result<crate::core::forward::ResponseStream, crate::core::forward::TransportError>
-        {
-            let mut sr = self.send_request.clone();
-            let http_req = axum::http::Request::builder()
-                .method(head.method.as_str())
-                .uri(head.uri.as_str())
-                .body(())
-                .map_err(|e| crate::core::forward::TransportError::Connect(e.to_string()))?;
-
-            let mut stream = sr
-                .send_request(http_req)
-                .await
-                .map_err(|e| crate::core::forward::TransportError::Connect(e.to_string()))?;
-
-            // Send body frames.
-            use crate::core::forward::Frame;
-            while let Some(frame) = body.recv().await {
-                match frame {
-                    Ok(Frame::Data(data)) => {
-                        stream.send_data(data).await.map_err(|e| {
-                            crate::core::forward::TransportError::Connect(e.to_string())
-                        })?;
-                    }
-                    Ok(Frame::Trailers(_)) | Err(_) => break,
-                }
-            }
-            stream
-                .finish()
-                .await
-                .map_err(|e| crate::core::forward::TransportError::Connect(e.to_string()))?;
-
-            let resp = stream
-                .recv_response()
-                .await
-                .map_err(|e| crate::core::forward::TransportError::Connect(e.to_string()))?;
-
-            let (parts, _) = resp.into_parts();
-            let status = parts.status.as_u16();
-            let mut headers = crate::middleware::HeaderMap::new();
-            for (k, v) in &parts.headers {
-                if let Ok(s) = v.to_str() {
-                    headers.insert(k.to_string(), s.to_string());
-                }
-            }
-
-            // Collect h3 DATA frames into a body channel.
-            let (tx, rx) = crate::core::forward::body_channel(8);
-            let tx_clone = tx;
-            tokio::spawn(async move {
-                while let Ok(Some(mut data)) = stream.recv_data().await {
-                    use bytes::Buf;
-                    let chunk = data.copy_to_bytes(data.remaining());
-                    if tx_clone.send(Frame::Data(chunk)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            Ok(crate::core::forward::ResponseStream {
-                head: crate::core::forward::ResponseHead {
-                    status,
-                    headers,
-                    protocol: crate::core::forward::NegotiatedProtocol::H3,
-                },
-                body: rx,
-            })
-        }
-    }
 }
 
 #[cfg(feature = "http3")]
-pub use inner::quinn;
-#[cfg(feature = "http3")]
-pub use inner::{H3Quinn, bind_h3_listener, build_quic_server_config, run_h3_listener};
+pub use inner::{bind_h3_listener, run_h3_listener};

@@ -95,6 +95,47 @@ pub(super) async fn list_rule_sets(State(state): State<Arc<AppState>>) -> impl I
     axum::Json(state.rule_sets.read().await.clone())
 }
 
+/// Reorder rule sets by accepting an ordered list of IDs.
+/// Rules not in the list are appended at the end in their original order.
+pub(super) async fn reorder_rule_sets(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let ids: Vec<String> = match body.get("ids").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    }) {
+        Some(v) => v,
+        None => {
+            return (
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({ "error": "ids array required" })),
+            )
+                .into_response();
+        }
+    };
+    {
+        let mut rules = state.rule_sets.write().await;
+        let mut reordered: Vec<RewriteRuleSet> = ids
+            .iter()
+            .filter_map(|id| rules.iter().find(|r| &r.id == id).cloned())
+            .collect();
+        // Append any rules not mentioned in ids (preserve them at the end)
+        for r in rules.iter() {
+            if !ids.contains(&r.id) {
+                reordered.push(r.clone());
+            }
+        }
+        *rules = reordered;
+    }
+    let rules = state.rule_sets.read().await.clone();
+    if let Err(e) = storage::save_rule_sets(&state.storage_path, &rules).await {
+        return storage_error_response(e);
+    }
+    axum::Json(rules).into_response()
+}
+
 pub(super) async fn create_rule_set(
     State(state): State<Arc<AppState>>,
     axum::extract::Json(mut rule): axum::extract::Json<RewriteRuleSet>,
@@ -178,8 +219,8 @@ fn map_local_fixtures_dir(state: &AppState) -> std::path::PathBuf {
 /// managed `storage/map-local/` fixtures directory).
 fn validate_map_local_path(
     rule: &MapLocalRule,
-    base_path: &Option<std::path::PathBuf>,
-    fixtures_dir: &std::path::Path,
+    _base_path: &Option<std::path::PathBuf>,
+    _fixtures_dir: &std::path::Path,
 ) -> Option<axum::response::Response> {
     if rule.file_path.trim().is_empty() {
         return Some(
@@ -192,41 +233,10 @@ fn validate_map_local_path(
                 .into_response(),
         );
     }
-    let path = crate::middleware::plugins::map_local::resolve_map_local_path(
-        &rule.file_path,
-        base_path.as_deref(),
-        Some(fixtures_dir),
-    );
-
-    if !path.exists() {
-        let hint = if base_path.is_some() && !rule.file_path.starts_with('/') {
-            format!(
-                "relative paths resolve from base path '{}' or the managed fixtures dir '{}'",
-                base_path.as_ref().unwrap().display(),
-                fixtures_dir.display()
-            )
-        } else if !rule.file_path.starts_with('/') {
-            format!(
-                "relative paths resolve from the managed fixtures dir '{}' — upload a file first",
-                fixtures_dir.display()
-            )
-        } else {
-            "In containerized deployments ensure the path is mounted inside the container."
-                .to_string()
-        };
-        return Some(
-            (
-                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                axum::Json(serde_json::json!({
-                    "error": format!(
-                        "file_path '{}' does not exist or is not accessible from this process. {}",
-                        rule.file_path, hint
-                    )
-                })),
-            )
-                .into_response(),
-        );
-    }
+    // Path existence is checked at serve time by the middleware (returns 502 when
+    // missing). We intentionally do NOT block rule creation here — users commonly
+    // pre-create rules for files they will place on disk or mount into the container
+    // after the rule is saved. A missing file at creation time is not an error.
     None
 }
 
@@ -514,6 +524,46 @@ pub(super) async fn delete_map_remote_rule(
     axum::http::StatusCode::OK.into_response()
 }
 
+/// Quick connectivity probe for a Map Remote destination.
+/// Fires a HEAD request (falling back to GET) and returns reachability info.
+pub(super) async fn test_map_remote(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let destination = match body.get("destination").and_then(|v| v.as_str()) {
+        Some(d) => d.trim_end_matches('/').to_string(),
+        None => {
+            return (
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({ "error": "destination is required" })),
+            )
+                .into_response();
+        }
+    };
+    let client = state.proxy_engine.http_client().await;
+    let probe_url = format!("{destination}/");
+    // Try HEAD first, fall back to GET
+    let result = client
+        .head(&probe_url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|_| reqwest::Client::new().get(&probe_url).build().unwrap_err());
+
+    match result {
+        Ok(resp) => axum::Json(serde_json::json!({
+            "ok": true,
+            "status": resp.status().as_u16(),
+        }))
+        .into_response(),
+        Err(e) => axum::Json(serde_json::json!({
+            "ok": false,
+            "error": e.to_string(),
+        }))
+        .into_response(),
+    }
+}
+
 // ── Capture filter ─────────────────────────────────────────────────────────────
 
 pub(super) async fn get_capture_filter(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -535,15 +585,52 @@ pub(super) async fn update_capture_filter(
 // ── DNS overrides ──────────────────────────────────────────────────────────────
 
 pub(super) async fn list_dns(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    axum::Json(state.dns_overrides.read().await.clone())
+    // Return enabled entries as plain strings (backward-compat API contract);
+    // disabled entries are returned as objects so their state is preserved.
+    let overrides = state.dns_overrides.read().await;
+    let out: std::collections::HashMap<String, serde_json::Value> = overrides
+        .iter()
+        .map(|(host, entry)| {
+            let val = if entry.enabled {
+                serde_json::Value::String(entry.ip.clone())
+            } else {
+                serde_json::json!({ "ip": entry.ip, "enabled": false })
+            };
+            (host.clone(), val)
+        })
+        .collect();
+    axum::Json(out)
 }
 
 pub(super) async fn update_dns(
     State(state): State<Arc<AppState>>,
-    axum::extract::Json(new_map): axum::extract::Json<std::collections::HashMap<String, String>>,
+    axum::extract::Json(new_map): axum::extract::Json<
+        std::collections::HashMap<String, crate::middleware::plugins::dns_override::DnsValue>,
+    >,
 ) -> impl IntoResponse {
     let mut overrides = state.dns_overrides.write().await;
-    *overrides = new_map;
+    *overrides = new_map
+        .into_iter()
+        .map(|(k, v)| (k, v.into_entry()))
+        .collect();
+    if let Err(e) = storage::save_dns_overrides(&state.storage_path, &overrides).await {
+        return storage_error_response(e);
+    }
+    axum::http::StatusCode::OK.into_response()
+}
+
+/// Upsert a single DNS override entry by host key.  Unlike the bulk POST which
+/// replaces the whole map, this is additive: existing entries for other hosts
+/// are left untouched.
+pub(super) async fn upsert_dns(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(host): axum::extract::Path<String>,
+    axum::extract::Json(entry): axum::extract::Json<
+        crate::middleware::plugins::dns_override::DnsEntry,
+    >,
+) -> impl IntoResponse {
+    let mut overrides = state.dns_overrides.write().await;
+    overrides.insert(host, entry);
     if let Err(e) = storage::save_dns_overrides(&state.storage_path, &overrides).await {
         return storage_error_response(e);
     }

@@ -24,17 +24,110 @@ const ACCENT_OPTIONS = [
 ];
 
 const METHODS = ['GET','POST','PUT','PATCH','DELETE','CONNECT','OPTIONS','HEAD'];
-const STATUS_BUCKETS = ['2','3','4','5','-'];
-const WORKSPACE_SURFACES = new Set(['sessions','compose','rules','breakpoints','mock','lua','inspector','dns','capture','webhooks','ca','settings']);
+const STATUS_BUCKETS = ['1','2','3','4','5','-'];
+const WORKSPACE_SURFACES = new Set(['sessions','dashboard','connections','compose','rules','breakpoints','mock','lua','inspector','dns','capture','webhooks','ca','settings']);
 const SESSION_SORT_KEYS = new Set(['idx','method','status','host','path','type','reqSize','total','ts','protocol']);
-const PROTO_BUCKETS = ['h1','h2','h3'];
-// Maps a session's protocol string to a filter bucket.
-const protoBucketOf = (p) => {
-  if (p === 'HTTP/2') return 'h2';
-  if (p === 'HTTP/3') return 'h3';
-  if (p === 'HTTP/1.1' || p === 'HTTP/1.0') return 'h1';
-  return 'other';
+const WIRE_BUCKETS = ['h1','h2','h3','socks'];
+const PROTO_FILTERS = [
+  { key: 'h1', label: '1.1', title: 'HTTP/1.1' },
+  { key: 'h2', label: 'H2', title: 'HTTP/2' },
+  { key: 'h3', label: 'H3', title: 'HTTP/3' },
+  { key: 'socks', label: 'SOCKS', title: 'SOCKS5' },
+];
+const APP_BUCKETS = ['http','ws','grpc','tunnel'];
+const APP_FILTERS = [
+  { key: 'http', label: 'HTTP', title: 'HTTP requests' },
+  { key: 'ws', label: 'WS', title: 'WebSocket' },
+  { key: 'grpc', label: 'gRPC', title: 'gRPC' },
+  { key: 'tunnel', label: 'Tunnel', title: 'TCP/SOCKS tunnels' },
+];
+
+function protocolToken(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Maps a session's protocol identity to a filter bucket.
+const protoBucketOf = (p, session = null) => {
+  const candidates = [
+    p,
+    session?.proto,
+    session?.wireProtocol,
+    session?.appProtocol,
+    session?.protocolContext?.downstream,
+    session?.protocolContext?.application,
+    session?.protocol_context?.downstream,
+    session?.protocol_context?.application,
+    session?.type,
+    session?.method,
+  ].map(protocolToken);
+  if (candidates.some(v => v === 'grpc')) return 'grpc';
+  if (candidates.some(v => v === 'websocket' || v === 'ws')) return 'ws';
+  if (candidates.some(v => v === 'socks5' || v === 'socks')) return 'socks';
+  if (candidates.some(v => v === 'http3' || v === 'h3')) return 'h3';
+  if (candidates.some(v => v === 'http2' || v === 'h2')) return 'h2';
+  if (candidates.some(v => v === 'http11' || v === 'http10' || v === 'http1' || v === 'h1')) return 'h1';
+  return 'h1';
 };
+
+const wireBucketOf = (p, session = null) => {
+  const candidates = [
+    p,
+    session?.wireProtocol,
+    session?.protocolContext?.downstream,
+    session?.protocol_context?.downstream,
+    session?.downstream_protocol,
+  ].map(protocolToken);
+  if (candidates.some(v => v === 'socks5' || v === 'socks')) return 'socks';
+  if (candidates.some(v => v === 'http3' || v === 'h3')) return 'h3';
+  if (candidates.some(v => v === 'http2' || v === 'h2')) return 'h2';
+  return 'h1';
+};
+
+const appBucketOf = (p, session = null) => {
+  const candidates = [
+    p,
+    session?.appProtocol,
+    session?.protocolContext?.application,
+    session?.protocolContext?.body_mode,
+    session?.protocol_context?.application,
+    session?.protocol_context?.body_mode,
+    session?.type,
+    session?.method,
+  ].map(protocolToken);
+  if (candidates.some(v => v === 'grpc')) return 'grpc';
+  if (candidates.some(v => v === 'websocket' || v === 'ws' || v === 'frames')) return 'ws';
+  if (candidates.some(v => v === 'tunnel' || v === 'socks5' || v === 'socks')) return 'tunnel';
+  return 'http';
+};
+
+function protocolLabel(value) {
+  const token = protocolToken(value);
+  if (token === 'admin') return '';
+  if (token === 'grpc') return 'gRPC';
+  if (token === 'websocket' || token === 'ws') return 'WebSocket';
+  if (token === 'socks5' || token === 'socks') return 'SOCKS5';
+  if (token === 'http3' || token === 'h3') return 'HTTP/3';
+  if (token === 'http2' || token === 'h2') return 'HTTP/2';
+  if (token === 'http10') return 'HTTP/1.0';
+  if (token === 'http11' || token === 'http1' || token === 'h1') return 'HTTP/1.1';
+  return value || '';
+}
+
+function applicationLabel(value, fallback = 'HTTP') {
+  const token = protocolToken(value);
+  if (token === 'grpc') return 'gRPC';
+  if (token === 'websocket' || token === 'ws' || token === 'frames') return 'WebSocket';
+  if (token === 'tunnel' || token === 'socks5' || token === 'socks' || token === 'raw') return 'Tunnel';
+  return fallback;
+}
+
+function sourceLabel(value) {
+  const token = String(value || 'proxy').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (token === 'adminforward') return 'Compose';
+  if (token === 'playback') return 'Replay';
+  if (token === 'imported') return 'Imported';
+  return 'Proxy';
+}
 
 const SESSION_LIST_LIMIT = 10000;
 const SESSION_RENDER_PAGE_SIZE = 250;
@@ -53,6 +146,7 @@ const STATUS_TEXT = {
   401: 'Unauthorized',
   403: 'Forbidden',
   404: 'Not Found',
+  402: 'Payment Required',
   408: 'Timeout',
   409: 'Conflict',
   410: 'Gone',
@@ -67,6 +161,10 @@ const STATUS_TEXT = {
 
 function inferType(exchange) {
   if (exchange.request?.method === 'WS') return 'ws';
+  const proto = exchange.protocol_context || {};
+  if (protocolToken(proto.downstream) === 'websocket') return 'ws';
+  if (protocolToken(proto.downstream) === 'socks5' || protocolToken(proto.body_mode) === 'tunnel') return 'tunnel';
+  if (protocolToken(proto.application) === 'grpc') return 'grpc';
   const headers = exchange.response?.headers || exchange.request?.headers || {};
   const contentType = Object.entries(headers).find(([k]) => k.toLowerCase() === 'content-type')?.[1] || '';
   const mime = String(contentType).split(';')[0].trim().toLowerCase();
@@ -83,9 +181,50 @@ function inferType(exchange) {
   return exchange.response ? 'http' : 'pending';
 }
 
+function protocolIdentity(exchange, inferredType, parts) {
+  const ctx = exchange.protocol_context || null;
+  const req = exchange.request || {};
+  const metrics = exchange.metrics || {};
+  const app = protocolToken(ctx?.application);
+  const downstream = protocolToken(exchange.downstream_protocol) === 'admin' ? null : exchange.downstream_protocol;
+  const wire = protocolToken(ctx?.downstream || downstream || metrics.protocol || req.version);
+  const bodyMode = protocolToken(ctx?.body_mode);
+  const method = String(req.method || '').toUpperCase();
+  const type = protocolToken(inferredType);
+
+  const wireProtocol = protocolLabel(ctx?.downstream || downstream || metrics.protocol || req.version || 'HTTP/1.1') || 'HTTP/1.1';
+  const appProtocol = app === 'grpc' || type === 'grpc'
+    ? 'gRPC'
+    : (wire === 'websocket' || bodyMode === 'frames' || method === 'WS')
+      ? 'WebSocket'
+      : (wire === 'socks5' || bodyMode === 'tunnel' || parts.scheme === 'socks5')
+        ? 'Tunnel'
+        : applicationLabel(ctx?.application, 'HTTP');
+
+  const bucket = appBucketOf(appProtocol, {
+    wireProtocol: ctx?.downstream,
+    appProtocol: ctx?.application,
+    protocolContext: ctx,
+    type: inferredType,
+    method,
+  });
+
+  return {
+    protocolContext: ctx,
+    proto: appProtocol,
+    protoBucket: bucket,
+    appBucket: bucket,
+    wireBucket: wireBucketOf(wireProtocol, { protocolContext: ctx, downstream_protocol: downstream }),
+    wireProtocol,
+    appProtocol,
+    bodyMode: ctx?.body_mode || null,
+  };
+}
+
 function parseUrlParts(uri, host) {
   try {
-    const url = new URL(uri && uri.startsWith('http') ? uri : `https://${host || 'unknown'}${uri || '/'}`);
+    const isAbsolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(uri || '');
+    const url = new URL(isAbsolute ? uri : `https://${host || 'unknown'}${uri || '/'}`);
     return {
       scheme: url.protocol.replace(':', '') || 'https',
       host: url.host || host || '',
@@ -113,7 +252,18 @@ function normalizeInspectorData(data) {
       payload: data.jwt.claims || {},
       valid: !data.jwt.alg_none_warning,
       expired: !!data.jwt.expired,
-      expiresIn: data.jwt.expired ? 'expired' : 'unknown',
+      expAt: data.jwt.expired ? null : (data.jwt.claims?.exp || null),
+      expiresIn: (() => {
+        if (data.jwt.expired) return 'expired';
+        const exp = data.jwt.claims?.exp;
+        if (!exp) return 'no expiry';
+        const secsLeft = exp - Math.floor(Date.now() / 1000);
+        if (secsLeft <= 0) return 'expired';
+        if (secsLeft < 60) return `${secsLeft}s`;
+        if (secsLeft < 3600) return `${Math.floor(secsLeft / 60)}m`;
+        if (secsLeft < 86400) return `${Math.floor(secsLeft / 3600)}h`;
+        return `${Math.floor(secsLeft / 86400)}d`;
+      })(),
     };
   }
   if (data.graphql) {
@@ -156,11 +306,14 @@ function adaptExchange(exchange, idx) {
   const status = metrics.status_code || res?.status || 0;
   const ttfb = metrics.ttfb_ms || metrics.latency_ms || 0;
   const body = metrics.body_ms || Math.max(0, (metrics.latency_ms || 0) - ttfb);
+  const inferredType = inferType(exchange);
+  const protocol = protocolIdentity(exchange, inferredType, parts);
   const tags = [
     ...(exchange.tags || []),
     exchange.inspector_data?.jwt ? 'jwt' : null,
     exchange.inspector_data?.graphql ? 'graphql' : null,
-    exchange.inspector_data?.grpc ? 'grpc' : null,
+    (exchange.inspector_data?.grpc || protocol.protoBucket === 'grpc') ? 'grpc' : null,
+    protocol.protoBucket === 'ws' ? 'ws' : null,
     parts.scheme === 'https' ? 'mitm' : null,
   ].filter(Boolean);
   return {
@@ -170,12 +323,13 @@ function adaptExchange(exchange, idx) {
     scheme: parts.scheme,
     url: parts.url,
     method: (req.method || 'GET').toUpperCase(),
+    displayMethod: protocol.appBucket === 'ws' ? 'GET' : (req.method || 'GET').toUpperCase(),
     host: parts.host,
     path: parts.path,
     query: parts.query,
     status,
     statusText: STATUS_TEXT[status] || '',
-    type: inferType(exchange),
+    type: inferredType,
     reqSize: metrics.request_size_bytes || req.body_bytes || (req.body ? String(req.body).length : 0),
     resSize: metrics.response_size_bytes || res?.body_bytes || (res?.body ? String(res.body).length : 0),
     total: metrics.latency_ms || 0,
@@ -189,9 +343,19 @@ function adaptExchange(exchange, idx) {
     note: exchange.note || '',
     // Captured WebSocket frames (empty for non-WS exchanges).
     wsFrames: exchange.ws_frames || [],
-    // Prefer the negotiated upstream protocol captured in metrics (Phase 0);
-    // fall back to the request version, then HTTP/1.1.
-    proto: metrics.protocol || req.version || 'HTTP/1.1',
+    protocolContext: protocol.protocolContext,
+    wireProtocol: protocol.wireProtocol,
+    appProtocol: protocol.appProtocol,
+    bodyMode: protocol.bodyMode,
+    appBucket: protocol.appBucket,
+    wireBucket: protocol.wireBucket,
+    protoBucket: protocol.protoBucket,
+    proto: protocol.proto,
+    sourceLabel: sourceLabel(exchange.source),
+    canCompose: protocol.appBucket !== 'tunnel',
+    canReplay: protocol.appBucket !== 'tunnel',
+    commandLabel: protocol.appBucket === 'ws' ? 'websocat' : protocol.appBucket === 'tunnel' ? null : 'cURL',
+    rawCommandLabel: protocol.appBucket === 'ws' ? 'raw websocat' : protocol.appBucket === 'tunnel' ? null : 'raw cURL',
     remote: req.remote_addr || '',
     cipher: parts.scheme === 'https' ? 'TLS' : '',
     reqHeadersRaw,
@@ -238,16 +402,22 @@ function isReplayableHeader(name) {
 }
 
 function sessionToComposeRequest(s) {
+  const bucket = s.appBucket || appBucketOf(s.appProtocol, s);
+  if (bucket === 'tunnel') return null;
+  const kind = bucket === 'ws' ? 'websocket' : bucket === 'grpc' ? 'grpc' : 'http';
+  const headers = s.reqHeadersRaw ?? s.reqHeaders ?? {};
   return {
     importId: `${s.id}_${Date.now()}`,
     name: `${s.method} ${s.host}${s.path || '/'}`,
-    method: s.method,
+    kind,
+    method: kind === 'grpc' ? 'POST' : s.method,
     url: s.url,
-    headers: headerItems(s.reqHeaders),
+    headers: headerItems(headers),
     params: [],
     body: s.reqBodyRaw ?? s.reqBody ?? '',
     bodyMode: 'raw',
-    contentType: s.reqHeadersRaw?.['content-type'] || s.reqHeadersRaw?.['Content-Type'] || s.reqHeaders?.['content-type'] || s.reqHeaders?.['Content-Type'] || 'application/json',
+    contentType: headers['content-type'] || headers['Content-Type'] || (kind === 'grpc' ? 'application/grpc+proto' : 'application/json'),
+    wsFrames: kind === 'websocket' ? wsFramesForCompose(s) : undefined,
   };
 }
 
@@ -256,11 +426,19 @@ function shellQuote(value) {
 }
 
 function buildCurlFromSession(s) {
+  const bucket = s.appBucket || appBucketOf(s.appProtocol, s);
+  if (bucket === 'ws') return buildWebsocketCommandFromSession(s, false);
+  if (bucket === 'tunnel') return '';
   const parts = ['curl'];
-  if (s.method && s.method !== 'GET') parts.push('-X', shellQuote(s.method));
+  if (bucket === 'grpc') parts.push('--http2');
+  const method = bucket === 'grpc' ? 'POST' : s.method;
+  if (method && method !== 'GET') parts.push('-X', shellQuote(method));
   Object.entries(s.reqHeaders || {})
     .filter(([k]) => isReplayableHeader(k))
     .forEach(([k, v]) => parts.push('-H', shellQuote(`${k}: ${v}`)));
+  if (bucket === 'grpc' && !Object.keys(s.reqHeaders || {}).some(k => k.toLowerCase() === 'content-type')) {
+    parts.push('-H', shellQuote('Content-Type: application/grpc+proto'));
+  }
   if (s.reqBody !== undefined && s.reqBody !== null && s.reqBody !== '') {
     parts.push('--data-raw', shellQuote(s.reqBody));
   }
@@ -269,11 +447,52 @@ function buildCurlFromSession(s) {
 }
 
 function buildRawCurlFromSession(s) {
+  const bucket = s.appBucket || appBucketOf(s.appProtocol, s);
+  if (bucket === 'ws') return buildWebsocketCommandFromSession(s, true);
+  if (bucket === 'tunnel') return '';
   return buildCurlFromSession({
     ...s,
     reqHeaders: s.reqHeadersRaw ?? s.reqHeaders,
     reqBody: s.reqBodyRaw ?? s.reqBody,
   });
+}
+
+function buildWebsocketCommandFromSession(s, raw = false) {
+  const headers = raw ? (s.reqHeadersRaw ?? s.reqHeaders) : s.reqHeaders;
+  const parts = ['websocat'];
+  Object.entries(headers || {})
+    .filter(([k]) => isReplayableHeader(k))
+    .forEach(([k, v]) => parts.push('-H', shellQuote(`${k}: ${v}`)));
+  parts.push(shellQuote(s.url));
+  return parts.join(' ');
+}
+
+function isClientWsFrame(frame) {
+  const dir = protocolToken(frame?.direction);
+  return dir === 'client' || dir === 'request' || dir === 'clienttoserver' || dir === 'outbound';
+}
+
+function wsFramePayload(frame) {
+  return frame?.payload ?? frame?.payload_text ?? frame?.text ?? '';
+}
+
+function wsOpcodeLabel(opcode) {
+  if (opcode === 1 || opcode === '1') return 'text';
+  if (opcode === 2 || opcode === '2') return 'binary';
+  if (opcode === 8 || opcode === '8') return 'close';
+  if (opcode === 9 || opcode === '9') return 'ping';
+  if (opcode === 10 || opcode === '10') return 'pong';
+  return opcode || 'text';
+}
+
+function wsFramesForCompose(s) {
+  const frames = (s.wsFrames || []).filter(isClientWsFrame);
+  return (frames.length ? frames : [{ opcode: 'text', payload: '' }]).map((frame, idx) => ({
+    id: `wf_${Date.now()}_${idx}`,
+    on: true,
+    opcode: wsOpcodeLabel(frame.opcode),
+    payload: wsFramePayload(frame),
+  }));
 }
 
 // Client-side sort that mirrors the backend sort_sessions logic (api/mod.rs).
@@ -289,7 +508,8 @@ function clientSortSessions(sessions, sort) {
       case 'host':   return a.host.localeCompare(b.host);
       case 'path':   return a.path.localeCompare(b.path);
       case 'type':   return a.type.localeCompare(b.type);
-      case 'reqSize': return (a.resSize || a.reqSize || 0) - (b.resSize || b.reqSize || 0);
+      case 'protocol': return a.proto.localeCompare(b.proto);
+      case 'reqSize': return (a.reqSize || 0) - (b.reqSize || 0);
       case 'total':  return a.total - b.total;
       default:       return a.ts - b.ts;
     }
@@ -441,6 +661,10 @@ function normalizeWorkspaceStatusBuckets(buckets) {
   return STATUS_BUCKETS.filter(b => picked.has(b));
 }
 
+function activeSelection(values, allValues) {
+  return values.length > 0 && values.length < allValues.length ? values : [];
+}
+
 function normalizeWorkspaceSort(sort) {
   // 'idx' is no longer a user-visible sort (SEQ column removed). Treat it as 'ts'.
   const rawKey = SESSION_SORT_KEYS.has(sort?.key) ? sort.key : 'ts';
@@ -449,14 +673,16 @@ function normalizeWorkspaceSort(sort) {
   return { key, dir };
 }
 
-function workspaceViewSnapshot({ activeRail, search, regexMode, methodFilter, statusFilter, hostFocus, hostFilter, sort, viewMode, selectedId }) {
+function workspaceViewSnapshot({ activeRail, search, regexMode, methodFilter, statusFilter, wireFilter, appFilter, hostFocus, hostFilter, sort, viewMode, selectedId }) {
   return {
     active_surface: WORKSPACE_SURFACES.has(activeRail) ? activeRail : 'sessions',
     sessions_view: {
       query: search || '',
       regex: !!regexMode,
-      methods: METHODS.filter(m => methodFilter.has(m)),
-      status_buckets: STATUS_BUCKETS.filter(b => statusFilter.has(b)),
+      methods: methodFilter.size === 0 ? METHODS : METHODS.filter(m => methodFilter.has(m)),
+      status_buckets: statusFilter.size === 0 ? STATUS_BUCKETS : STATUS_BUCKETS.filter(b => statusFilter.has(b)),
+      wire_filter: wireFilter ? [...wireFilter] : [],
+      app_filter: appFilter ? [...appFilter] : [],
       host_focus: Array.isArray(hostFocus) ? hostFocus : [],
       host_filter: hostFilter || null,
       sort: normalizeWorkspaceSort(sort),
@@ -468,13 +694,17 @@ function workspaceViewSnapshot({ activeRail, search, regexMode, methodFilter, st
 
 function workspaceSnapshotFromState(workspace) {
   const view = workspace?.sessions_view || {};
+  const methods = normalizeWorkspaceMethods(view.methods);
+  const statusBuckets = normalizeWorkspaceStatusBuckets(view.status_buckets);
   return {
     active_surface: WORKSPACE_SURFACES.has(workspace?.active_surface) ? workspace.active_surface : 'sessions',
     sessions_view: {
       query: view.query || '',
       regex: !!view.regex,
-      methods: normalizeWorkspaceMethods(view.methods).length ? normalizeWorkspaceMethods(view.methods) : METHODS,
-      status_buckets: normalizeWorkspaceStatusBuckets(view.status_buckets).length ? normalizeWorkspaceStatusBuckets(view.status_buckets) : STATUS_BUCKETS,
+      methods: activeSelection(methods, METHODS),
+      status_buckets: activeSelection(statusBuckets, STATUS_BUCKETS),
+      wire_filter: Array.isArray(view.wire_filter) ? view.wire_filter : [],
+      app_filter: Array.isArray(view.app_filter) ? view.app_filter : [],
       host_focus: Array.isArray(view.host_focus) ? view.host_focus : [],
       host_filter: view.host_filter || null,
       sort: normalizeWorkspaceSort(view.sort),
@@ -498,15 +728,19 @@ function App() {
   const [sessions, setSessions] = React.useState([]);
   const [selectedId, setSelectedId] = React.useState(null);
   const [search, setSearch] = React.useState('');
-  const [methodFilter, setMethodFilter] = React.useState(new Set(METHODS));
-  const [statusFilter, setStatusFilter] = React.useState(new Set(['2','3','4','5','-']));
-  // Protocol facet — client-side refinement over fetched rows (all on = no filter).
-  const [protoFilter, setProtoFilter] = React.useState(new Set(PROTO_BUCKETS));
+  const [methodFilter, setMethodFilter] = React.useState(new Set());
+  const [statusFilter, setStatusFilter] = React.useState(new Set());
+  const [wireFilter, setWireFilter] = React.useState(new Set());
+  const [appFilter, setAppFilter] = React.useState(new Set());
   const [hostFilter, setHostFilter] = React.useState(null);
   const [hostFocus, setHostFocus] = React.useState([]); // pinned hosts shown as chips
   const [liveRefresh, setLiveRefresh] = React.useState(true);
+  const [sseConnected, setSseConnected] = React.useState(false);
+  // proxyDown becomes true ~4 s after SSE goes offline, to avoid flicker on startup/reconnect.
+  const [proxyDown, setProxyDown] = React.useState(false);
   const [sort, setSort] = React.useState({ key: 'ts', dir: 'desc' });
   const [activeRail, setActiveRail] = React.useState('sessions');
+  const [rulesTab, setRulesTab] = React.useState(null);
   const [assistantOpen, setAssistantOpen] = React.useState(false);
   const [regexMode, setRegexMode] = React.useState(false);
   const [showShortcuts, setShowShortcuts] = React.useState(false);
@@ -514,13 +748,13 @@ function App() {
   const [viewMode, setViewMode] = React.useState('sequence'); // sequence | structure
   const [bulkSel, setBulkSel] = React.useState(new Set());
   const [composeRequest, setComposeRequest] = React.useState(null);
+  const [createFromTarget, setCreateFromTarget] = React.useState(null); // { action, prefill }
   const [runtime, setRuntime] = React.useState({ config: null, throttle: null, socks5: null, caBytes: 0, breakpointHeld: 0, errors: {} });
   const [sessionsError, setSessionsError] = React.useState(null);
   const [sessionMeta, setSessionMeta] = React.useState({ total: 0, filtered_total: 0, facets: null });
   const [renderLimit, setRenderLimit] = React.useState(SESSION_RENDER_PAGE_SIZE);
   const [detailById, setDetailById] = React.useState({});
   const [workspaceHydrated, setWorkspaceHydrated] = React.useState(false);
-  const [workspaceError, setWorkspaceError] = React.useState(null);
   const mainRef = React.useRef(null);
   const [splitSize, setSplitSize] = React.useState({ detailW: 560, detailH: 360 });
   const lastFetchRef = React.useRef(null);    // Date of last full or incremental session fetch
@@ -542,18 +776,32 @@ function App() {
     // key migration (e.g. idx→ts) produces a diff and triggers a workspace PATCH to
     // persist the migrated value back to the server.
     const rawSortKey = workspace?.sessions_view?.sort?.key;
-    const snapshotForRef = rawSortKey && rawSortKey !== snapshot.sessions_view.sort.key
-      ? { ...snapshot, sessions_view: { ...snapshot.sessions_view, sort: { key: rawSortKey, dir: workspace.sessions_view.sort.dir } } }
-      : snapshot;
+    const serializedSessionsView = {
+      ...snapshot.sessions_view,
+      methods: snapshot.sessions_view.methods.length === 0 ? METHODS : snapshot.sessions_view.methods,
+      status_buckets: snapshot.sessions_view.status_buckets.length === 0 ? STATUS_BUCKETS : snapshot.sessions_view.status_buckets,
+    };
+    const snapshotForRef = {
+      ...snapshot,
+      sessions_view: {
+        ...serializedSessionsView,
+        sort: rawSortKey && rawSortKey !== snapshot.sessions_view.sort.key
+          ? { key: rawSortKey, dir: workspace.sessions_view.sort.dir }
+          : snapshot.sessions_view.sort,
+      },
+    };
     workspaceSnapshotRef.current = JSON.stringify(snapshotForRef);
-    setWorkspaceError(null);
     setActiveRail(snapshot.active_surface);
+    const rulesTabHint = workspace?.feature_views?.rules?.tab;
+    if (rulesTabHint) setRulesTab(rulesTabHint);
     setSearch(snapshot.sessions_view.query);
     setRegexMode(snapshot.sessions_view.regex);
-    setMethodFilter(new Set(snapshot.sessions_view.methods.length ? snapshot.sessions_view.methods : METHODS));
-    setStatusFilter(new Set(snapshot.sessions_view.status_buckets.length ? snapshot.sessions_view.status_buckets : STATUS_BUCKETS));
+    setMethodFilter(new Set(snapshot.sessions_view.methods));
+    setStatusFilter(new Set(snapshot.sessions_view.status_buckets));
     setHostFocus(snapshot.sessions_view.host_focus);
     setHostFilter(snapshot.sessions_view.host_filter);
+    if (Array.isArray(snapshot.sessions_view.wire_filter)) setWireFilter(new Set(snapshot.sessions_view.wire_filter));
+    if (Array.isArray(snapshot.sessions_view.app_filter)) setAppFilter(new Set(snapshot.sessions_view.app_filter));
     setSort(snapshot.sessions_view.sort);
     setViewMode(snapshot.sessions_view.view_mode);
     setSelectedId(snapshot.sessions_view.selected_session_id);
@@ -573,7 +821,6 @@ function App() {
       applyWorkspaceState(data.workspace);
     } catch (err) {
       console.warn('Failed to load workspace state', err);
-      setWorkspaceError(err);
       setWorkspaceHydrated(true);
     }
   }, [applyWorkspaceState]);
@@ -666,6 +913,8 @@ function App() {
       regexMode,
       methodFilter,
       statusFilter,
+      wireFilter,
+      appFilter,
       hostFocus,
       hostFilter,
       sort,
@@ -701,12 +950,11 @@ function App() {
         }
       } catch (err) {
         console.warn('Failed to patch workspace state', err);
-        setWorkspaceError(err);
       }
     }, 250);
 
     return () => clearTimeout(timer);
-  }, [workspaceHydrated, activeRail, search, regexMode, methodFilter, statusFilter, hostFocus, hostFilter, sort, viewMode, selectedId, loadWorkspace, loadSessions, applyWorkspaceState]);
+  }, [workspaceHydrated, activeRail, search, regexMode, methodFilter, statusFilter, wireFilter, appFilter, hostFocus, hostFilter, sort, viewMode, selectedId, loadWorkspace, loadSessions, applyWorkspaceState]);
 
   React.useEffect(() => {
     if (!selectedId) return;
@@ -772,14 +1020,18 @@ function App() {
 
     function connect() {
       if (es) { es.close(); es = null; }
+      setSseConnected(false);
       es = new EventSource('/api/sessions/stream');
       clearTimeout(watchdogTimer);
       // Server sends keep-alive pings every 15 s; reconnect if silent for 35 s.
-      watchdogTimer = setTimeout(connect, 35000);
+      watchdogTimer = setTimeout(() => { setSseConnected(false); connect(); }, 35000);
+
+      es.onopen = () => setSseConnected(true);
 
       es.onmessage = (e) => {
+        setSseConnected(true);
         clearTimeout(watchdogTimer);
-        watchdogTimer = setTimeout(connect, 35000);
+        watchdogTimer = setTimeout(() => { setSseConnected(false); connect(); }, 35000);
         try {
           const ev = JSON.parse(e.data);
           if (ev.kind === 'sessions_cleared') {
@@ -800,6 +1052,7 @@ function App() {
       };
 
       es.onerror = () => {
+        setSseConnected(false);
         clearTimeout(watchdogTimer);
         if (es) { es.close(); es = null; }
         watchdogTimer = setTimeout(connect, 3000);
@@ -815,34 +1068,39 @@ function App() {
     };
   }, [liveRefresh, fetchIncremental, loadSessions]);
 
-  const toggleMethod = (m) => {
-    setMethodFilter(prev => {
+  // Delay showing the proxy-down banner to avoid flicker during startup / brief reconnect.
+  React.useEffect(() => {
+    if (sseConnected || !liveRefresh) {
+      setProxyDown(false);
+      return;
+    }
+    const t = setTimeout(() => setProxyDown(true), 4000);
+    return () => clearTimeout(t);
+  }, [sseConnected, liveRefresh]);
+
+  const toggleFacet = (value, setter) => {
+    setter(prev => {
+      if (prev.size === 0) return new Set([value]);
       const next = new Set(prev);
-      next.has(m) ? next.delete(m) : next.add(m);
+      next.has(value) ? next.delete(value) : next.add(value);
       return next;
     });
   };
-  const toggleStatus = (s) => {
-    setStatusFilter(prev => {
-      const next = new Set(prev);
-      next.has(s) ? next.delete(s) : next.add(s);
-      return next;
-    });
-  };
-  const toggleProto = (p) => {
-    setProtoFilter(prev => {
-      const next = new Set(prev);
-      next.has(p) ? next.delete(p) : next.add(p);
-      // Never allow an empty selection (that would hide everything); reset to all.
-      return next.size === 0 ? new Set(PROTO_BUCKETS) : next;
-    });
-  };
+  const toggleMethod = (m) => toggleFacet(m, setMethodFilter);
+  const toggleStatus = (s) => toggleFacet(s, setStatusFilter);
+  const toggleWire = (p) => toggleFacet(p, setWireFilter);
+  const toggleApp = (p) => toggleFacet(p, setAppFilter);
   const DEFAULT_SORT = { key: 'ts', dir: 'desc' };
   const onSort = (key) => setSort(prev => {
-    if (prev.key !== key) return { key, dir: 'asc' };
+    if (prev.key !== key) {
+      // Switching to a different column: start in the most useful direction.
+      // For timestamp (the default key) that is desc (newest first); for
+      // every other column ascending is the natural starting direction.
+      return { key, dir: key === DEFAULT_SORT.key ? DEFAULT_SORT.dir : 'asc' };
+    }
     if (prev.dir === 'asc') return { key, dir: 'desc' };
-    // third click (desc → reset). If we're already on the default column,
-    // wrap back to asc rather than staying in place.
+    // desc → reset. For the default column wrap back to asc so the user can
+    // cycle; for any other column reset to the default (ts desc).
     if (key === DEFAULT_SORT.key) return { key, dir: 'asc' };
     return { ...DEFAULT_SORT };
   });
@@ -854,16 +1112,18 @@ function App() {
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   }, [sessions]);
 
-  // Backend owns search/method/status filtering and sorting; the protocol facet
-  // is a lightweight client-side refinement over the rows already fetched.
+  // Backend owns search/method/status filtering and sorting; wire/app facets
+  // are lightweight client-side refinements over the rows already fetched.
   const filtered = React.useMemo(() => {
-    if (protoFilter.size >= PROTO_BUCKETS.length) return sessions;
-    return sessions.filter(s => protoFilter.has(protoBucketOf(s.proto)));
-  }, [sessions, protoFilter]);
+    return sessions.filter(s =>
+      (wireFilter.size === 0 || wireFilter.has(s.wireBucket || wireBucketOf(s.wireProtocol, s)))
+      && (appFilter.size === 0 || appFilter.has(s.appBucket || appBucketOf(s.appProtocol, s)))
+    );
+  }, [sessions, wireFilter, appFilter]);
 
   React.useEffect(() => {
     setRenderLimit(SESSION_RENDER_PAGE_SIZE);
-  }, [search, methodFilter, statusFilter, protoFilter, hostFilter, hostFocus, sort, regexMode, viewMode]);
+  }, [search, methodFilter, statusFilter, wireFilter, appFilter, hostFilter, hostFocus, sort, regexMode, viewMode]);
 
   const renderedSessions = React.useMemo(
     () => filtered.slice(0, renderLimit),
@@ -876,9 +1136,10 @@ function App() {
     search.trim().length > 0 ||
     !!hostFilter ||
     (Array.isArray(hostFocus) ? hostFocus.length > 0 : !!hostFocus) ||
-    methodFilter.size < METHODS.length ||
-    statusFilter.size < STATUS_BUCKETS.length ||
-    protoFilter.size < PROTO_BUCKETS.length;
+    methodFilter.size > 0 ||
+    statusFilter.size > 0 ||
+    wireFilter.size > 0 ||
+    appFilter.size > 0;
   const emptyState = sessionsError
     ? {
         title: 'Session API unavailable.',
@@ -958,6 +1219,21 @@ function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [renderedSessions, selectedId, t.theme, showShortcuts, activeRail, assistantOpen]);
 
+  // Create-from-session: listen for context menu actions from sessions table
+  React.useEffect(() => {
+    const handler = (e) => {
+      const { action, prefill } = e.detail;
+      setCreateFromTarget({ action, prefill });
+      if (action === 'mock')       setActiveRail('mock');
+      else if (action === 'rule')  setActiveRail('rules');
+      else if (action === 'breakpoint') setActiveRail('breakpoints');
+      // Clear after a tick so surfaces see the update then reset
+      setTimeout(() => setCreateFromTarget(null), 500);
+    };
+    window.addEventListener('oproxy:create-from-session', handler);
+    return () => window.removeEventListener('oproxy:create-from-session', handler);
+  }, []);
+
   // Counts for status bar
   const counts = React.useMemo(() => {
     const c = { total: sessions.length, ok: 0, redirect: 0, client: 0, server: 0, paused: 0, pending: 0, bytes: 0 };
@@ -978,19 +1254,35 @@ function App() {
     total: sessionMeta.total ?? counts.total,
   }), [counts, sessionMeta.total]);
 
-  const resume = (id) => {
+  const resume = async (id) => {
     const targetId = id || selectedId;
     if (!targetId) return;
+    // Optimistically clear paused state; server response will confirm or update.
     setSessions(prev => prev.map(s => s.id === targetId ? {
-      ...s, paused: false, status: 200, statusText: 'OK', total: 168, ttfb: 142, timing: { dns: 0, tcp: 0, tls: 0, ttfb: 142, body: 26 }, tags: s.tags.filter(t => t !== 'bp'),
+      ...s, paused: false, tags: s.tags ? s.tags.filter(t => t !== 'bp') : [],
     } : s));
+    try {
+      await fetch(`/admin/breakpoints/pending/${encodeURIComponent(targetId)}/resolve`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'resume' }),
+      });
+    } catch {}
   };
-  const abort = (id) => {
+  const abort = async (id) => {
     const targetId = id || selectedId;
     if (!targetId) return;
+    // Optimistically clear paused state; server response will confirm or update.
     setSessions(prev => prev.map(s => s.id === targetId ? {
-      ...s, paused: false, status: 403, statusText: 'Forbidden', total: 8, ttfb: 8, timing: { dns: 0, tcp: 0, tls: 0, ttfb: 8, body: 0 }, tags: s.tags.filter(t => t !== 'bp'),
+      ...s, paused: false, tags: s.tags ? s.tags.filter(t => t !== 'bp') : [],
     } : s));
+    try {
+      await fetch(`/admin/breakpoints/pending/${encodeURIComponent(targetId)}/resolve`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'abort' }),
+      });
+    } catch {}
   };
 
   const replaySession = async (s) => {
@@ -1003,11 +1295,40 @@ function App() {
         if (detail.exchange) source = adaptExchange(detail.exchange, Math.max(0, (s.idx || 1) - 1));
       }
     } catch {}
+    const bucket = source.appBucket || appBucketOf(source.appProtocol, source);
+    if (bucket === 'tunnel') {
+      showToast('Tunnel sessions are metadata-only and cannot be replayed from the session page.', true);
+      return;
+    }
+    if (bucket === 'ws') {
+      await fetch('/admin/forward/websocket', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          url: source.url,
+          headers: replayableHeaders(source.reqHeadersRaw ?? source.reqHeaders),
+          frames: wsFramesForCompose(source).filter(f => f.payload !== '').map(f => ({
+            opcode: f.opcode || 'text',
+            payload: f.payload || '',
+          })),
+          note: `Replay of ${s.id}`,
+          tags: ['replay'],
+        }),
+      }).catch(() => {});
+      await loadSessions();
+      return;
+    }
+    const wireBucket = source.wireBucket || wireBucketOf(source.wireProtocol, source);
+    const replayKind = bucket === 'grpc' ? 'grpc'
+      : wireBucket === 'h3' ? 'http3'
+      : wireBucket === 'h2' ? 'http2'
+      : 'http';
     await fetch('/admin/forward', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        method: source.method,
+        kind: replayKind,
+        method: bucket === 'grpc' ? 'POST' : source.method,
         url: source.url,
         headers: replayableHeaders(source.reqHeadersRaw ?? source.reqHeaders),
         body: source.reqBodyRaw ?? source.reqBody ?? null,
@@ -1020,7 +1341,12 @@ function App() {
 
   const openSessionInCompose = (s) => {
     if (!s) return;
-    setComposeRequest(sessionToComposeRequest(s));
+    const request = sessionToComposeRequest(s);
+    if (!request) {
+      showToast('Tunnel sessions are metadata-only and cannot be opened in Compose.', true);
+      return;
+    }
+    setComposeRequest(request);
     setActiveRail('compose');
   };
   const handleImportFile = async (file) => {
@@ -1096,13 +1422,14 @@ function App() {
 
       <div className="body">
         {tinyViewport && (
-          <div className="warn-strip" style={{ margin: 8, gridColumn: '1 / -1' }}>
+          <div className="warn-strip" style={{ margin: 8, gridColumn: '1 / -1', alignSelf: 'start' }}>
             Window height is very small. Enlarge the app window and press <code>Ctrl+0</code> to reset zoom.
           </div>
         )}
-        {workspaceError && (
-          <div className="warn-strip" style={{ margin: 8, gridColumn: '1 / -1' }}>
-            Workspace state is temporarily local. Changes will sync again when the backend responds.
+        {proxyDown && (
+          <div className="proxy-down-banner" style={{ gridColumn: '1 / -1', alignSelf: 'start' }}>
+            <span className="dot" />
+            Proxy unreachable — reconnecting…
           </div>
         )}
         <LeftRail active={activeRail} onChange={setActiveRail} />
@@ -1122,7 +1449,8 @@ function App() {
                 <FilterBar
                   methodFilter={methodFilter} toggleMethod={toggleMethod}
                   statusFilter={statusFilter} toggleStatus={toggleStatus}
-                  protoFilter={protoFilter} toggleProto={toggleProto}
+                  wireFilter={wireFilter} toggleWire={toggleWire}
+                  appFilter={appFilter} toggleApp={toggleApp}
                   hostFilter={hostFilter} setHostFilter={setHostFilter}
                   hostFocus={hostFocus} setHostFocus={setHostFocus}
                   hostCounts={hostCounts}
@@ -1192,10 +1520,22 @@ function App() {
                 onClose={() => setSelectedId(null)}
                 onResume={() => resume(selectedId)}
                 onAbort={() => abort(selectedId)}
-                onCopyCurl={(s) => copyText(buildCurlFromSession(s))}
+                onCopyCurl={(s) => {
+                  const command = buildCurlFromSession(s);
+                  if (!command) {
+                    showToast('SOCKS tunnel sessions do not have a replayable shell command.', true);
+                    return;
+                  }
+                  copyText(command);
+                }}
                 onCopyRawCurl={async (s) => {
                   if (await confirmAction('Copy unredacted request data to the clipboard?', 'Copy')) {
-                    copyText(buildRawCurlFromSession(s));
+                    const command = buildRawCurlFromSession(s);
+                    if (!command) {
+                      showToast('SOCKS tunnel sessions do not have a replayable shell command.', true);
+                      return;
+                    }
+                    copyText(command);
                   }
                 }}
                 onReplay={replaySession}
@@ -1205,18 +1545,19 @@ function App() {
           )}
           {activeRail === 'dashboard' && <ProtocolDashboard />}
           {activeRail === 'connections' && <ConnectionsSurface />}
-          {activeRail === 'rules' && <RulesSurface />}
+          {activeRail === 'rules' && <RulesSurface createFrom={createFromTarget?.action === 'rule' ? createFromTarget.prefill : null} initialTab={rulesTab} />}
           {activeRail === 'breakpoints' && (
             <BreakpointsSurface
               sessions={sessions}
               onResume={(id) => { setSelectedId(id); resume(id); }}
               onAbort={(id) => { setSelectedId(id); abort(id); }}
+              createFrom={createFromTarget?.action === 'breakpoint' ? createFromTarget.prefill : null}
             />
           )}
           {activeRail === 'inspector' && <InspectorsSurface />}
           {activeRail === 'ca' && <CertSurface />}
           {activeRail === 'compose' && <ComposeSurface incomingRequest={composeRequest} />}
-          {activeRail === 'mock' && <MockSurface />}
+          {activeRail === 'mock' && <MockSurface createFrom={createFromTarget?.action === 'mock' ? createFromTarget.prefill : null} />}
           {activeRail === 'lua' && <LuaSurface />}
           {activeRail === 'webhooks' && <WebhooksSurface />}
           {activeRail === 'dns' && <DnsSurface />}
@@ -1225,7 +1566,7 @@ function App() {
         </div>
       </div>
 
-      <StatusBar counts={counts} liveRefresh={liveRefresh} t={t} runtime={runtime} setActiveRail={setActiveRail} />
+      <StatusBar counts={counts} liveRefresh={liveRefresh} sseConnected={sseConnected} t={t} runtime={runtime} setActiveRail={setActiveRail} />
 
       <button
         className="assistant-fab"
@@ -1253,6 +1594,8 @@ function App() {
                 regex_mode: regexMode,
                 method_filter: [...methodFilter],
                 status_filter: [...statusFilter],
+                wire_filter: [...wireFilter],
+                app_filter: [...appFilter],
                 host_focus: hostFocus,
                 view_mode: viewMode,
               }}
@@ -1443,7 +1786,7 @@ function LeftRail({ active, onChange }) {
 }
 
 /* ===== Filter bar ===== */
-function FilterBar({ methodFilter, toggleMethod, statusFilter, toggleStatus, protoFilter, toggleProto, hostFilter, setHostFilter, hostFocus, setHostFocus, hostCounts, counts, total, viewMode, setViewMode, sort, onResetSort }) {
+function FilterBar({ methodFilter, toggleMethod, statusFilter, toggleStatus, wireFilter, toggleWire, appFilter, toggleApp, hostFilter, setHostFilter, hostFocus, setHostFocus, hostCounts, counts, total, viewMode, setViewMode, sort, onResetSort }) {
   const [hostMenuOpen, setHostMenuOpen] = React.useState(false);
   const [hostMenuPos, setHostMenuPos] = React.useState({ top: 0, left: 0 });
   const hostButtonRef = React.useRef(null);
@@ -1490,17 +1833,40 @@ function FilterBar({ methodFilter, toggleMethod, statusFilter, toggleStatus, pro
       </div>
       <span className="filter-label" style={{ marginLeft: 8 }}>Status</span>
       <div className="chip-group">
+        <button className={'chip' + (statusFilter.has('1') ? ' on' : '')} data-tone="1xx" onClick={() => toggleStatus('1')} aria-pressed={statusFilter.has('1')}>1xx</button>
         <button className={'chip' + (statusFilter.has('2') ? ' on' : '')} data-tone="2xx" onClick={() => toggleStatus('2')} aria-pressed={statusFilter.has('2')}>2xx</button>
         <button className={'chip' + (statusFilter.has('3') ? ' on' : '')} data-tone="3xx" onClick={() => toggleStatus('3')} aria-pressed={statusFilter.has('3')}>3xx</button>
         <button className={'chip' + (statusFilter.has('4') ? ' on' : '')} data-tone="4xx" onClick={() => toggleStatus('4')} aria-pressed={statusFilter.has('4')}>4xx</button>
         <button className={'chip' + (statusFilter.has('5') ? ' on' : '')} data-tone="5xx" onClick={() => toggleStatus('5')} aria-pressed={statusFilter.has('5')}>5xx</button>
         <button className={'chip' + (statusFilter.has('-') ? ' on' : '')} onClick={() => toggleStatus('-')} aria-pressed={statusFilter.has('-')}>pending</button>
       </div>
-      <span className="filter-label" style={{ marginLeft: 8 }}>Proto</span>
+      <span className="filter-label" style={{ marginLeft: 8 }}>Wire</span>
       <div className="chip-group">
-        <button className={'chip' + (protoFilter.has('h1') ? ' on' : '')} onClick={() => toggleProto('h1')} aria-pressed={protoFilter.has('h1')} title="HTTP/1.x">1.1</button>
-        <button className={'chip' + (protoFilter.has('h2') ? ' on' : '')} onClick={() => toggleProto('h2')} aria-pressed={protoFilter.has('h2')} title="HTTP/2">H2</button>
-        <button className={'chip' + (protoFilter.has('h3') ? ' on' : '')} onClick={() => toggleProto('h3')} aria-pressed={protoFilter.has('h3')} title="HTTP/3">H3</button>
+        {PROTO_FILTERS.map(p => (
+          <button
+            key={p.key}
+            className={'chip' + (wireFilter.has(p.key) ? ' on' : '')}
+            onClick={() => toggleWire(p.key)}
+            aria-pressed={wireFilter.has(p.key)}
+            title={p.title}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+      <span className="filter-label" style={{ marginLeft: 8 }}>App</span>
+      <div className="chip-group">
+        {APP_FILTERS.map(p => (
+          <button
+            key={p.key}
+            className={'chip' + (appFilter.has(p.key) ? ' on' : '')}
+            onClick={() => toggleApp(p.key)}
+            aria-pressed={appFilter.has(p.key)}
+            title={p.title}
+          >
+            {p.label}
+          </button>
+        ))}
       </div>
 
       <div className="host-filter" style={{ marginLeft: 8 }}>
@@ -1567,7 +1933,7 @@ function FilterBar({ methodFilter, toggleMethod, statusFilter, toggleStatus, pro
 }
 
 /* ===== Status bar ===== */
-function StatusBar({ counts, liveRefresh, t, runtime, setActiveRail }) {
+function StatusBar({ counts, liveRefresh, sseConnected, t, runtime, setActiveRail }) {
   const cfg = runtime?.config;
   const throttle = runtime?.throttle;
   const runtimeErrors = Object.entries(runtime?.errors || {});
@@ -1584,9 +1950,9 @@ function StatusBar({ counts, liveRefresh, t, runtime, setActiveRail }) {
   return (
     <div className="statusbar">
       <div className="group">
-        <span className={'dot ' + (liveRefresh ? 'ok' : 'warn')} />
+        <span className={'dot ' + (!liveRefresh ? 'warn' : sseConnected ? 'ok' : 'err')} />
         <span className="k">LIVE</span>
-        <span className="v">{liveRefresh ? 'refreshing' : 'paused'}</span>
+        <span className="v">{!liveRefresh ? 'paused' : sseConnected ? 'live' : 'offline'}</span>
       </div>
       <button className="group status-action" onClick={copyProxy} title={`Copy client proxy address. Listener bind: ${bind}`}>
         <span className="k">PROXY</span><span className="v">{clientProxy}</span>

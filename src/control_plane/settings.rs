@@ -122,7 +122,9 @@ pub(super) async fn set_upstream_proxy_handler(
 }
 
 pub(super) async fn get_socks5_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let enabled = state.config.socks5_port.is_some();
+    let enabled = state
+        .socks5_bound
+        .load(std::sync::atomic::Ordering::Relaxed);
     let mitm_active = enabled && state.proxy_engine.mitm_enabled;
     axum::Json(serde_json::json!({
         "enabled": enabled,

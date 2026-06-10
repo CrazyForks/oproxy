@@ -164,7 +164,8 @@ function OverviewTab({ s }) {
         {m('TTFB', incomplete ? '—' : s.ttfb, '', ' ms')}
         {m('Request',  fmtBytes(s.reqSize), '')}
         {m('Response', fmtBytes(s.resSize), '')}
-        {m('Protocol', s.proto, '')}
+        {m('App', s.appProtocol || s.proto, '')}
+        {m('Wire', s.wireProtocol || '—', '')}
       </div>
 
       <div className="section">
@@ -172,7 +173,10 @@ function OverviewTab({ s }) {
         <div className="sec-body">
           <div className="kv" style={{ gridTemplateColumns: '140px 1fr' }}>
             <div className="k">Request URL</div><div className="v">{s.url}</div>
-            <div className="k">Request Method</div><div className="v"><span className="cell-method" data-m={s.method}>{s.method}</span></div>
+            <div className="k">Request Method</div><div className="v"><span className="cell-method" data-m={s.displayMethod || s.method}>{s.displayMethod || s.method}</span></div>
+            <div className="k">Application</div><div className="v">{s.appProtocol || s.proto}</div>
+            <div className="k">Wire Protocol</div><div className="v">{s.wireProtocol || '—'}</div>
+            <div className="k">Capture Source</div><div className="v">{s.sourceLabel || 'Proxy'}</div>
             <div className="k">Status Code</div><div className="v"><span className="cell-status" data-c={statusBucket(s.status)}>{s.status || '—'}</span> {STATUS_TEXT[s.status]}</div>
             <div className="k">Remote Address</div><div className="v">{s.remote}</div>
             <div className="k">Referrer Policy</div><div className="v">strict-origin-when-cross-origin</div>
@@ -292,9 +296,68 @@ function TimingTab({ s }) {
         <div className="sec-body">
           <div className="kv">
             <div className="k">Connection</div><div className="v">{(t.dns + t.tcp + t.tls) === 0 ? 'reused (keep-alive)' : 'new'}</div>
-            <div className="k">Protocol</div><div className="v">{s.proto}</div>
+            <div className="k">Protocol</div><div className="v">{s.wireProtocol || '—'}</div>
             <div className="k">Cipher</div><div className="v">{s.cipher}</div>
-            <div className="k">ALPN</div><div className="v">{s.proto.includes('2') ? 'h2' : 'http/1.1'}</div>
+            <div className="k">ALPN</div><div className="v">{s.wireBucket === 'h3' ? 'h3' : s.wireBucket === 'h2' ? 'h2' : s.wireBucket === 'socks' ? 'socks5' : 'http/1.1'}</div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function fmtSecsLeft(secsLeft) {
+  if (secsLeft <= 0) return 'expired';
+  if (secsLeft < 60) return `${secsLeft}s`;
+  if (secsLeft < 3600) return `${Math.floor(secsLeft / 60)}m ${secsLeft % 60}s`;
+  if (secsLeft < 86400) return `${Math.floor(secsLeft / 3600)}h ${Math.floor((secsLeft % 3600) / 60)}m`;
+  return `${Math.floor(secsLeft / 86400)}d`;
+}
+
+function JwtInspectorPanel({ i }) {
+  const [liveCountdown, setLiveCountdown] = React.useState(() => {
+    if (!i.expAt) return i.expiresIn;
+    return fmtSecsLeft(i.expAt - Math.floor(Date.now() / 1000));
+  });
+
+  React.useEffect(() => {
+    if (!i.expAt) return;
+    const tick = () => setLiveCountdown(fmtSecsLeft(i.expAt - Math.floor(Date.now() / 1000)));
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [i.expAt]);
+
+  return (
+    <>
+      <div className="section">
+        <h4>Decoded JWT <span className="meta">{i.valid ? 'signature ok' : 'signature mismatch'} · expires in {liveCountdown}</span></h4>
+        <div className="sec-body">
+          <div className="jwt-segments">
+            <div className="jwt-seg" data-part="h">
+              <h5>Header — alg</h5>
+              <pre>{JSON.stringify(i.header, null, 2)}</pre>
+            </div>
+            <div className="jwt-seg" data-part="p">
+              <h5>Payload — claims</h5>
+              <pre>{JSON.stringify(i.payload, null, 2)}</pre>
+            </div>
+            <div className="jwt-seg" data-part="s">
+              <h5>Signature</h5>
+              <pre>{i.valid ? 'verified against JWKS\n076f3fb11' : 'invalid signature'}</pre>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="section">
+        <h4>Claim Details</h4>
+        <div className="sec-body">
+          <div className="kv">
+            {Object.entries(i.payload).map(([k, v]) => (
+              <React.Fragment key={k}>
+                <div className="k">{k}</div>
+                <div className="v">{typeof v === 'object' ? JSON.stringify(v) : String(v)}</div>
+              </React.Fragment>
+            ))}
           </div>
         </div>
       </div>
@@ -314,42 +377,7 @@ function InspectorTab({ s }) {
     );
   }
   if (i.kind === 'jwt') {
-    return (
-      <>
-        <div className="section">
-          <h4>Decoded JWT <span className="meta">{i.valid ? 'signature ok' : 'signature mismatch'} · expires in {i.expiresIn}</span></h4>
-          <div className="sec-body">
-            <div className="jwt-segments">
-              <div className="jwt-seg" data-part="h">
-                <h5>Header — alg</h5>
-                <pre>{JSON.stringify(i.header, null, 2)}</pre>
-              </div>
-              <div className="jwt-seg" data-part="p">
-                <h5>Payload — claims</h5>
-                <pre>{JSON.stringify(i.payload, null, 2)}</pre>
-              </div>
-              <div className="jwt-seg" data-part="s">
-                <h5>Signature</h5>
-                <pre>{i.valid ? 'verified against JWKS\n076f3fb11' : 'invalid signature'}</pre>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div className="section">
-          <h4>Claim Details</h4>
-          <div className="sec-body">
-            <div className="kv">
-              {Object.entries(i.payload).map(([k, v]) => (
-                <React.Fragment key={k}>
-                  <div className="k">{k}</div>
-                  <div className="v">{typeof v === 'object' ? JSON.stringify(v) : String(v)}</div>
-                </React.Fragment>
-              ))}
-            </div>
-          </div>
-        </div>
-      </>
-    );
+    return <JwtInspectorPanel i={i} />;
   }
   if (i.kind === 'graphql') {
     return (
@@ -611,10 +639,26 @@ function DetailPanel({ session: s, onClose, onResume, onAbort, onCopyCurl, onCop
             {u.search && <span className="query">{u.search}</span>}
           </span>
           <div className="actions">
-            <button className="copy-btn" onClick={() => onCopyCurl?.(s)} title="Copy as cURL"><Icon name="copy" size={11} stroke={1.8} /> cURL</button>
-            <button className="copy-btn" onClick={() => onCopyRawCurl?.(s)} title="Copy raw cURL with unredacted local data">raw cURL</button>
-            <button className="copy-btn" onClick={() => onReplay?.(s)} title="Replay this request"><Icon name="replay" size={11} stroke={1.8} /> Replay</button>
-            <button className="copy-btn" onClick={() => onOpenInCompose?.(s)} title="Send to builder" aria-label="Send to builder"><Icon name="open" size={11} stroke={1.8} /></button>
+            {s.commandLabel && (
+              <button className="copy-btn" onClick={() => onCopyCurl?.(s)} title={`Copy as ${s.commandLabel}`}>
+                <Icon name="copy" size={11} stroke={1.8} /> {s.commandLabel}
+              </button>
+            )}
+            {s.rawCommandLabel && (
+              <button className="copy-btn" onClick={() => onCopyRawCurl?.(s)} title={`Copy ${s.rawCommandLabel} with unredacted local data`}>
+                {s.rawCommandLabel}
+              </button>
+            )}
+            {s.canReplay !== false && (
+              <button className="copy-btn" onClick={() => onReplay?.(s)} title="Replay this request">
+                <Icon name="replay" size={11} stroke={1.8} /> Replay
+              </button>
+            )}
+            {s.canCompose !== false && (
+              <button className="copy-btn" onClick={() => onOpenInCompose?.(s)} title="Send to builder" aria-label="Send to builder">
+                <Icon name="open" size={11} stroke={1.8} />
+              </button>
+            )}
             <button className="icon-btn" onClick={onClose} title="Close panel" aria-label="Close detail panel" style={{ marginLeft: 2 }}>
               <Icon name="x" size={14} stroke={1.6} />
             </button>
@@ -622,7 +666,9 @@ function DetailPanel({ session: s, onClose, onResume, onAbort, onCopyCurl, onCop
         </div>
         <div className="detail-sub">
           <div className="item"><span className="k">ID</span><span className="v">{s.id}</span></div>
-          <div className="item"><span className="k">PROTO</span><span className="v">{s.proto}</span></div>
+          <div className="item"><span className="k">APP</span><span className="v">{s.appProtocol || s.proto}</span></div>
+          <div className="item"><span className="k">WIRE</span><span className="v">{s.wireProtocol || '—'}</span></div>
+          <div className="item"><span className="k">SOURCE</span><span className="v">{s.sourceLabel || 'Proxy'}</span></div>
           <div className="item"><span className="k">REMOTE</span><span className="v">{s.remote}</span></div>
           <div className="item"><span className="k">STARTED</span><span className="v">{fmtTime(s.ts)}</span></div>
           <div className="item"><span className="k">TOTAL</span><span className="v">{(s.paused || s.pending) ? '—' : fmtMs(s.total)}</span></div>

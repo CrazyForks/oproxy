@@ -145,6 +145,7 @@ pub enum RewriteAction {
 /// satisfied, every action in `actions` is applied in order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RewriteRuleSet {
+    #[serde(default)]
     pub id: String,
     pub name: String,
     #[serde(default = "default_true")]
@@ -284,6 +285,7 @@ fn apply_request_actions(
                     headers,
                     body: Bytes::new(),
                     tags: Vec::new(),
+                    served_mock: None,
                 });
                 return Some(MiddlewareAction::StopAndReturn);
             }
@@ -293,6 +295,7 @@ fn apply_request_actions(
                     headers: crate::middleware::HeaderMap::new(),
                     body: Bytes::new(),
                     tags: Vec::new(),
+                    served_mock: None,
                 });
                 return Some(MiddlewareAction::StopAndReturn);
             }
