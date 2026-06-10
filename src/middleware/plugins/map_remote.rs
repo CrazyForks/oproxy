@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapRemoteRule {
+    #[serde(default)]
     pub id: String,
     pub name: String,
     #[serde(default = "default_true")]

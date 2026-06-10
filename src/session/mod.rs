@@ -96,6 +96,60 @@ pub struct GrpcMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionEvent {
+    RequestBodyChunk {
+        bytes: usize,
+        at_ms: u64,
+    },
+    ResponseBodyChunk {
+        bytes: usize,
+        at_ms: u64,
+    },
+    GrpcMessage {
+        direction: String,
+        message: GrpcMessage,
+    },
+    WsFrame {
+        frame: WsFrame,
+    },
+    Trailers {
+        headers: crate::middleware::HeaderMap,
+    },
+    BreakpointPaused {
+        breakpoint_id: String,
+    },
+    MockServed {
+        rule_id: String,
+        behavior: String,
+    },
+    TunnelOpened,
+    TunnelClosed {
+        bytes_up: u64,
+        bytes_down: u64,
+    },
+}
+
+impl SessionEvent {
+    fn retained_body_size(&self) -> usize {
+        match self {
+            SessionEvent::WsFrame { frame } => {
+                frame.payload_text.as_ref().map_or(0, String::len)
+                    + frame.payload_hex.as_ref().map_or(0, String::len)
+            }
+            _ => 0,
+        }
+    }
+
+    fn clear_retained_body(&mut self) {
+        if let SessionEvent::WsFrame { frame } = self {
+            frame.payload_text = None;
+            frame.payload_hex = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrpcInfo {
     pub service: Option<String>,
     pub method: Option<String>,
@@ -132,6 +186,10 @@ pub struct Exchange {
     pub source: SessionSource,
     #[serde(default)]
     pub ws_frames: Vec<WsFrame>,
+    /// Append-only protocol event stream. Compatibility fields above remain as
+    /// read models while UI/API consumers migrate to this unified path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<SessionEvent>,
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]
@@ -155,6 +213,10 @@ pub struct Exchange {
     /// Distinct from `metrics.protocol`, which is the upstream (proxy→origin) leg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downstream_protocol: Option<String>,
+    /// Typed protocol identity for protocol-aware rules and UI read models. Kept
+    /// optional so old saved sessions/imports remain valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_context: Option<crate::core::forward::ProtocolContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -196,6 +258,10 @@ enum WriteOp {
     AppendWsFrame {
         id: String,
         frame: WsFrame,
+    },
+    AppendEvent {
+        id: String,
+        event: SessionEvent,
     },
     Annotate {
         id: String,
@@ -341,6 +407,13 @@ impl SessionManager {
         });
     }
 
+    pub fn append_event(&self, id: &str, event: SessionEvent) {
+        self.enqueue(WriteOp::AppendEvent {
+            id: id.to_string(),
+            event,
+        });
+    }
+
     pub fn clear_sessions(&self) {
         self.enqueue(WriteOp::ClearSessions);
     }
@@ -438,7 +511,12 @@ impl SessionManager {
                     + f.payload_hex.as_ref().map_or(0, String::len)
             })
             .sum::<usize>();
-        request_bytes + response_bytes + ws_bytes
+        let event_bytes = exchange
+            .events
+            .iter()
+            .map(SessionEvent::retained_body_size)
+            .sum::<usize>();
+        request_bytes + response_bytes + ws_bytes + event_bytes
     }
 
     fn clear_exchange_bodies(exchange: &mut Exchange) {
@@ -449,6 +527,9 @@ impl SessionManager {
         for frame in &mut exchange.ws_frames {
             frame.payload_text = None;
             frame.payload_hex = None;
+        }
+        for event in &mut exchange.events {
+            event.clear_retained_body();
         }
     }
 }
@@ -473,6 +554,7 @@ pub trait ExchangeRecorder: Send + Sync {
     );
     fn import_sessions(&self, exchanges: Vec<Exchange>);
     fn append_ws_frame(&self, id: &str, frame: WsFrame);
+    fn append_event(&self, id: &str, event: SessionEvent);
     fn clear_sessions(&self);
     fn update_inspector_data(&self, id: &str, data: InspectorData);
     fn mark_paused(&self, id: &str);
@@ -519,6 +601,9 @@ impl ExchangeRecorder for SessionManager {
     }
     fn append_ws_frame(&self, id: &str, frame: WsFrame) {
         self.append_ws_frame(id, frame)
+    }
+    fn append_event(&self, id: &str, event: SessionEvent) {
+        self.append_event(id, event)
     }
     fn clear_sessions(&self) {
         self.clear_sessions()
@@ -610,11 +695,13 @@ fn process_write_op(
                         connection_id: request.connection_id.clone(),
                         stream_id: request.stream_id,
                         downstream_protocol: request.downstream_protocol.clone(),
+                        protocol_context: request.protocol_context.clone(),
                         request: *request,
                         response: None,
                         metrics: None,
                         source,
                         ws_frames: Vec::new(),
+                        events: Vec::new(),
                         note: None,
                         tags: Vec::new(),
                         inspector_data: None,
@@ -675,11 +762,15 @@ fn process_write_op(
         }
 
         WriteOp::AppendWsFrame { id, frame } => {
-            let added = frame.payload_text.as_ref().map_or(0, String::len)
+            let frame_bytes = frame.payload_text.as_ref().map_or(0, String::len)
                 + frame.payload_hex.as_ref().map_or(0, String::len);
+            let added = frame_bytes.saturating_mul(2);
             {
                 let mut store = exchanges.write().unwrap();
                 if let Some(ex) = store.get_mut(&id) {
+                    ex.events.push(SessionEvent::WsFrame {
+                        frame: frame.clone(),
+                    });
                     ex.ws_frames.push(frame);
                     *body_bytes += added;
                 }
@@ -690,6 +781,25 @@ fn process_write_op(
             let _ = change_tx.send(SessionChange {
                 session_id: Some(id),
                 kind: SessionChangeKind::WsFrameCaptured,
+            });
+        }
+
+        WriteOp::AppendEvent { id, event } => {
+            let added = event.retained_body_size();
+            {
+                let mut store = exchanges.write().unwrap();
+                if let Some(ex) = store.get_mut(&id) {
+                    ex.events.push(event);
+                    ex.updated_at = Some(Utc::now());
+                    *body_bytes += added;
+                }
+                if max_retained_body_bytes != usize::MAX && *body_bytes > max_retained_body_bytes {
+                    enforce_budget(&mut store, max_retained_body_bytes, body_bytes);
+                }
+            }
+            let _ = change_tx.send(SessionChange {
+                session_id: Some(id),
+                kind: SessionChangeKind::SessionUpdated,
             });
         }
 
@@ -970,6 +1080,51 @@ mod tests {
         sm.record_response("ghost".to_string(), res("/test", 200));
         sm.flush().await;
         assert!(sm.get_all_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_ws_frame_populates_compat_and_event_paths() {
+        let sm = SessionManager::new(10_000);
+        sm.record_request("id1".to_string(), req("/ws"));
+        sm.append_ws_frame(
+            "id1",
+            WsFrame {
+                timestamp: Utc::now(),
+                direction: WsDirection::ClientToServer,
+                opcode: 1,
+                payload_len: 5,
+                payload_text: Some("hello".to_string()),
+                payload_hex: None,
+            },
+        );
+        sm.flush().await;
+
+        let session = sm.get_session("id1").unwrap();
+        assert_eq!(session.ws_frames.len(), 1);
+        assert_eq!(session.events.len(), 1);
+        assert!(matches!(
+            &session.events[0],
+            SessionEvent::WsFrame { frame } if frame.payload_text.as_deref() == Some("hello")
+        ));
+    }
+
+    #[tokio::test]
+    async fn append_event_records_protocol_event() {
+        let sm = SessionManager::new(10_000);
+        sm.record_request("id1".to_string(), req("/break"));
+        sm.append_event(
+            "id1",
+            SessionEvent::BreakpointPaused {
+                breakpoint_id: "bp-1".to_string(),
+            },
+        );
+        sm.flush().await;
+
+        let session = sm.get_session("id1").unwrap();
+        assert!(matches!(
+            &session.events[0],
+            SessionEvent::BreakpointPaused { breakpoint_id } if breakpoint_id == "bp-1"
+        ));
     }
 
     #[tokio::test]
@@ -1393,6 +1548,7 @@ mod tests {
             metrics: None,
             source: SessionSource::Proxy,
             ws_frames: vec![],
+            events: vec![],
             note: None,
             tags: vec!["auth".to_string()],
             inspector_data: None,
@@ -1400,6 +1556,7 @@ mod tests {
             connection_id: None,
             stream_id: None,
             downstream_protocol: None,
+            protocol_context: None,
         };
         assert!(terms[0].matches(&ex));
         let ex2 = Exchange { tags: vec![], ..ex };
@@ -1419,6 +1576,7 @@ mod tests {
             metrics: None,
             source: SessionSource::Proxy,
             ws_frames: vec![],
+            events: vec![],
             note: None,
             tags: vec![],
             inspector_data: None,
@@ -1426,6 +1584,7 @@ mod tests {
             connection_id: None,
             stream_id: None,
             downstream_protocol: None,
+            protocol_context: None,
         };
         sm.import_sessions(vec![exchange]);
         sm.flush().await;

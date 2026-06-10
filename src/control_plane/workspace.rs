@@ -27,7 +27,7 @@ const MAX_FEATURE_VIEW_COUNT: usize = 32;
 const ALLOWED_METHODS: &[&str] = &[
     "GET", "POST", "PUT", "PATCH", "DELETE", "CONNECT", "OPTIONS", "HEAD",
 ];
-const ALLOWED_STATUS_BUCKETS: &[&str] = &["2", "3", "4", "5", "-"];
+const ALLOWED_STATUS_BUCKETS: &[&str] = &["1", "2", "3", "4", "5", "-"];
 const ALLOWED_SORT_KEYS: &[&str] = &[
     "idx", "method", "status", "host", "path", "type", "reqSize", "total", "ts", "protocol",
 ];
@@ -132,6 +132,8 @@ impl WorkspaceState {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkspaceSurface {
     Sessions,
+    Dashboard,
+    Connections,
     Compose,
     Rules,
     Breakpoints,
@@ -156,6 +158,14 @@ pub(crate) struct SessionsViewState {
     pub sort: WorkspaceSort,
     pub view_mode: SessionsViewMode,
     pub selected_session_id: Option<String>,
+    /// Client-side wire-protocol facet filter (e.g. ["h2", "h3"]).
+    /// Not used for server-side filtering; persisted so the UI can restore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wire_filter: Vec<String>,
+    /// Client-side application-protocol facet filter (e.g. ["grpc", "ws"]).
+    /// Not used for server-side filtering; persisted so the UI can restore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub app_filter: Vec<String>,
 }
 
 impl Default for SessionsViewState {
@@ -173,6 +183,8 @@ impl Default for SessionsViewState {
             sort: WorkspaceSort::default(),
             view_mode: SessionsViewMode::Sequence,
             selected_session_id: None,
+            wire_filter: Vec::new(),
+            app_filter: Vec::new(),
         }
     }
 }
@@ -215,6 +227,12 @@ impl SessionsViewState {
                 self.selected_session_id =
                     normalize_optional_id(Some(selected_session_id), "selected_session_id")?;
             }
+        }
+        if let Some(wire_filter) = patch.wire_filter {
+            self.wire_filter = wire_filter;
+        }
+        if let Some(app_filter) = patch.app_filter {
+            self.app_filter = app_filter;
         }
         self.validate()
     }
@@ -351,6 +369,8 @@ pub(crate) struct SessionsViewPatch {
     pub view_mode: Option<SessionsViewMode>,
     #[serde(default)]
     pub selected_session_id: PatchField<String>,
+    pub wire_filter: Option<Vec<String>>,
+    pub app_filter: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -750,6 +770,10 @@ fn deterministic_open_surface_action(text: &str) -> Option<WorkspaceActionReques
     }
     let surface = if has_word(&lower, "sessions") || has_word(&lower, "traffic") {
         "sessions"
+    } else if has_word(&lower, "dashboard") || lower.contains("protocol metrics") {
+        "dashboard"
+    } else if has_word(&lower, "connections") || has_word(&lower, "multiplexing") {
+        "connections"
     } else if has_word(&lower, "compose") || lower.contains("send request") {
         "compose"
     } else if has_word(&lower, "rules")
@@ -918,6 +942,8 @@ fn action_apply_sessions_filter(
             .transpose()
             .map_err(|e| format!("invalid sessions.apply_filter view_mode: {e}"))?,
         selected_session_id: parse_patch_string_field(payload.get("selected_session_id")),
+        wire_filter: payload.get("wire_filter").and_then(parse_string_array),
+        app_filter: payload.get("app_filter").and_then(parse_string_array),
     };
 
     workspace.active_surface = WorkspaceSurface::Sessions;
@@ -1031,6 +1057,8 @@ fn workspace_action_id() -> String {
 fn workspace_surface_label(surface: &WorkspaceSurface) -> &'static str {
     match surface {
         WorkspaceSurface::Sessions => "Sessions",
+        WorkspaceSurface::Dashboard => "Dashboard",
+        WorkspaceSurface::Connections => "Connections",
         WorkspaceSurface::Compose => "Compose",
         WorkspaceSurface::Rules => "Rules",
         WorkspaceSurface::Breakpoints => "Breakpoints",
@@ -1184,7 +1212,7 @@ mod tests {
         );
         assert_eq!(
             workspace.sessions_view.status_buckets,
-            vec!["2", "3", "4", "5", "-"]
+            vec!["1", "2", "3", "4", "5", "-"]
         );
         assert_eq!(workspace.sessions_view.sort.key, "idx");
         assert_eq!(workspace.sessions_view.sort.dir, SortDirection::Asc);
@@ -1484,6 +1512,36 @@ mod tests {
             serde_json::json!(["api.test.com"])
         );
         assert_eq!(req.payload["view_mode"], "structure");
+    }
+
+    #[test]
+    fn open_surface_accepts_dashboard_and_connections() {
+        let action = workspace_action_definition("navigation.open_surface").expect("action");
+        for (surface, expected) in [
+            ("dashboard", WorkspaceSurface::Dashboard),
+            ("connections", WorkspaceSurface::Connections),
+        ] {
+            let mut workspace = WorkspaceState::default();
+            apply_workspace_action_to_state(
+                &mut workspace,
+                &action,
+                serde_json::json!({ "surface": surface }),
+            )
+            .expect("surface navigates");
+            assert_eq!(workspace.active_surface, expected);
+        }
+    }
+
+    #[test]
+    fn deterministic_text_navigates_to_protocol_surfaces() {
+        let dash = deterministic_workspace_action_from_text("open the protocol dashboard")
+            .expect("dashboard action");
+        assert_eq!(dash.action_type, "navigation.open_surface");
+        assert_eq!(dash.payload["surface"], "dashboard");
+
+        let conns =
+            deterministic_workspace_action_from_text("show connections").expect("connections");
+        assert_eq!(conns.payload["surface"], "connections");
     }
 
     #[test]

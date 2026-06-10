@@ -215,6 +215,10 @@ pub(super) struct ProtocolMetrics {
     protocol_mix: Vec<LabelCount>,
     /// Downstream (client→proxy) protocol mix.
     downstream_mix: Vec<LabelCount>,
+    /// Application-level traffic family (HTTP / WebSocket / gRPC / tunnel).
+    application_mix: Vec<LabelCount>,
+    /// Capture source (live proxy, Compose/admin forward, replay, import).
+    source_mix: Vec<LabelCount>,
     /// Status-class distribution (2xx/3xx/4xx/5xx/pending).
     status_classes: Vec<LabelCount>,
     /// gRPC status-code distribution (from captured `grpc-status`).
@@ -253,6 +257,8 @@ pub(super) fn aggregate_protocol_metrics(
     };
     let mut upstream: BTreeMap<String, usize> = BTreeMap::new();
     let mut downstream: BTreeMap<String, usize> = BTreeMap::new();
+    let mut application: BTreeMap<String, usize> = BTreeMap::new();
+    let mut source: BTreeMap<String, usize> = BTreeMap::new();
     let mut status: BTreeMap<String, usize> = BTreeMap::new();
     let mut grpc: BTreeMap<String, usize> = BTreeMap::new();
     let mut conns: HashSet<String> = HashSet::new();
@@ -274,9 +280,11 @@ pub(super) fn aggregate_protocol_metrics(
         if let Some(p) = ex.metrics.as_ref().and_then(|x| x.protocol.clone()) {
             *upstream.entry(p).or_default() += 1;
         }
-        if let Some(p) = &ex.downstream_protocol {
-            *downstream.entry(p.clone()).or_default() += 1;
-        }
+        *downstream.entry(downstream_protocol_label(ex)).or_default() += 1;
+        *application
+            .entry(application_protocol_label(ex))
+            .or_default() += 1;
+        *source.entry(source_label(ex.source)).or_default() += 1;
         let code = ex
             .metrics
             .as_ref()
@@ -288,7 +296,8 @@ pub(super) fn aggregate_protocol_metrics(
             200..=299 => "2xx",
             300..=399 => "3xx",
             400..=499 => "4xx",
-            _ => "5xx",
+            500..=599 => "5xx",
+            _ => "Others",
         };
         *status.entry(class.to_string()).or_default() += 1;
         if let Some(mx) = &ex.metrics {
@@ -309,6 +318,8 @@ pub(super) fn aggregate_protocol_metrics(
     m.connections = conns.len();
     m.protocol_mix = to_sorted(upstream);
     m.downstream_mix = to_sorted(downstream);
+    m.application_mix = to_sorted(application);
+    m.source_mix = to_sorted(source);
     m.status_classes = to_sorted(status);
     m.grpc_status = to_sorted(grpc);
 
@@ -324,6 +335,65 @@ pub(super) fn aggregate_protocol_metrics(
     m.latency_p95_ms = pct(0.95);
     m.latency_max_ms = latencies.last().copied().unwrap_or(0);
     m
+}
+
+fn downstream_protocol_label(ex: &crate::session::Exchange) -> String {
+    if let Some(ctx) = &ex.protocol_context {
+        return ctx.downstream.label().to_string();
+    }
+    match ex.downstream_protocol.as_deref() {
+        Some("admin") | None => ex
+            .metrics
+            .as_ref()
+            .and_then(|m| m.protocol.clone())
+            .unwrap_or_else(|| "HTTP/1.1".to_string()),
+        Some(label) => label.to_string(),
+    }
+}
+
+fn application_protocol_label(ex: &crate::session::Exchange) -> String {
+    if let Some(ctx) = &ex.protocol_context {
+        return match ctx.application {
+            crate::core::forward::ApplicationProtocol::Grpc => "gRPC".to_string(),
+            crate::core::forward::ApplicationProtocol::Http
+                if matches!(
+                    ctx.downstream,
+                    crate::core::forward::WireProtocol::WebSocket
+                ) =>
+            {
+                "WebSocket".to_string()
+            }
+            crate::core::forward::ApplicationProtocol::Http
+                if matches!(ctx.body_mode, crate::core::forward::BodyMode::Tunnel) =>
+            {
+                "Tunnel".to_string()
+            }
+            _ => "HTTP".to_string(),
+        };
+    }
+    if ex.request.method.eq_ignore_ascii_case("WS") {
+        "WebSocket".to_string()
+    } else if ex
+        .inspector_data
+        .as_ref()
+        .and_then(|i| i.grpc.as_ref())
+        .is_some()
+    {
+        "gRPC".to_string()
+    } else if matches!(ex.downstream_protocol.as_deref(), Some("SOCKS5")) {
+        "Tunnel".to_string()
+    } else {
+        "HTTP".to_string()
+    }
+}
+
+fn source_label(source: crate::session::SessionSource) -> String {
+    match source {
+        crate::session::SessionSource::Proxy => "Proxy".to_string(),
+        crate::session::SessionSource::AdminForward => "Compose".to_string(),
+        crate::session::SessionSource::Playback => "Replay".to_string(),
+        crate::session::SessionSource::Imported => "Imported".to_string(),
+    }
 }
 
 /// Peak number of `[start, end)` intervals overlapping at any instant — the max
@@ -390,10 +460,16 @@ pub(super) async fn list_sessions(
 }
 
 fn session_filter_from_workspace(view: &SessionsViewState) -> SessionListFilter {
+    let mut methods = view.methods.clone();
+    if methods.iter().any(|m| m.eq_ignore_ascii_case("GET"))
+        && !methods.iter().any(|m| m.eq_ignore_ascii_case("WS"))
+    {
+        methods.push("WS".to_string());
+    }
     SessionListFilter {
         query: view.query.clone(),
         regex: view.regex,
-        methods: Some(view.methods.clone()),
+        methods: Some(methods),
         status_buckets: Some(view.status_buckets.clone()),
         host_focus: view.host_focus.clone(),
         host_filter: view.host_filter.clone(),
@@ -847,9 +923,50 @@ mod tests {
         assert_eq!(m.protocol_mix[0].count, 2);
         let two_xx = m.status_classes.iter().find(|c| c.label == "2xx").unwrap();
         assert_eq!(two_xx.count, 2);
+        let http_app = m
+            .application_mix
+            .iter()
+            .find(|c| c.label == "HTTP")
+            .unwrap();
+        assert_eq!(http_app.count, 3);
+        let proxy_source = m.source_mix.iter().find(|c| c.label == "Proxy").unwrap();
+        assert_eq!(proxy_source.count, 3);
         assert_eq!(m.total_bytes, 300);
         assert_eq!(m.latency_max_ms, 30);
         assert_eq!(m.latency_p50_ms, 20);
+    }
+
+    #[test]
+    fn protocol_metrics_keeps_source_out_of_downstream_protocol() {
+        use super::aggregate_protocol_metrics;
+        use crate::session::{InspectionMetrics, SessionSource};
+
+        let mut e = ex("admin", Some("c1"), Some(0), "api.test", "/p");
+        e.source = SessionSource::AdminForward;
+        e.downstream_protocol = Some("admin".to_string());
+        e.metrics = Some(InspectionMetrics {
+            status_code: 200,
+            protocol: Some("HTTP/2".to_string()),
+            ..Default::default()
+        });
+
+        let m = aggregate_protocol_metrics(vec![e]);
+
+        assert!(m.downstream_mix.iter().all(|c| c.label != "admin"));
+        assert_eq!(m.downstream_mix[0].label, "HTTP/2");
+        assert_eq!(m.source_mix[0].label, "Compose");
+    }
+
+    #[test]
+    fn protocol_metrics_counts_websocket_exchanges() {
+        use super::aggregate_protocol_metrics;
+
+        let mut ws = ex("ws", Some("c1"), Some(0), "ws.test", "/socket");
+        ws.request.method = "WS".to_string();
+
+        let m = aggregate_protocol_metrics(vec![ws]);
+
+        assert_eq!(m.websockets, 1);
     }
 
     fn ex(id: &str, conn: Option<&str>, stream: Option<u64>, host: &str, path: &str) -> Exchange {
@@ -867,6 +984,7 @@ mod tests {
             metrics: None,
             source: Default::default(),
             ws_frames: vec![],
+            events: vec![],
             note: None,
             tags: vec![],
             inspector_data: None,
@@ -874,6 +992,7 @@ mod tests {
             connection_id: conn.map(str::to_string),
             stream_id: stream,
             downstream_protocol: Some("HTTP/2".to_string()),
+            protocol_context: None,
         }
     }
 

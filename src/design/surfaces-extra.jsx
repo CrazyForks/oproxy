@@ -1,51 +1,235 @@
 import React from 'react';
-const { Icon, Toggle, SurfaceShell, fetchJson, sendJson, notifyError, ask, formDialog, confirmAction, nonEmpty, Modal, LocationEditor } = window;
+const { Icon, Toggle, SurfaceShell, fetchJson, sendJson, notifyError, ask, formDialog, confirmAction, nonEmpty, Modal, LocationEditor, applyTrafficKind } = window;
 /* Additional surfaces: Mock / Lua / Webhooks / Settings / DNS / Capture / Shortcuts modal */
 
 // ─── Mock modal ────────────────────────────────────────────────────────
 
-const EMPTY_MOCK_LOC = { host: null, path: null, port: null, protocol: null, query: null, methods: [], mode: 'glob' };
+const EMPTY_MOCK_LOC = {
+  host: null,
+  path: null,
+  port: null,
+  protocol: null,
+  query: null,
+  methods: [],
+  wire_protocol: null,
+  application_protocol: null,
+  body_mode: null,
+  mode: 'glob',
+};
+
+const MOCK_TYPES = [
+  ['http_response', 'HTTP'],
+  ['web_socket_script', 'WebSocket'],
+  ['grpc_script', 'gRPC'],
+  ['tunnel_decision', 'Tunnel'],
+];
+
+function mockType(rule) {
+  return rule?.behavior?.type || 'http_response';
+}
+
+function mockSummary(rule) {
+  const type = mockType(rule);
+  if (type === 'web_socket_script') return `${rule.behavior?.frames?.length || 0} frame${(rule.behavior?.frames?.length || 0) === 1 ? '' : 's'}`;
+  if (type === 'grpc_script') return `${rule.behavior?.messages?.length || 0} message${(rule.behavior?.messages?.length || 0) === 1 ? '' : 's'}`;
+  if (type === 'tunnel_decision') return rule.behavior?.decision?.allow ? 'allow tunnel' : 'deny tunnel';
+  const n = rule.responses?.length || rule.behavior?.responses?.length || 0;
+  return `${n} response${n === 1 ? '' : 's'}`;
+}
+
+function safeJsonParse(value, fallback) {
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function toBase64(value) {
+  return btoa(unescape(encodeURIComponent(value || '')));
+}
+
+function fromBase64(value) {
+  try { return decodeURIComponent(escape(atob(value || ''))); } catch { return ''; }
+}
+
+
+// Prettify a JSON string or return it unchanged
+function prettifyJson(str) {
+  try { return JSON.stringify(JSON.parse(str), null, 2); } catch { return str; }
+}
+function isJsonContentType(ct) {
+  return (ct || '').toLowerCase().includes('json');
+}
+
+// Single HTTP response variant editor
+function HttpVariantEditor({ variant, onChange, index, onRemove, isOnly, lbl }) {
+  const jsonError = isJsonContentType(variant.ct) && variant.body && (() => {
+    try { JSON.parse(variant.body); return null; } catch (e) { return e.message; }
+  })();
+  return (
+    <div style={{ background: 'rgba(0,0,0,0.04)', borderRadius: 6, padding: '10px 12px', marginBottom: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ ...lbl, fontWeight: 600 }}>Variant {index + 1}</span>
+        <span style={{ ...lbl, fontSize: 11, color: 'var(--text-faint)' }}>Status</span>
+        <input className="cmp-input" type="number" min="100" max="599" style={{ width: 70 }} value={variant.status} onChange={e => onChange({ ...variant, status: e.target.value })} aria-label="Status code" />
+        <input className="cmp-input" style={{ flex: 1 }} value={variant.ct} onChange={e => onChange({ ...variant, ct: e.target.value })} placeholder="application/json" aria-label="Content-Type" />
+        <input className="cmp-input" type="number" min="0" style={{ width: 80 }} value={variant.delay} onChange={e => onChange({ ...variant, delay: e.target.value })} aria-label="Delay ms" />
+        <span style={{ ...lbl, fontSize: 11 }}>ms</span>
+        {!isOnly && <button className="copy-btn" onClick={onRemove} title="Remove variant" style={{ flexShrink: 0 }}>&times;</button>}
+      </div>
+      <div>
+        <span style={{ fontSize: 11, color: 'var(--text-faint)', display: 'block', marginBottom: 4 }}>Body</span>
+        <textarea className="cmp-input" rows={5} value={variant.body} onChange={e => onChange({ ...variant, body: e.target.value })}
+          placeholder='{"ok": true}'
+          style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12, width: '100%', boxSizing: 'border-box', borderColor: jsonError ? 'var(--c-5xx)' : undefined }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
+          <button type="button" className="copy-btn" onClick={() => onChange({ ...variant, body: prettifyJson(variant.body) })}>Prettify</button>
+          {jsonError && <span style={{ fontSize: 11, color: 'var(--c-5xx)' }}>{jsonError}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Quick-add preset templates
+const MOCK_PRESETS = [
+  { label: 'Empty 200', status: '200', ct: 'application/json', body: '{}' },
+  { label: '404 Not Found', status: '404', ct: 'application/json', body: '{"error":"not found"}' },
+  { label: '500 Error', status: '500', ct: 'application/json', body: '{"error":"internal server error"}' },
+  { label: '401 Unauth', status: '401', ct: 'application/json', body: '{"error":"unauthorized"}' },
+  { label: '429 Rate limit', status: '429', ct: 'application/json', body: '{"error":"rate limit exceeded"}', delay: '500' },
+];
 
 function MockModal({ rule, onClose, onSave }) {
   const isNew = !rule;
-  const first = rule?.responses?.[0] || { status: 200, headers: {}, body: '', delay_ms: 0 };
+  const type0 = mockType(rule);
+
+  const initVariants = () => {
+    const existing = rule?.behavior?.responses || rule?.responses || [];
+    if (existing.length > 0) {
+      return existing.map(r => ({
+        status: String(r.status || 200),
+        ct: r.headers?.['content-type'] || r.headers?.['Content-Type'] || 'application/json',
+        body: r.body || '',
+        delay: String(r.delay_ms || 0),
+      }));
+    }
+    return [{ status: '200', ct: 'application/json', body: '{"ok":true}', delay: '0' }];
+  };
+
+  const firstWs = rule?.behavior?.frames?.[0] || { opcode: 1, payload: 'hello', delay_ms: 0 };
+  const firstGrpc = rule?.behavior?.messages?.[0] || { compressed: false, payload_base64: '', delay_ms: 0 };
+  const tunnelDecision = rule?.behavior?.decision || { allow: false, delay_ms: 0 };
   const [name, setName] = React.useState(rule?.name || '');
   const [loc, setLoc] = React.useState(rule?.location || EMPTY_MOCK_LOC);
-  const [status, setStatus] = React.useState(String(first.status || 200));
-  const [ct, setCt] = React.useState(first.headers?.['content-type'] || first.headers?.['Content-Type'] || 'application/json');
-  const [body, setBody] = React.useState(first.body || '{"ok":true}');
+  const [type, setType] = React.useState(type0);
+  const [variants, setVariants] = React.useState(initVariants);
+  const [delay, setDelay] = React.useState(String(firstWs.delay_ms || firstGrpc.delay_ms || tunnelDecision.delay_ms || 0));
+  const [wsOpcode, setWsOpcode] = React.useState(String(firstWs.opcode || 1));
+  const [wsPayload, setWsPayload] = React.useState(firstWs.payload || '');
+  const [grpcPayload, setGrpcPayload] = React.useState(fromBase64(firstGrpc.payload_base64) || '');
+  const [grpcCompressed, setGrpcCompressed] = React.useState(!!firstGrpc.compressed);
+  const [trailers, setTrailers] = React.useState(JSON.stringify(rule?.behavior?.trailers || {}, null, 2));
+  const [tunnelAllow, setTunnelAllow] = React.useState(!!tunnelDecision.allow);
   const lbl = { fontSize: 12, color: 'var(--text-faint)', whiteSpace: 'nowrap' };
+
+  const updateVariant = (i, v) => setVariants(vs => vs.map((x, j) => j === i ? v : x));
+  const addVariant = () => setVariants(vs => [...vs, { status: '200', ct: 'application/json', body: '{"ok":true}', delay: '0' }]);
+  const removeVariant = (i) => setVariants(vs => vs.filter((_, j) => j !== i));
+  const applyPreset = (p) => setVariants([{ status: p.status, ct: p.ct, body: p.body, delay: p.delay || '0' }]);
+
+  const selectType = (nextType) => {
+    setType(nextType);
+    const kind = nextType === 'web_socket_script' ? 'websocket' : nextType === 'grpc_script' ? 'grpc' : nextType === 'tunnel_decision' ? 'tunnel' : 'http';
+    if (applyTrafficKind) setLoc(prev => applyTrafficKind(prev || EMPTY_MOCK_LOC, kind));
+  };
+
   const save = async () => {
-    try { await onSave({ name, loc, status: Number(status || 200), contentType: ct, body }); }
+    const nextLoc = { ...(loc || EMPTY_MOCK_LOC) };
+    let responses = [];
+    let behavior = null;
+    if (type === 'http_response') {
+      responses = variants.map(v => ({
+        status: Number(v.status || 200),
+        headers: { 'content-type': v.ct },
+        body: v.body,
+        delay_ms: Math.max(0, Number(v.delay || 0)),
+      }));
+    } else if (type === 'web_socket_script') {
+      behavior = { type, frames: [{ opcode: Number(wsOpcode || 1), payload: wsPayload, delay_ms: Math.max(0, Number(delay || 0)) }] };
+      nextLoc.wire_protocol = nextLoc.wire_protocol || 'websocket';
+      nextLoc.body_mode = nextLoc.body_mode || 'frames';
+    } else if (type === 'grpc_script') {
+      behavior = { type, messages: [{ compressed: grpcCompressed, payload_base64: toBase64(grpcPayload), delay_ms: Math.max(0, Number(delay || 0)) }], trailers: safeJsonParse(trailers, {}) };
+      nextLoc.application_protocol = nextLoc.application_protocol || 'grpc';
+      nextLoc.body_mode = nextLoc.body_mode || 'stream_messages';
+    } else if (type === 'tunnel_decision') {
+      behavior = { type, decision: { allow: tunnelAllow, delay_ms: Math.max(0, Number(delay || 0)) } };
+      nextLoc.wire_protocol = nextLoc.wire_protocol || 'socks5';
+      nextLoc.body_mode = nextLoc.body_mode || 'tunnel';
+    }
+    try { await onSave({ name, loc: nextLoc, responses, behavior }); }
     catch (e) { notifyError(e.message || e); }
   };
+
   return (
-    <Modal title={isNew ? 'Add mock response' : `Edit — ${rule.name}`} onClose={onClose} onSave={save}>
-      {/* Name row — full width */}
+    <Modal title={isNew ? 'Add mock' : `Edit — ${rule.name}`} onClose={onClose} onSave={save}>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
         <input className="cmp-input" style={{ flex: 1 }} value={name} onChange={e => setName(e.target.value)}
                placeholder={isNew ? 'Name (optional)' : 'Name'} autoFocus />
+        <select className="cmp-input" style={{ width: 132 }} value={type} onChange={e => selectType(e.target.value)}>
+          {MOCK_TYPES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
       </div>
-      {/* Location — shown for new rules; on edit, location is kept as-is */}
-      {isNew
-        ? <LocationEditor loc={loc} onChange={setLoc} />
-        : <div style={{ fontSize: 11, color: 'var(--text-faint)', marginBottom: 8 }}>
-            Scope: {[rule.location?.host, rule.location?.path].filter(Boolean).join(' ') || 'any'}
+      <LocationEditor loc={loc} onChange={setLoc} />
+      {type === 'http_response' && <>
+        {isNew && (
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10, alignItems: 'center' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>Quick add:</span>
+            {MOCK_PRESETS.map(p => (
+              <button key={p.label} type="button" className="copy-btn" onClick={() => applyPreset(p)}>{p.label}</button>
+            ))}
           </div>
-      }
-      {/* Status + Content-Type */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'max-content 80px max-content 1fr', gap: '6px 8px', alignItems: 'center', marginBottom: 8 }}>
-        <span style={lbl}>Status</span>
-        <input className="cmp-input" type="number" min="100" max="599" value={status} onChange={e => setStatus(e.target.value)} />
-        <span style={lbl}>Content-Type</span>
-        <input className="cmp-input" value={ct} onChange={e => setCt(e.target.value)} placeholder="application/json" />
-      </div>
-      {/* Body */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr', gap: '6px 8px', alignItems: 'start' }}>
-        <span style={{ ...lbl, paddingTop: 5 }}>Body</span>
-        <textarea className="cmp-input" rows={6} value={body} onChange={e => setBody(e.target.value)}
-                  placeholder='{"ok": true}' style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12 }} />
-      </div>
+        )}
+        <div style={{ fontSize: 10.5, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--text-faint)', marginBottom: 8 }}>
+          Responses{variants.length > 1 ? <span style={{ fontWeight: 400, textTransform: 'none', fontSize: 11, letterSpacing: 0 }}> — served in sequence, cycling on each call</span> : null}
+        </div>
+        {variants.map((v, i) => (
+          <HttpVariantEditor key={i} variant={v} index={i} onChange={nv => updateVariant(i, nv)} onRemove={() => removeVariant(i)} isOnly={variants.length === 1} lbl={lbl} />
+        ))}
+        <button className="btn ghost" style={{ fontSize: 12, marginBottom: 8 }} onClick={addVariant}>+ Add variant</button>
+      </>}
+      {type === 'web_socket_script' && <>
+        <div style={{ display: 'grid', gridTemplateColumns: 'max-content 90px max-content 90px', gap: '6px 8px', alignItems: 'center', marginBottom: 8 }}>
+          <span style={lbl}>Opcode</span>
+          <select className="cmp-input" value={wsOpcode} onChange={e => setWsOpcode(e.target.value)}>
+            <option value="1">Text</option><option value="2">Binary</option><option value="8">Close</option><option value="9">Ping</option><option value="10">Pong</option>
+          </select>
+          <span style={lbl}>Delay</span>
+          <input className="cmp-input" type="number" min="0" value={delay} onChange={e => setDelay(e.target.value)} />
+        </div>
+        <textarea className="cmp-input" rows={5} value={wsPayload} onChange={e => setWsPayload(e.target.value)}
+                  placeholder="payload" style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12 }} />
+      </>}
+      {type === 'grpc_script' && <>
+        <div style={{ display: 'grid', gridTemplateColumns: 'max-content 80px max-content 90px', gap: '6px 8px', alignItems: 'center', marginBottom: 8 }}>
+          <span style={lbl}>Compressed</span>
+          <Toggle on={grpcCompressed} onChange={setGrpcCompressed} label="Toggle gRPC compression flag" />
+          <span style={lbl}>Delay</span>
+          <input className="cmp-input" type="number" min="0" value={delay} onChange={e => setDelay(e.target.value)} />
+        </div>
+        <textarea className="cmp-input" rows={5} value={grpcPayload} onChange={e => setGrpcPayload(e.target.value)}
+                  placeholder="protobuf payload bytes as text" style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12, marginBottom: 8 }} />
+        <textarea className="cmp-input" rows={3} value={trailers} onChange={e => setTrailers(e.target.value)}
+                  placeholder='{"grpc-status":"0"}' style={{ resize: 'vertical', fontFamily: 'var(--font-mono)', fontSize: 12 }} />
+      </>}
+      {type === 'tunnel_decision' && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'max-content 120px max-content 90px', gap: '6px 8px', alignItems: 'center' }}>
+          <span style={lbl}>Decision</span>
+          <select className="cmp-input" value={tunnelAllow ? 'allow' : 'deny'} onChange={e => setTunnelAllow(e.target.value === 'allow')}>
+            <option value="deny">Deny</option><option value="allow">Allow</option>
+          </select>
+          <span style={lbl}>Delay</span>
+          <input className="cmp-input" type="number" min="0" value={delay} onChange={e => setDelay(e.target.value)} />
+        </div>
+      )}
     </Modal>
   );
 }
@@ -53,26 +237,28 @@ function MockModal({ rule, onClose, onSave }) {
 // ─── Mock Server ───────────────────────────────────────────────────────
 const INITIAL_MOCK_RULES = [];
 
-function MockSurface() {
+function MockSurface({ createFrom }) {
   const [rules, setRules] = React.useState(INITIAL_MOCK_RULES);
   const [expanded, setExpanded] = React.useState(null);
   const [mockEdit, setMockEdit] = React.useState(undefined); // undefined=closed, null=new, obj=editing
   const load = React.useCallback(() => fetchJson('/admin/mock/rules', []).then(setRules), []);
   React.useEffect(() => { load(); }, [load]);
+  // Pre-fill from create-from-session action
+  React.useEffect(() => { if (createFrom) setMockEdit(createFrom); }, [createFrom]);
   const toggle = async (id) => {
     const rule = rules.find(r => r.id === id);
     if (!rule) return;
     await sendJson(`/admin/mock/rules/${encodeURIComponent(id)}`, 'PUT', { ...rule, enabled: !rule.enabled }).catch(e => notifyError(e.message || e));
     await load();
   };
-  const saveMock = async ({ name, loc, status, contentType, body }) => {
+  const saveMock = async ({ name, loc, responses, behavior }) => {
     if (mockEdit) {
-      // Edit existing — update first response; location unchanged
-      const first = mockEdit.responses?.[0] || { status: 200, headers: {}, body: '', delay_ms: 0 };
       await sendJson(`/admin/mock/rules/${encodeURIComponent(mockEdit.id)}`, 'PUT', {
         ...mockEdit,
         name: name || mockEdit.name,
-        responses: [{ ...first, status, headers: { ...(first.headers || {}), 'content-type': contentType }, body }],
+        location: loc || mockEdit.location || EMPTY_MOCK_LOC,
+        behavior,
+        responses,
       }).catch(e => notifyError(e.message || e));
     } else {
       // New — send full Location struct
@@ -82,7 +268,8 @@ function MockSurface() {
         name: name || `Mock ${location.path || '*'}`,
         enabled: true,
         location,
-        responses: [{ status, headers: { 'content-type': contentType }, body, delay_ms: 0 }],
+        behavior,
+        responses,
         call_count: 0,
       }).catch(e => notifyError(e.message || e));
     }
@@ -99,14 +286,15 @@ function MockSurface() {
     await load();
   };
   const totalCalls = rules.reduce((a, r) => a + (r.call_count || 0), 0);
+  const maxCalls = Math.max(1, ...rules.map(r => r.call_count || 0));
   return (
     <SurfaceShell title="Mock Server"
                   sub={`${rules.filter(r => r.enabled).length} active · ${totalCalls} mock responses served`}
                   actions={<>
                     <button className="btn primary" onClick={() => setMockEdit(null)}>＋ Add mock</button>
                   </>}>
-      <div className="rule-head" style={{ gridTemplateColumns: '36px 1fr 80px 220px 120px 80px 100px' }}>
-        <div></div><div>Name / scope</div><div>Methods</div><div>Path</div><div>Responses</div><div style={{ textAlign: 'right' }}>Calls</div><div></div>
+      <div className="rule-head" style={{ gridTemplateColumns: '36px 1fr 80px 220px 150px 80px 100px' }}>
+        <div></div><div>Name / scope</div><div>Methods</div><div>Path</div><div>Behavior</div><div style={{ textAlign: 'right' }}>Calls</div><div></div>
       </div>
       {rules.length === 0 && <div className="empty">No mock rules are configured.</div>}
       {rules.map(r => {
@@ -115,7 +303,7 @@ function MockSurface() {
         const firstMethod = loc.methods?.[0] || 'GET';
         return (
         <React.Fragment key={r.id}>
-          <div className={'rule-row' + (r.enabled ? '' : ' off')} style={{ gridTemplateColumns: '36px 1fr 80px 220px 120px 80px 100px' }}>
+          <div className={'rule-row' + (r.enabled ? '' : ' off')} style={{ gridTemplateColumns: '36px 1fr 80px 220px 150px 80px 100px' }}>
             <div className="col-toggle"><Toggle label={`Toggle mock rule ${r.name}`} on={r.enabled} onChange={() => toggle(r.id)} /></div>
             <div className="col-match">
               <div style={{ color: 'var(--text-hi)', fontFamily: 'var(--font-sans)', fontSize: 12, fontWeight: 500 }}>{r.name}</div>
@@ -124,10 +312,17 @@ function MockSurface() {
             <div><span className="cell-method" data-m={firstMethod}>{methods}</span></div>
             <div className="col-match" style={{ color: 'var(--c-3xx)' }}>{loc.path || '.*'}</div>
             <div className="col-meta">
-              {r.responses.length} response{r.responses.length === 1 ? '' : 's'}
-              {r.responses.length > 1 && <span className="mute"> · weighted</span>}
+              {mockSummary(r)}
+              {mockType(r) !== 'http_response' && <span className="mute"> · {mockType(r).replace(/_/g, ' ')}</span>}
             </div>
-            <div className="cell-num" style={{ fontFamily: 'var(--font-mono)' }}>{(r.call_count || 0).toLocaleString()} <button className="copy-btn" onClick={() => resetMock(r)} aria-label={`Reset mock call count for ${r.name}`}>↺</button></div>
+            <div className="cell-num" style={{ fontFamily: 'var(--font-mono)', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2 }}>
+              <span>{(r.call_count || 0).toLocaleString()} <button className="copy-btn" onClick={() => resetMock(r)} aria-label={`Reset mock call count for ${r.name}`}>↺</button></span>
+              {(r.call_count || 0) > 0 && (
+                <div style={{ width: '100%', height: 3, background: 'var(--border)', borderRadius: 2 }}>
+                  <div style={{ height: '100%', width: `${Math.round((r.call_count || 0) / maxCalls * 100)}%`, background: 'var(--c-2xx, #30a14e)', borderRadius: 2, transition: 'width 0.3s' }} />
+                </div>
+              )}
+            </div>
             <div className="col-act">
               <button className="copy-btn" onClick={() => setExpanded(expanded === r.id ? null : r.id)} aria-expanded={expanded === r.id} aria-label={`${expanded === r.id ? 'Hide' : 'Show'} mock responses for ${r.name}`}>
                 {expanded === r.id ? 'hide' : 'show'}
@@ -138,14 +333,29 @@ function MockSurface() {
           </div>
           {expanded === r.id && (
             <div style={{ background: 'var(--surface-2)', padding: '12px 16px 14px', borderBottom: '1px solid var(--border)' }}>
-              {r.responses.map((res, i) => (
+              {mockType(r) === 'http_response' && ((r.responses || r.behavior?.responses || []).map((res, i) => (
                 <div key={i} style={{ display: 'grid', gridTemplateColumns: '60px 80px 100px 1fr', alignItems: 'center', gap: 12, fontFamily: 'var(--font-mono)', fontSize: 11.5, padding: '6px 0' }}>
                   <span className="dim">variant {i + 1}</span>
                   <span className="cell-status" data-c={String(res.status)[0]}>{res.status}</span>
                   <span className="dim">+{res.delay_ms || 0} ms</span>
                   <code style={{ background: 'var(--bg-deep)', padding: '4px 8px', borderRadius: 4, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{res.body}</code>
                 </div>
+              )))}
+              {mockType(r) === 'web_socket_script' && (r.behavior?.frames || []).map((frame, i) => (
+                <div key={i} style={{ display: 'grid', gridTemplateColumns: '60px 80px 100px 1fr', alignItems: 'center', gap: 12, fontFamily: 'var(--font-mono)', fontSize: 11.5, padding: '6px 0' }}>
+                  <span className="dim">frame {i + 1}</span><span>op {frame.opcode}</span><span className="dim">+{frame.delay_ms || 0} ms</span><code style={{ background: 'var(--bg-deep)', padding: '4px 8px', borderRadius: 4 }}>{frame.payload}</code>
+                </div>
               ))}
+              {mockType(r) === 'grpc_script' && (r.behavior?.messages || []).map((msg, i) => (
+                <div key={i} style={{ display: 'grid', gridTemplateColumns: '80px 100px 1fr', alignItems: 'center', gap: 12, fontFamily: 'var(--font-mono)', fontSize: 11.5, padding: '6px 0' }}>
+                  <span className="dim">message {i + 1}</span><span className="dim">+{msg.delay_ms || 0} ms</span><code style={{ background: 'var(--bg-deep)', padding: '4px 8px', borderRadius: 4 }}>{fromBase64(msg.payload_base64)}</code>
+                </div>
+              ))}
+              {mockType(r) === 'tunnel_decision' && (
+                <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>
+                  {r.behavior?.decision?.allow ? 'allow' : 'deny'} · +{r.behavior?.decision?.delay_ms || 0} ms
+                </div>
+              )}
             </div>
           )}
         </React.Fragment>
@@ -347,7 +557,7 @@ function WebhooksSurface() {
             {h.events.map(e => <span key={e} className="tag-badge" style={{ marginLeft: 0, marginRight: 4 }}>{e}</span>)}
           </div>
           <div className="col-meta">
-            <div className="mute">runtime</div>
+            <div className="mute">{h.last_fired ? new Date(h.last_fired).toLocaleString() : 'Never'}</div>
           </div>
           <div className="col-act">
             <button className="copy-btn" onClick={() => editHook(h)} aria-label={`Edit webhook ${h.url}`}>edit</button>
@@ -364,12 +574,30 @@ function DnsSurface() {
   const [entries, setEntries] = React.useState([]);
   const load = React.useCallback(async () => {
     const data = await fetchJson('/admin/dns', {});
-    setEntries(Object.entries(data || {}).map(([host, ip]) => ({ id: host, host, ip, on: true, note: 'active override' })));
+    setEntries(Object.entries(data || {}).map(([host, val]) => {
+      // Support both legacy string format and new DnsEntry object format
+      const ip = typeof val === 'string' ? val : val?.ip || '';
+      const on = typeof val === 'string' ? true : (val?.enabled !== false);
+      return { id: host, host, ip, on };
+    }));
   }, []);
   React.useEffect(() => { load(); }, [load]);
-  const saveDns = async (host, ip) => {
-    const current = await fetchJson('/admin/dns', {});
-    await sendJson('/admin/dns', 'POST', { ...current, [host]: ip });
+  const currentMap = async () => {
+    const data = await fetchJson('/admin/dns', {});
+    // GET returns strings for enabled entries, objects for disabled entries — use as-is.
+    return data || {};
+  };
+  const saveDns = async (host, ip, enabled = true) => {
+    const current = await currentMap();
+    // Send plain string for enabled entries (API contract); object for disabled.
+    const val = enabled ? ip : { ip, enabled: false };
+    await sendJson('/admin/dns', 'POST', { ...current, [host]: val });
+    await load();
+  };
+  const toggleDns = async (d) => {
+    const current = await currentMap();
+    const val = !d.on ? d.ip : { ip: d.ip, enabled: false };
+    await sendJson('/admin/dns', 'POST', { ...current, [d.host]: val });
     await load();
   };
   const addDns = async () => {
@@ -378,14 +606,14 @@ function DnsSurface() {
       { name: 'ip', label: 'Override IP', value: '127.0.0.1' },
     ]);
     if (!form || !nonEmpty(form.host) || !nonEmpty(form.ip)) return;
-    await saveDns(form.host, form.ip).catch(e => notifyError(e.message || e));
+    await saveDns(form.host, form.ip, true).catch(e => notifyError(e.message || e));
   };
   const editDns = async (d) => {
     const form = await formDialog('Edit DNS override', [
       { name: 'ip', label: 'Override IP', value: d.ip },
     ]);
     if (!form || !nonEmpty(form.ip)) return;
-    await saveDns(d.host, form.ip).catch(e => notifyError(e.message || e));
+    await saveDns(d.host, form.ip, d.on).catch(e => notifyError(e.message || e));
   };
   const deleteDns = async (d) => {
     await fetch(`/admin/dns/${encodeURIComponent(d.host)}`, { method: 'DELETE' }).catch(e => notifyError(e.message || e));
@@ -395,16 +623,15 @@ function DnsSurface() {
     <SurfaceShell title="DNS Override"
                   sub="resolve hostnames to fixed IPs before forwarding · CONNECT tunnels included"
                   actions={<button className="btn primary" onClick={addDns}>＋ Add override</button>}>
-      <div className="rule-head" style={{ gridTemplateColumns: '36px 1fr 160px 1fr 100px' }}>
-        <div></div><div>Hostname</div><div>Override IP</div><div>Note</div><div></div>
+      <div className="rule-head" style={{ gridTemplateColumns: '36px 1fr 160px 100px' }}>
+        <div></div><div>Hostname</div><div>Override IP</div><div></div>
       </div>
       {entries.length === 0 && <div className="empty">No DNS overrides are configured.</div>}
       {entries.map(d => (
-        <div key={d.id} className={'rule-row' + (d.on ? '' : ' off')} style={{ gridTemplateColumns: '36px 1fr 160px 1fr 100px' }}>
-          <div className="col-toggle"><span className="mute">—</span></div>
+        <div key={d.id} className={'rule-row' + (d.on ? '' : ' off')} style={{ gridTemplateColumns: '36px 1fr 160px 100px' }}>
+          <div className="col-toggle"><Toggle label={`Toggle DNS override ${d.host}`} on={d.on} onChange={() => toggleDns(d)} /></div>
           <div className="col-match">{d.host}</div>
           <div className="col-match" style={{ color: 'var(--c-3xx)' }}>{d.ip}</div>
-          <div className="col-meta" style={{ fontFamily: 'var(--font-sans)' }}>{d.note}</div>
           <div className="col-act">
             <button className="copy-btn" onClick={() => editDns(d)} aria-label={`Edit DNS override ${d.host}`}>edit</button>
             <button className="copy-btn" onClick={() => deleteDns(d)} aria-label={`Delete DNS override ${d.host}`}>×</button>
@@ -559,6 +786,11 @@ function SettingsSurface() {
             Admin UI and proxy are reachable outside localhost because bind host is {cfg.bind_host}. Use this only on trusted networks.
           </div>
         )}
+        {socks5 && !socks5.enabled && socks5.port && (
+          <div className="warn-strip" style={{ gridColumn: '1 / -1' }}>
+            SOCKS5 is configured on port {socks5.port} but failed to bind at startup — the port may already be in use. Set <code>OPROXY_SOCKS5_PORT</code> to a free port and restart.
+          </div>
+        )}
         <div className="insp-card" style={{ margin: 0 }}>
           <div className="head"><h3>Listener</h3></div>
           <div className="body">
@@ -633,7 +865,7 @@ function ShortcutsModal({ onClose }) {
     { title: 'Search & filter', items: [
       ['⌘ / Ctrl + F',  'Focus search'],
       ['⌘ / Ctrl + K',  'Focus search'],
-      ['.*',            'Toggle regex search'],
+      ['/ + .*',        'Toggle regex search (type .* in search box)'],
     ]},
     { title: 'Actions', items: [
       ['Space',         'Pause / resume live refresh'],
@@ -645,6 +877,7 @@ function ShortcutsModal({ onClose }) {
     ]},
     { title: 'View', items: [
       ['⌘ / Ctrl + D',  'Toggle theme'],
+      ['⌘ / Ctrl + B',  'Download Root CA certificate'],
       ['?',             'Open this dialog'],
     ]},
   ];
@@ -798,7 +1031,8 @@ function ProtocolDashboard() {
     return () => clearInterval(t);
   }, [load]);
   const statusTone = (k) => k === '2xx' ? 'ok' : k === '3xx' ? 'redir' : (k === '4xx' || k === '5xx') ? 'err' : '';
-  const protoTone = (k) => k === 'HTTP/2' ? 'h2' : k === 'HTTP/3' ? 'h3' : 'h1';
+  const protoTone = (k) => k === 'HTTP/2' ? 'h2' : k === 'HTTP/3' ? 'h3' : k === 'SOCKS5' ? 'socks' : 'h1';
+  const appTone = (k) => k === 'WebSocket' ? 'ws' : k === 'gRPC' ? 'grpc' : k === 'Tunnel' ? 'socks' : 'h1';
   return (
     <SurfaceShell title="Protocol Dashboard"
                   sub="live aggregates across recorded sessions · refreshes every 3s"
@@ -816,6 +1050,8 @@ function ProtocolDashboard() {
           <div className="dash-cols">
             <DistBars title="Upstream protocol" rows={m.protocol_mix} tone={protoTone} />
             <DistBars title="Downstream protocol" rows={m.downstream_mix} tone={protoTone} />
+            <DistBars title="Application" rows={m.application_mix || []} tone={appTone} />
+            <DistBars title="Capture source" rows={m.source_mix || []} />
             <DistBars title="Status classes" rows={m.status_classes} tone={statusTone} />
             {m.grpc_status.length > 0 && <DistBars title="gRPC status" rows={m.grpc_status} />}
           </div>

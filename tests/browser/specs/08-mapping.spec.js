@@ -57,6 +57,31 @@ test.describe('Rules / mapping and access', () => {
     await expect(page.getByText('http://new.example.com')).toBeVisible();
   });
 
+  test('Map Remote kind presets store app and wire match fields separately', async ({ request, page }) => {
+    const host = `ui-grpc-route-${Date.now()}.example.com`;
+    await gotoRail(page, 'Rules');
+    await page.getByRole('button', { name: 'Map Remote', exact: true }).click();
+    await page.getByRole('button', { name: /Add rule/ }).click();
+
+    const dialog = page.locator('.ui-dialog');
+    await dialog.getByPlaceholder('Name').fill('ui-map-remote-grpc');
+    await dialog.getByRole('button', { name: 'gRPC', exact: true }).click();
+    await dialog.getByPlaceholder('api.example.com').fill(host);
+    await dialog.getByPlaceholder('http://10.0.0.1:3000').fill('http://grpc-upstream.example');
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+
+    const rules = await (await request.get('/admin/map-remote-rules')).json();
+    const saved = rules.find(r => r.name === 'ui-map-remote-grpc');
+    expect(saved).toBeTruthy();
+    expect(saved.location).toMatchObject({
+      host,
+      wire_protocol: 'http2',
+      application_protocol: 'grpc',
+      body_mode: 'stream_messages',
+    });
+    expect(saved.location.methods || []).not.toContain('WS');
+  });
+
   test('Map Local and Access tabs switch view', async ({ page }) => {
     await gotoRail(page, 'Rules');
     await page.getByRole('button', { name: 'Map Local', exact: true }).click();

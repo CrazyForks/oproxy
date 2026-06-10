@@ -190,6 +190,12 @@ impl ApiHandler {
         self.breakpoint_manager.list_rules().await
     }
 
+    pub async fn list_breakpoint_diagnostics(
+        &self,
+    ) -> Vec<crate::middleware::plugins::breakpoints::BreakpointDiagnostic> {
+        self.breakpoint_manager.list_diagnostics().await
+    }
+
     pub async fn add_breakpoint_rule(&self, rule: BreakpointRule) {
         self.breakpoint_manager.add_rule(rule).await;
     }
@@ -256,14 +262,15 @@ fn matches_session_filter(session: &Exchange, filter: &SessionListFilter) -> boo
         .host_filter
         .as_deref()
         .filter(|host| !host.is_empty())
-        && session.request.host != host_filter
+        && !session.request.host.eq_ignore_ascii_case(host_filter)
     {
         return false;
     }
 
     if !filter.host_focus.is_empty()
         && !filter.host_focus.iter().any(|host| {
-            session.request.host == *host || session.request.host.ends_with(&format!(".{host}"))
+            let h = session.request.host.to_ascii_lowercase();
+            h == host.as_str() || h.ends_with(&format!(".{host}"))
         })
     {
         return false;
@@ -329,6 +336,7 @@ fn build_facets(sessions: &[Exchange]) -> SessionListFacets {
 
 fn status_bucket(session: &Exchange) -> &'static str {
     match response_status(session) {
+        100..=199 => "1",
         200..=299 => "2",
         300..=399 => "3",
         400..=499 => "4",

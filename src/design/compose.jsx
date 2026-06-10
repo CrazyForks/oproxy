@@ -7,14 +7,24 @@ const COMPOSE_INITIAL = {
   variables: [],
 };
 const COMPOSE_STORAGE_KEY = 'oproxy.compose.workspace.v1';
+const COMPOSE_KINDS = [
+  { key: 'http', label: 'HTTP' },
+  { key: 'websocket', label: 'WS' },
+  { key: 'grpc', label: 'gRPC' },
+];
+const DEFAULT_WS_FRAMES = [{ id: 'wf_1', on: true, opcode: 'text', payload: 'hello' }];
 
 function loadComposeState() {
   try {
     const raw = localStorage.getItem(COMPOSE_STORAGE_KEY);
     if (!raw) return COMPOSE_INITIAL;
     const parsed = JSON.parse(raw);
+    const collections = Array.isArray(parsed?.collections) ? parsed.collections : [];
     return {
-      collections: Array.isArray(parsed?.collections) ? parsed.collections : [],
+      collections: collections.map(c => ({
+        ...c,
+        requests: Array.isArray(c.requests) ? c.requests.map(normalizeComposeRequest) : [],
+      })),
       variables: Array.isArray(parsed?.variables) ? parsed.variables : [],
     };
   } catch {
@@ -25,7 +35,10 @@ function loadComposeState() {
 function saveComposeState(state) {
   try {
     localStorage.setItem(COMPOSE_STORAGE_KEY, JSON.stringify({
-      collections: state.collections || [],
+      collections: (state.collections || []).map(c => ({
+        ...c,
+        requests: (c.requests || []).map(normalizeComposeRequest),
+      })),
       variables: state.variables || [],
     }));
   } catch {
@@ -37,10 +50,44 @@ const DEFAULT_HEADERS = [];
 
 const DEFAULT_BODY = '';
 
-function makeTab(overrides = {}) {
+function normalizeComposeKind(kind) {
+  return COMPOSE_KINDS.some(k => k.key === kind) ? kind : 'http';
+}
+
+function normalizeRows(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map(it => ({
+    id: it.id || ('n' + Date.now() + Math.random()),
+    on: it.on !== false,
+    key: it.key ?? '',
+    value: it.value ?? '',
+  }));
+}
+
+function normalizeComposeRequest(req = {}) {
+  const kind = normalizeComposeKind(req.kind);
   return {
+    ...req,
+    kind,
+    method: req.method || (kind === 'grpc' ? 'POST' : 'GET'),
+    headers: normalizeRows(req.headers),
+    params: normalizeRows(req.params),
+    body: req.body ?? DEFAULT_BODY,
+    bodyMode: req.bodyMode || (req.body ? 'raw' : 'none'),
+    contentType: req.contentType || (kind === 'grpc' ? 'application/grpc+proto' : 'application/json'),
+    authType: req.authType || 'none',
+    authToken: req.authToken || '',
+    authUser: req.authUser || '',
+    authPass: req.authPass || '',
+    wsFrames: Array.isArray(req.wsFrames) && req.wsFrames.length ? req.wsFrames : DEFAULT_WS_FRAMES.map(f => ({ ...f, id: 'wf_' + Math.random().toString(36).slice(2, 8) })),
+  };
+}
+
+function makeTab(overrides = {}) {
+  return normalizeComposeRequest({
     id: 't_' + Math.random().toString(36).slice(2, 8),
     name: 'Untitled',
+    kind: 'http',
     method: 'GET',
     url: '',
     headers: [...DEFAULT_HEADERS],
@@ -55,11 +102,15 @@ function makeTab(overrides = {}) {
     response: null,
     dirty: false,
     ...overrides,
-  };
+  });
 }
 
 function enabledPairs(items) {
   return (items || []).filter(x => x.on !== false && x.key);
+}
+
+function enabledWsFrames(items) {
+  return (items || []).filter(x => x.on !== false);
 }
 
 function buildComposeUrl(tab, resolveVars) {
@@ -78,11 +129,23 @@ function buildComposeUrl(tab, resolveVars) {
 }
 
 function validateComposeTarget(url) {
-  if (!url) return 'Enter an absolute http:// or https:// URL.';
+  return validateComposeTargetForKind('http', url);
+}
+
+function validateComposeTargetForKind(kind, url) {
+  if (!url) {
+    return kind === 'websocket'
+      ? 'Enter an absolute ws:// or wss:// URL.'
+      : 'Enter an absolute http:// or https:// URL.';
+  }
   if (url.includes('{{')) return 'Resolve all variables before sending.';
   try {
     const parsed = new URL(url);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    if (kind === 'websocket') {
+      if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+        return 'Only ws:// and wss:// URLs can be sent.';
+      }
+    } else if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       return 'Only http:// and https:// URLs can be sent.';
     }
     return '';
@@ -93,11 +156,16 @@ function validateComposeTarget(url) {
 
 function buildComposeCurl(tab, resolveVars) {
   const url = buildComposeUrl(tab, resolveVars);
+  if (tab.kind === 'websocket') return `websocat ${shellQuote(url)}`;
   const parts = ['curl'];
-  if (tab.method && tab.method !== 'GET') parts.push('-X', shellQuote(tab.method));
+  const method = tab.kind === 'grpc' ? 'POST' : tab.method;
+  if (method && method !== 'GET') parts.push('-X', shellQuote(method));
   enabledPairs(tab.headers).forEach(h => parts.push('-H', shellQuote(`${h.key}: ${resolveVars(h.value || '')}`)));
   const authHeader = authHeaderValue(tab, resolveVars);
   if (authHeader) parts.push('-H', shellQuote(`Authorization: ${authHeader}`));
+  if (tab.kind === 'grpc' && !enabledPairs(tab.headers).some(h => h.key.toLowerCase() === 'content-type')) {
+    parts.push('-H', shellQuote(`Content-Type: ${tab.contentType || 'application/grpc+proto'}`));
+  }
   if (tab.body) parts.push('--data-raw', shellQuote(resolveVars(tab.body)));
   parts.push(shellQuote(url));
   return parts.join(' ');
@@ -236,7 +304,19 @@ function ComposeSurface({ incomingRequest }) {
         ? prev.collections
         : [{ id: 'c_' + Date.now(), name: 'Collection 1', open: true, requests: [] }];
       const targetId = saveCollId || collections[0].id;
-      const req = { id: savedId, name, method: active.method, url: active.url, headers: active.headers, params: active.params, body: active.body, bodyMode: active.bodyMode, contentType: active.contentType };
+      const req = normalizeComposeRequest({
+        id: savedId,
+        name,
+        kind: active.kind,
+        method: active.method,
+        url: active.url,
+        headers: active.headers,
+        params: active.params,
+        body: active.body,
+        bodyMode: active.bodyMode,
+        contentType: active.contentType,
+        wsFrames: active.wsFrames,
+      });
       return {
         ...prev,
         collections: collections.map(c => c.id === targetId
@@ -254,7 +334,14 @@ function ComposeSurface({ incomingRequest }) {
 
   React.useEffect(() => {
     if (!incomingRequest) return;
-    const t = makeTab(incomingRequest);
+    const t = makeTab({
+      ...incomingRequest,
+      initialBodyTab: incomingRequest.kind === 'websocket'
+        ? 'frames'
+        : incomingRequest.kind === 'grpc'
+          ? 'message'
+          : 'headers',
+    });
     setTabs(prev => [...prev, t]);
     setActiveTabId(t.id);
   }, [incomingRequest?.importId]);
@@ -316,6 +403,7 @@ function ComposeSurface({ incomingRequest }) {
       const req = {
         id: savedId,
         name: active.name || `${active.method} ${active.url || '/'}`,
+        kind: active.kind,
         method: active.method,
         url: active.url,
         headers: active.headers,
@@ -323,11 +411,12 @@ function ComposeSurface({ incomingRequest }) {
         body: active.body,
         bodyMode: active.bodyMode,
         contentType: active.contentType,
+        wsFrames: active.wsFrames,
       };
       return {
         ...prev,
         collections: collections.map(c => c.id === target.id
-          ? { ...c, open: true, requests: [...c.requests.filter(r => r.id !== req.id), req] }
+          ? { ...c, open: true, requests: [...c.requests.filter(r => r.id !== req.id), normalizeComposeRequest(req)] }
           : c),
       };
     });
@@ -338,7 +427,7 @@ function ComposeSurface({ incomingRequest }) {
     if (!active) return;
     const started = performance.now();
     const url = buildComposeUrl(active, resolveVars);
-    const validationError = validateComposeTarget(url);
+    const validationError = validateComposeTargetForKind(active.kind, url);
     if (validationError) {
       updateActive({
         response: {
@@ -363,15 +452,28 @@ function ComposeSurface({ incomingRequest }) {
       headers['content-type'] = active.contentType;
     }
     try {
-      const res = await fetch('/admin/forward', {
+      const isWs = active.kind === 'websocket';
+      const endpoint = isWs ? '/admin/forward/websocket' : '/admin/forward';
+      const payload = isWs
+        ? {
+            url,
+            headers,
+            frames: enabledWsFrames(active.wsFrames).map(f => ({
+              opcode: f.opcode || 'text',
+              payload: resolveVars(f.payload || ''),
+            })),
+          }
+        : {
+            kind: active.kind === 'grpc' ? 'grpc' : 'http',
+            method: active.kind === 'grpc' ? 'POST' : active.method,
+            url,
+            headers,
+            body: active.body ? resolveVars(active.body) : null,
+          };
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          method: active.method,
-          url,
-          headers,
-          body: active.body ? resolveVars(active.body) : null,
-        }),
+        body: JSON.stringify(payload),
       });
       const contentType = res.headers.get('content-type') || '';
       const text = await res.text();
@@ -384,11 +486,13 @@ function ComposeSurface({ incomingRequest }) {
       updateActive({
         response: {
           status: data.status || res.status,
-          statusText: data.statusText || res.statusText || '',
+          statusText: data.statusText || data.status_text || res.statusText || '',
           timeMs: Math.round(performance.now() - started),
-          size: data.body ? String(data.body).length : 0,
+          size: data.body ? String(data.body).length : JSON.stringify(data.frames || []).length,
           body: data.error || data.body || '',
+          frames: data.frames || null,
           headers: data.headers || {},
+          protocol: data.protocol || null,
           when: Date.now(),
         },
         dirty: false,
@@ -455,7 +559,7 @@ function ComposeSurface({ incomingRequest }) {
                     <div key={r.id}
                          className={'cmp-req' + (active && active.name === r.name ? ' on' : '')}
                          onClick={() => openRequestInTab(r)}>
-                      <span className="cell-method" data-m={r.method}>{r.method}</span>
+                      <span className="cell-method" data-m={r.kind === 'websocket' ? 'WS' : r.method}>{r.kind === 'websocket' ? 'WS' : r.method}</span>
                       <span className="cmp-req-name">{r.name}</span>
                     </div>
                   ))}
@@ -488,7 +592,7 @@ function ComposeSurface({ incomingRequest }) {
               <div key={t.id}
                    className={'cmp-tab' + (t.id === activeTabId ? ' on' : '')}
                    onClick={() => { if (editingTabId !== t.id) setActiveTabId(t.id); }}>
-                <span className="cell-method" data-m={t.method} style={{ fontSize: 10 }}>{t.method}</span>
+                <span className="cell-method" data-m={t.kind === 'websocket' ? 'WS' : t.method} style={{ fontSize: 10 }}>{t.kind === 'websocket' ? 'WS' : t.method}</span>
                 {editingTabId === t.id ? (
                   <input
                     className="cmp-tab-name"
@@ -527,7 +631,7 @@ function ComposeSurface({ incomingRequest }) {
             </div>
           )}
 
-          {active && <ComposeEditor tab={active} updateActive={updateActive} send={send} saveActive={saveActive} openSaveBar={openSaveBar} resolveVars={resolveVars} />}
+          {active && <ComposeEditor key={active.id} tab={active} updateActive={updateActive} send={send} saveActive={saveActive} openSaveBar={openSaveBar} resolveVars={resolveVars} />}
         </div>
       </div>
     </SurfaceShell>
@@ -535,13 +639,42 @@ function ComposeSurface({ incomingRequest }) {
 }
 
 function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resolveVars }) {
-  const [bodyTab, setBodyTab] = React.useState('headers');
+  const [bodyTab, setBodyTab] = React.useState(() => {
+    // Default to 'body'/'message' sub-tab when the tab already has body content,
+    // so reopening a saved request with a payload lands on the body immediately.
+    if (tab.initialBodyTab) return tab.initialBodyTab;
+    if (tab.body) {
+      if (tab.kind === 'grpc') return 'message';
+      if (tab.kind !== 'websocket') return 'body';
+    }
+    return 'headers';
+  });
   const [resTab, setResTab] = React.useState('body');
   const resolved = resolveVars(tab.url);
   const showResolved = resolved !== tab.url && tab.url.includes('{{');
-  const validationError = validateComposeTarget(resolved);
+  const validationError = validateComposeTargetForKind(tab.kind, resolved);
+  const requestTabs = tab.kind === 'websocket'
+    ? ['headers','params','frames']
+    : tab.kind === 'grpc'
+      ? ['headers','params','auth','message']
+      : ['headers','params','auth','body'];
+
+  React.useEffect(() => {
+    if (!requestTabs.includes(bodyTab)) setBodyTab(requestTabs[0]);
+  }, [tab.kind, bodyTab]);
+
+  React.useEffect(() => {
+    if (tab.initialBodyTab && requestTabs.includes(tab.initialBodyTab)) {
+      setBodyTab(tab.initialBodyTab);
+    }
+  }, [tab.id]);
+
+  React.useEffect(() => {
+    if (tab.response?.frames && resTab !== 'frames') setResTab('frames');
+  }, [tab.response?.when]);
 
   const handleUrlPaste = async (event) => {
+    if (tab.kind !== 'http') return;
     const text = event.clipboardData?.getData('text/plain') || '';
     if (!isCurlCommand(text)) return;
     event.preventDefault();
@@ -565,19 +698,58 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
     }
   };
 
+  const switchKind = (kind) => {
+    if (kind === tab.kind) return;
+    const patch = { kind, response: null };
+    if (kind === 'websocket') {
+      patch.method = 'GET';
+      patch.bodyMode = 'none';
+      patch.wsFrames = tab.wsFrames?.length ? tab.wsFrames : DEFAULT_WS_FRAMES.map(f => ({ ...f, id: 'wf_' + Math.random().toString(36).slice(2, 8) }));
+      setBodyTab('frames');
+    } else if (kind === 'grpc') {
+      patch.method = 'POST';
+      patch.bodyMode = 'raw';
+      patch.contentType = tab.contentType?.startsWith('application/grpc') ? tab.contentType : 'application/grpc+proto';
+      setBodyTab('message');
+    } else {
+      patch.method = tab.method === 'WS' ? 'GET' : (tab.method || 'GET');
+      patch.bodyMode = tab.bodyMode === 'none' && tab.body ? 'raw' : tab.bodyMode;
+      patch.contentType = tab.contentType?.startsWith('application/grpc') ? 'application/json' : tab.contentType;
+      const hasBody = ['POST', 'PUT', 'PATCH'].includes((patch.method || '').toUpperCase());
+      setBodyTab(hasBody ? 'body' : 'headers');
+    }
+    updateActive(patch);
+  };
+
   return (
     <>
       <div className="cmp-req-line">
-        <select className="cmp-method"
-                aria-label="Request method"
-                value={tab.method}
-                onChange={e => updateActive({ method: e.target.value })}
-                data-m={tab.method}>
-          {['GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS'].map(m => <option key={m}>{m}</option>)}
-        </select>
+        <div className="segctl cmp-kind" role="tablist" aria-label="Compose protocol">
+          {COMPOSE_KINDS.map(k => (
+            <button key={k.key}
+                    className={tab.kind === k.key ? 'on' : ''}
+                    onClick={() => switchKind(k.key)}
+                    type="button">
+              {k.label}
+            </button>
+          ))}
+        </div>
+        {tab.kind !== 'websocket' && (
+          <select className="cmp-method"
+                  aria-label="Request method"
+                  value={tab.kind === 'grpc' ? 'POST' : tab.method}
+                  disabled={tab.kind === 'grpc'}
+                  onChange={e => {
+                    updateActive({ method: e.target.value });
+                    if (['POST', 'PUT', 'PATCH'].includes(e.target.value)) setBodyTab('body');
+                  }}
+                  data-m={tab.kind === 'grpc' ? 'POST' : tab.method}>
+            {['GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS'].map(m => <option key={m}>{m}</option>)}
+          </select>
+        )}
         <input className="cmp-url"
                aria-label="Request URL"
-               placeholder="https://{{base}}/api/resource"
+               placeholder={tab.kind === 'websocket' ? 'wss://{{base}}/socket' : tab.kind === 'grpc' ? 'https://{{base}}/pkg.Service/Method' : 'https://{{base}}/api/resource'}
                value={tab.url}
                onChange={e => updateActive({ url: e.target.value })}
                onPaste={handleUrlPaste} />
@@ -606,7 +778,7 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
       )}
 
       <div className="cmp-body-tabs">
-        {['headers','params','auth','body'].map(k => (
+        {requestTabs.map(k => (
           <button key={k}
                   className={'tab' + (bodyTab === k ? ' on' : '')}
                   onClick={() => setBodyTab(k)}>
@@ -614,7 +786,8 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
             {k === 'headers' && <span className="count">{tab.headers.filter(h => h.on).length}</span>}
             {k === 'params' && <span className="count">{tab.params.filter(p => p.on).length}</span>}
             {k === 'auth' && tab.authType !== 'none' && <span className="count">1</span>}
-            {k === 'body' && tab.body && <span className="count">1</span>}
+            {(k === 'body' || k === 'message') && tab.body && <span className="count">1</span>}
+            {k === 'frames' && <span className="count">{enabledWsFrames(tab.wsFrames).length}</span>}
           </button>
         ))}
       </div>
@@ -658,13 +831,18 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
             )}
           </div>
         )}
-        {bodyTab === 'body' && (
+        {bodyTab === 'frames' && (
+          <WsFramesEditor frames={tab.wsFrames || []} onChange={(wsFrames) => updateActive({ wsFrames })} />
+        )}
+        {(bodyTab === 'body' || bodyTab === 'message') && (
           <div className="cmp-body">
             <div className="cmp-body-bar">
-              <div className="segctl">
-                <button className={tab.bodyMode === 'none' ? 'on' : ''} onClick={() => updateActive({ bodyMode: 'none' })}>none</button>
-                <button className={tab.bodyMode !== 'none' ? 'on' : ''} onClick={() => updateActive({ bodyMode: 'raw' })}>raw</button>
-              </div>
+              {tab.kind !== 'grpc' && (
+                <div className="segctl">
+                  <button className={tab.bodyMode === 'none' ? 'on' : ''} onClick={() => updateActive({ bodyMode: 'none' })}>none</button>
+                  <button className={tab.bodyMode !== 'none' ? 'on' : ''} onClick={() => updateActive({ bodyMode: 'raw' })}>raw</button>
+                </div>
+              )}
               {tab.bodyMode !== 'none' && (
                 <select className="cmp-ct" value={tab.contentType}
                         aria-label="Request body content type"
@@ -673,6 +851,8 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
                   <option>text/plain</option>
                   <option>text/html</option>
                   <option>application/xml</option>
+                  <option>application/grpc+proto</option>
+                  <option>application/grpc+json</option>
                 </select>
               )}
               <div className="spacer" />
@@ -680,7 +860,7 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
             </div>
             {tab.bodyMode !== 'none' && (
               <textarea className="cmp-body-ta"
-                        aria-label="Request body"
+                        aria-label={tab.kind === 'grpc' ? 'gRPC unary message payload' : 'Request body'}
                         spellCheck={false}
                         value={tab.body || ''}
                         onChange={e => updateActive({ body: e.target.value })} />
@@ -701,7 +881,7 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text)' }}>{fmtBytes(tab.response.size)}</span>
             <div className="spacer" />
             <div className="cmp-body-tabs" style={{ margin: 0, border: 0 }}>
-              {['body','headers','timing'].map(k => (
+              {(tab.response.frames ? ['frames','body','headers','timing'] : ['body','headers','timing']).map(k => (
                 <button key={k} className={'tab' + (resTab === k ? ' on' : '')} onClick={() => setResTab(k)} style={{ padding: '4px 10px' }}>
                   {k}
                 </button>
@@ -710,6 +890,7 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
             <button className="icon-btn" onClick={() => updateActive({ response: null })} title="Close response" aria-label="Close response"><Icon name="x" size={12} /></button>
           </div>
           <div className="cmp-res-body">
+            {resTab === 'frames' && <FrameList frames={tab.response.frames || []} />}
             {resTab === 'body' && (
               <pre className="cmp-json">{typeof tab.response.body === 'string' ? tab.response.body : JSON.stringify(tab.response.body, null, 2)}</pre>
             )}
@@ -717,6 +898,13 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
             {resTab === 'timing' && (
               <div style={{ padding: 12, fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>
                 <div className="kv">
+                  {tab.response.protocol && (
+                    <>
+                      <div className="k">Protocol</div><div className="v">{tab.response.protocol.downstream}{tab.response.protocol.upstream ? ` → ${tab.response.protocol.upstream}` : ''}</div>
+                      <div className="k">Application</div><div className="v">{tab.response.protocol.application}</div>
+                      <div className="k">Body mode</div><div className="v">{tab.response.protocol.body_mode}</div>
+                    </>
+                  )}
                   <div className="k">Request</div><div className="v">{tab.response.timeMs} ms</div>
                   <div className="k">Total</div><div className="v hi">{tab.response.timeMs} ms</div>
                 </div>
@@ -726,6 +914,51 @@ function ComposeEditor({ tab, updateActive, send, saveActive, openSaveBar, resol
         </div>
       )}
     </>
+  );
+}
+
+function WsFramesEditor({ frames, onChange }) {
+  const update = (id, patch) => onChange(frames.map(f => f.id === id ? { ...f, ...patch } : f));
+  const remove = (id) => onChange(frames.filter(f => f.id !== id));
+  const add = () => onChange([...frames, { id: 'wf_' + Date.now(), on: true, opcode: 'text', payload: '' }]);
+  return (
+    <div className="kvedit">
+      <div className="kvedit-head ws">
+        <div></div>
+        <div>Opcode</div>
+        <div>Payload</div>
+        <div></div>
+      </div>
+      {frames.map(frame => (
+        <div key={frame.id} className={'kvedit-row ws' + (frame.on ? '' : ' off')}>
+          <Toggle label="Toggle WebSocket frame" on={frame.on !== false} onChange={(on) => update(frame.id, { on })} />
+          <select className="kvedit-i" aria-label="WebSocket opcode" value={frame.opcode || 'text'} onChange={e => update(frame.id, { opcode: e.target.value })}>
+            <option value="text">text</option>
+            <option value="binary">binary</option>
+            <option value="ping">ping</option>
+            <option value="pong">pong</option>
+            <option value="close">close</option>
+          </select>
+          <input className="kvedit-i" aria-label="WebSocket frame payload" placeholder={frame.opcode === 'binary' ? 'base64 or text fallback' : 'payload'} value={frame.payload || ''} onChange={e => update(frame.id, { payload: e.target.value })} />
+          <button className="kvedit-x" onClick={() => remove(frame.id)} title="Remove" aria-label="Remove WebSocket frame">×</button>
+        </div>
+      ))}
+      <button className="btn sm ghost" onClick={add} style={{ margin: '8px 12px' }}>+ Frame</button>
+    </div>
+  );
+}
+
+function FrameList({ frames }) {
+  if (!frames?.length) return <div className="empty">No frames</div>;
+  return (
+    <div className="kv">
+      {frames.map((f, idx) => (
+        <React.Fragment key={idx}>
+          <div className="k">{f.direction} · {f.opcode}</div>
+          <div className="v" title={f.payload || ''}>{f.payload || `${f.payload_len || 0} bytes`}</div>
+        </React.Fragment>
+      ))}
+    </div>
   );
 }
 

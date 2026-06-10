@@ -1,13 +1,21 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use crate::core::forward::encode_grpc_frame;
+use crate::middleware::plugins::breakpoints::{
+    BreakpointContext, BreakpointManager, BreakpointResolution,
+};
 use crate::middleware::{
     BodyObserver, Middleware, MiddlewareAction, RequestContext, ResponseContext,
 };
-use crate::session::{GrpcField, GrpcInfo, GrpcMessage, InspectorData, SharedSessionManager};
+use crate::session::{
+    GrpcField, GrpcInfo, GrpcMessage, InspectorData, SessionEvent, SharedSessionManager,
+};
+use std::sync::Arc;
 
 pub struct GrpcInspectorMiddleware {
     pub session_manager: SharedSessionManager,
+    pub breakpoint_manager: Arc<BreakpointManager>,
 }
 
 impl GrpcInspectorMiddleware {
@@ -255,7 +263,10 @@ impl Middleware for GrpcInspectorMiddleware {
         let (service, method) = Self::parse_uri(&req.uri);
         Some(Box::new(GrpcStreamObserver {
             session_manager: self.session_manager.clone(),
+            breakpoint_manager: self.breakpoint_manager.clone(),
             session_id,
+            request: req.clone(),
+            response_head: None,
             service,
             method,
             req_splitter: GrpcFrameSplitter::new(),
@@ -291,7 +302,10 @@ impl Middleware for GrpcInspectorMiddleware {
 /// Created by [`GrpcInspectorMiddleware::stream_observer`].
 struct GrpcStreamObserver {
     session_manager: SharedSessionManager,
+    breakpoint_manager: Arc<BreakpointManager>,
     session_id: String,
+    request: RequestContext,
+    response_head: Option<ResponseContext>,
     service: Option<String>,
     method: Option<String>,
     req_splitter: GrpcFrameSplitter,
@@ -305,37 +319,39 @@ struct GrpcStreamObserver {
 
 #[async_trait]
 impl BodyObserver for GrpcStreamObserver {
-    fn on_request_chunk(&mut self, chunk: &Bytes) {
-        for (compressed, proto) in self.req_splitter.push(chunk) {
-            self.messages
-                .push(GrpcInspectorMiddleware::message_from_frame(
-                    "request", compressed, &proto,
-                ));
-        }
+    async fn on_request_chunk(&mut self, chunk: Bytes) -> Option<Bytes> {
+        self.handle_frames("request", chunk).await
     }
 
-    fn on_response_head(&mut self, res: &ResponseContext, _start: std::time::Instant) {
+    async fn on_response_head(&mut self, res: &ResponseContext, _start: std::time::Instant) {
+        self.response_head = Some(res.clone());
         self.grpc_status = res.headers.get("grpc-status").cloned();
         self.grpc_status_message = res.headers.get("grpc-message").cloned();
     }
 
-    fn on_chunk(&mut self, chunk: &Bytes) {
-        for (compressed, proto) in self.res_splitter.push(chunk) {
-            self.messages
-                .push(GrpcInspectorMiddleware::message_from_frame(
-                    "response", compressed, &proto,
-                ));
-        }
+    async fn on_chunk(&mut self, chunk: Bytes) -> Option<Bytes> {
+        self.handle_frames("response", chunk).await
     }
 
     async fn finish(self: Box<Self>) {
+        let messages = self.messages;
+        for message in &messages {
+            self.session_manager.append_event(
+                &self.session_id,
+                SessionEvent::GrpcMessage {
+                    direction: message.direction.clone(),
+                    message: message.clone(),
+                },
+            );
+        }
+
         self.session_manager.update_inspector_data(
             &self.session_id,
             InspectorData {
                 grpc: Some(GrpcInfo {
                     service: self.service,
                     method: self.method,
-                    messages: self.messages,
+                    messages,
                     grpc_status: self.grpc_status,
                     grpc_status_message: self.grpc_status_message,
                 }),
@@ -345,9 +361,129 @@ impl BodyObserver for GrpcStreamObserver {
     }
 }
 
+impl GrpcStreamObserver {
+    async fn handle_frames(&mut self, direction: &str, chunk: Bytes) -> Option<Bytes> {
+        let frames = if direction == "request" {
+            self.req_splitter.push(&chunk)
+        } else {
+            self.res_splitter.push(&chunk)
+        };
+        if frames.is_empty() {
+            return Some(Bytes::new());
+        }
+
+        let mut out = Vec::new();
+        for (compressed, proto) in frames {
+            let resolution = self.pause_message(direction, compressed, &proto).await;
+            match resolution {
+                BreakpointResolution::Continue => {
+                    self.record_message(direction, compressed, &proto);
+                    out.extend_from_slice(&encode_grpc_frame(compressed, &proto));
+                }
+                BreakpointResolution::Drop => {}
+                BreakpointResolution::Modify(ctx) => {
+                    let modified = match *ctx {
+                        BreakpointContext::Request(req) => req.body.to_vec(),
+                        BreakpointContext::Response(res) => res.body.to_vec(),
+                    };
+                    self.record_message(direction, compressed, &modified);
+                    out.extend_from_slice(&encode_grpc_frame(compressed, &modified));
+                }
+            }
+        }
+        Some(Bytes::from(out))
+    }
+
+    async fn pause_message(
+        &self,
+        direction: &str,
+        compressed: bool,
+        proto: &[u8],
+    ) -> BreakpointResolution {
+        // Fast path: no Frame-tier rules configured → skip the per-message
+        // context construction (request/response contexts clone headers etc.).
+        if !self.breakpoint_manager.has_frame_rules().await {
+            return BreakpointResolution::Continue;
+        }
+        let context = if direction == "request" {
+            BreakpointContext::Request(Box::new(self.message_request_context(compressed, proto)))
+        } else {
+            BreakpointContext::Response(Box::new(self.message_response_context(compressed, proto)))
+        };
+        self.breakpoint_manager
+            .pause_frame(&self.session_manager, &self.session_id, context)
+            .await
+    }
+
+    fn record_message(&mut self, direction: &str, compressed: bool, proto: &[u8]) {
+        self.messages
+            .push(GrpcInspectorMiddleware::message_from_frame(
+                direction, compressed, proto,
+            ));
+    }
+
+    fn message_protocol_context(&self) -> crate::core::forward::ProtocolContext {
+        let mut ctx = self.request.protocol_context.clone().unwrap_or_default();
+        ctx.application = crate::core::forward::ApplicationProtocol::Grpc;
+        ctx.body_mode = crate::core::forward::BodyMode::StreamMessages;
+        ctx
+    }
+
+    fn message_request_context(&self, compressed: bool, proto: &[u8]) -> RequestContext {
+        let mut ctx = self.request.clone();
+        ctx.session_id = Some(self.session_id.clone());
+        ctx.body = Bytes::copy_from_slice(proto);
+        ctx.protocol_context = Some(self.message_protocol_context());
+        ctx.headers
+            .insert("x-oproxy-grpc-direction".to_string(), "request".to_string());
+        ctx.headers.insert(
+            "x-oproxy-grpc-compressed".to_string(),
+            compressed.to_string(),
+        );
+        ctx
+    }
+
+    fn message_response_context(&self, compressed: bool, proto: &[u8]) -> ResponseContext {
+        let mut ctx = self
+            .response_head
+            .clone()
+            .unwrap_or_else(|| ResponseContext {
+                status: 200,
+                request_uri: self.request.uri.clone(),
+                session_id: Some(self.session_id.clone()),
+                request_host: self.request.host.clone(),
+                request_method: self.request.method.clone(),
+                protocol_context: Some(self.message_protocol_context()),
+                ..Default::default()
+            });
+        if ctx.request_uri.is_empty() {
+            ctx.request_uri = self.request.uri.clone();
+        }
+        if ctx.request_host.is_empty() {
+            ctx.request_host = self.request.host.clone();
+        }
+        if ctx.request_method.is_empty() {
+            ctx.request_method = self.request.method.clone();
+        }
+        ctx.session_id = Some(self.session_id.clone());
+        ctx.body = Bytes::copy_from_slice(proto);
+        ctx.protocol_context = Some(self.message_protocol_context());
+        ctx.headers.insert(
+            "x-oproxy-grpc-direction".to_string(),
+            "response".to_string(),
+        );
+        ctx.headers.insert(
+            "x-oproxy-grpc-compressed".to_string(),
+            compressed.to_string(),
+        );
+        ctx
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::plugins::breakpoints::{BreakpointTier, BreakpointType};
     fn make_ctx(content_type: &str, uri: &str) -> RequestContext {
         let mut headers = crate::middleware::HeaderMap::new();
         headers.insert("content-type", content_type.to_string());
@@ -533,6 +669,20 @@ mod tests {
         std::sync::Arc::new(crate::session::SessionManager::new(10_000))
     }
 
+    fn make_mw(sm: crate::session::SharedSessionManager) -> GrpcInspectorMiddleware {
+        make_mw_with_breakpoints(sm, std::sync::Arc::new(BreakpointManager::new()))
+    }
+
+    fn make_mw_with_breakpoints(
+        sm: crate::session::SharedSessionManager,
+        breakpoint_manager: std::sync::Arc<BreakpointManager>,
+    ) -> GrpcInspectorMiddleware {
+        GrpcInspectorMiddleware {
+            session_manager: sm,
+            breakpoint_manager,
+        }
+    }
+
     fn grpc_ctx(uri: &str) -> RequestContext {
         let mut headers = crate::middleware::HeaderMap::new();
         headers.insert("content-type", "application/grpc+proto".to_string());
@@ -542,8 +692,52 @@ mod tests {
             headers,
             host: "grpc.example.com".to_string(),
             session_id: Some("sess-1".to_string()),
+            protocol_context: Some(crate::core::forward::ProtocolContext {
+                downstream: crate::core::forward::WireProtocol::Http2,
+                upstream: None,
+                application: crate::core::forward::ApplicationProtocol::Grpc,
+                body_mode: crate::core::forward::BodyMode::StreamMessages,
+                scheme: "https".to_string(),
+                connection_id: None,
+                stream_id: None,
+            }),
             ..Default::default()
         }
+    }
+
+    fn frame_breakpoint_rule(
+        path: &str,
+        bp_type: BreakpointType,
+    ) -> crate::middleware::plugins::breakpoints::BreakpointRule {
+        crate::middleware::plugins::breakpoints::BreakpointRule {
+            id: "grpc-frame-bp".to_string(),
+            location: crate::middleware::matcher::Location {
+                path: Some(path.to_string()),
+                mode: crate::middleware::matcher::MatchMode::Regex,
+                ..Default::default()
+            },
+            bp_type,
+            tier: BreakpointTier::Frame,
+            enabled: true,
+        }
+    }
+
+    async fn auto_resolve(
+        manager: std::sync::Arc<BreakpointManager>,
+        resolution: BreakpointResolution,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                let pending = manager.pending.read().await;
+                if let Some(id) = pending.keys().next().cloned() {
+                    drop(pending);
+                    let _ = manager.resolve_breakpoint(&id, resolution).await;
+                    return;
+                }
+                drop(pending);
+                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+            }
+        });
     }
 
     fn empty_res() -> crate::middleware::ResponseContext {
@@ -558,19 +752,20 @@ mod tests {
         let sm = make_sm();
         sm.record_request("sess-1".to_string(), grpc_ctx("/pkg.Svc/Method"));
         sm.flush().await;
-        let mw = GrpcInspectorMiddleware {
-            session_manager: sm.clone(),
-        };
+        let mw = make_mw(sm.clone());
         let req = grpc_ctx("/pkg.Svc/Method");
         let mut obs = mw.stream_observer(&req).unwrap();
 
         let req_frame = grpc_frame(false, &[0x0a, 0x03, b'r', b'e', b'q']); // "req"
-        obs.on_request_chunk(&Bytes::from(req_frame));
+        let forwarded_req = obs.on_request_chunk(Bytes::from(req_frame.clone())).await;
+        assert_eq!(forwarded_req.as_deref(), Some(req_frame.as_slice()));
 
-        obs.on_response_head(&empty_res(), std::time::Instant::now());
+        obs.on_response_head(&empty_res(), std::time::Instant::now())
+            .await;
 
         let res_frame = grpc_frame(false, &[0x0a, 0x03, b'r', b'e', b's']); // "res"
-        obs.on_chunk(&Bytes::from(res_frame));
+        let forwarded_res = obs.on_chunk(Bytes::from(res_frame.clone())).await;
+        assert_eq!(forwarded_res.as_deref(), Some(res_frame.as_slice()));
 
         obs.finish().await;
         sm.flush().await;
@@ -590,17 +785,22 @@ mod tests {
         let sm = make_sm();
         sm.record_request("sess-1".to_string(), grpc_ctx("/pkg.Svc/Bidi"));
         sm.flush().await;
-        let mw = GrpcInspectorMiddleware {
-            session_manager: sm.clone(),
-        };
+        let mw = make_mw(sm.clone());
         let req = grpc_ctx("/pkg.Svc/Bidi");
         let mut obs = mw.stream_observer(&req).unwrap();
-        obs.on_response_head(&empty_res(), std::time::Instant::now());
+        obs.on_response_head(&empty_res(), std::time::Instant::now())
+            .await;
 
         let frame = grpc_frame(false, b"split-message");
         let (a, b) = frame.split_at(4);
-        obs.on_chunk(&Bytes::copy_from_slice(a));
-        obs.on_chunk(&Bytes::copy_from_slice(b));
+        assert_eq!(
+            obs.on_chunk(Bytes::copy_from_slice(a)).await,
+            Some(Bytes::new())
+        );
+        assert_eq!(
+            obs.on_chunk(Bytes::copy_from_slice(b)).await.as_deref(),
+            Some(frame.as_slice())
+        );
         obs.finish().await;
         sm.flush().await;
 
@@ -623,9 +823,7 @@ mod tests {
         let sm = make_sm();
         sm.record_request("sess-1".to_string(), grpc_ctx("/pkg.Svc/Unary"));
         sm.flush().await;
-        let mw = GrpcInspectorMiddleware {
-            session_manager: sm.clone(),
-        };
+        let mw = make_mw(sm.clone());
         let req = grpc_ctx("/pkg.Svc/Unary");
         let mut obs = mw.stream_observer(&req).unwrap();
 
@@ -634,7 +832,7 @@ mod tests {
             .insert("grpc-status".to_string(), "0".to_string());
         res.headers
             .insert("grpc-message".to_string(), "OK".to_string());
-        obs.on_response_head(&res, std::time::Instant::now());
+        obs.on_response_head(&res, std::time::Instant::now()).await;
         obs.finish().await;
         sm.flush().await;
 
@@ -645,12 +843,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frame_breakpoint_can_drop_request_message() {
+        let sm = make_sm();
+        sm.record_request("sess-1".to_string(), grpc_ctx("/pkg.Svc/Drop"));
+        sm.flush().await;
+        let manager = std::sync::Arc::new(BreakpointManager::new());
+        manager
+            .add_rule(frame_breakpoint_rule(
+                r"/pkg\.Svc/Drop",
+                BreakpointType::Request,
+            ))
+            .await;
+        auto_resolve(manager.clone(), BreakpointResolution::Drop).await;
+        let mw = make_mw_with_breakpoints(sm.clone(), manager);
+        let req = grpc_ctx("/pkg.Svc/Drop");
+        let mut obs = mw.stream_observer(&req).unwrap();
+
+        let frame = grpc_frame(false, &[0x0a, 0x03, b'd', b'r', b'p']);
+        assert_eq!(
+            obs.on_request_chunk(Bytes::from(frame)).await,
+            Some(Bytes::new())
+        );
+        obs.finish().await;
+        sm.flush().await;
+
+        let ex = sm.get_session("sess-1").unwrap();
+        let grpc = ex.inspector_data.as_ref().unwrap().grpc.as_ref().unwrap();
+        assert!(grpc.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_breakpoint_can_modify_response_message() {
+        let sm = make_sm();
+        sm.record_request("sess-1".to_string(), grpc_ctx("/pkg.Svc/Modify"));
+        sm.flush().await;
+        let manager = std::sync::Arc::new(BreakpointManager::new());
+        manager
+            .add_rule(frame_breakpoint_rule(
+                r"/pkg\.Svc/Modify",
+                BreakpointType::Response,
+            ))
+            .await;
+
+        let modified_proto = Bytes::from_static(b"\x0a\x03new");
+        let manager_for_task = manager.clone();
+        tokio::spawn(async move {
+            loop {
+                let pending = manager_for_task.pending.read().await;
+                if let Some((id, bp)) = pending.iter().next() {
+                    let mut context = bp.context.clone();
+                    let id = id.clone();
+                    drop(pending);
+                    if let BreakpointContext::Response(res) = &mut context {
+                        res.body = modified_proto.clone();
+                    }
+                    let _ = manager_for_task
+                        .resolve_breakpoint(&id, BreakpointResolution::Modify(Box::new(context)))
+                        .await;
+                    return;
+                }
+                drop(pending);
+                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+            }
+        });
+
+        let mw = make_mw_with_breakpoints(sm.clone(), manager);
+        let req = grpc_ctx("/pkg.Svc/Modify");
+        let mut obs = mw.stream_observer(&req).unwrap();
+        obs.on_response_head(&empty_res(), std::time::Instant::now())
+            .await;
+
+        let frame = grpc_frame(false, &[0x0a, 0x03, b'o', b'l', b'd']);
+        let forwarded = obs.on_chunk(Bytes::from(frame)).await.unwrap();
+        assert_eq!(
+            forwarded.as_ref(),
+            grpc_frame(false, b"\x0a\x03new").as_slice()
+        );
+        obs.finish().await;
+        sm.flush().await;
+
+        let ex = sm.get_session("sess-1").unwrap();
+        let grpc = ex.inspector_data.as_ref().unwrap().grpc.as_ref().unwrap();
+        assert_eq!(grpc.messages.len(), 1);
+        assert_eq!(grpc.messages[0].fields[0].value, serde_json::json!("new"));
+    }
+
+    #[tokio::test]
     async fn body_hint_is_streaming_for_grpc_non_grpc_stays_full() {
         use crate::core::forward::{BodyHint, Granularity};
         let sm = make_sm();
-        let mw = GrpcInspectorMiddleware {
-            session_manager: sm.clone(),
-        };
+        let mw = make_mw(sm.clone());
         let grpc = grpc_ctx("/pkg.Svc/M");
         assert_eq!(
             mw.body_hint(&grpc),

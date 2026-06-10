@@ -51,11 +51,51 @@ The checked-in `docker-compose.yml` uses:
 - `network_mode: host`
 - `OPROXY_BIND_HOST=0.0.0.0`
 - `OPROXY_MITM_ENABLED=true`
+- `OPROXY_HTTP3_ENABLED=true` + `OPROXY_HTTP3_PORT=8443`
 - `OPROXY_ALLOW_REMOTE_ADMIN=false`
 - `oproxy-certs:/app/certs`
 - `oproxy-storage:/app/storage`
 
 Because it uses host networking, the Compose file does not declare a `ports:` block.
+
+### HTTP/3 (QUIC)
+
+The Docker image is built with `--all-features`, so the `http3` listener is
+available out of the box. The Compose file enables it on UDP port 8443; with
+host networking it is reachable directly. For bridge networking (or
+`docker run`), publish the UDP port explicitly, e.g. `-p 127.0.0.1:8443:8443/udp`.
+Clients must trust the oproxy root CA (`/admin/ca`) for QUIC TLS, and forwarded
+responses advertise the listener via `alt-svc: h3=":8443"`.
+
+## Protocol Fixtures
+
+For local protocol testing without external services, start the fixture profile:
+
+```bash
+docker compose --profile fixtures up --build
+```
+
+This starts `oproxy` plus stable local fixture origins:
+
+| Fixture | URL / target |
+| --- | --- |
+| HTTP/1.1 | `http://127.0.0.1:18080/` |
+| HTTP/2 TLS | `https://127.0.0.1:18443/` |
+| WebSocket echo | `ws://127.0.0.1:18081/` |
+| gRPC TLS echo | `127.0.0.1:19090`, service `echo.EchoService` |
+
+The fixture container writes self-signed origin CAs to the
+`protocol-fixture-certs` Docker volume. When clients connect through oproxy with
+MITM enabled, install/trust the oproxy CA from `/admin/ca`. When clients connect
+directly to the HTTP/2 or gRPC fixture origins, trust the matching fixture CA
+from that volume instead.
+
+The checked-in Compose file keeps host networking as the default oproxy path.
+The fixture ports are also published on host loopback so host-network oproxy,
+browser tests, and local CLI clients can all target the same addresses. For
+bridge-mode experiments, remove/comment `network_mode: host`, uncomment the
+oproxy `ports:` block, and target the fixture service name
+`protocol-fixtures` from inside the Compose network.
 
 ## Volumes
 
@@ -101,4 +141,3 @@ docker run --rm \
 ```
 
 Keep the CA volume if clients already trust the current CA. Replacing it creates a new CA and requires reinstalling trust.
-

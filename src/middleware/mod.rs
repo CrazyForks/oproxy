@@ -184,12 +184,21 @@ fn content_type_of(headers: &HeaderMap) -> String {
 /// protocol: the body is carried as raw [`Bytes`] so binary payloads survive
 /// without a base64 round-trip, and nothing leaks into the forwarded headers.
 #[derive(Debug, Clone)]
+pub struct ServedMock {
+    pub rule_id: String,
+    pub behavior: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct InterceptedResponse {
     pub status: u16,
     pub headers: HeaderMap,
     pub body: Bytes,
     /// Session tags to attach when this response is recorded (e.g. "mock").
     pub tags: Vec<String>,
+    /// Metadata for terminal mock behaviors. Kept separate from tags so the
+    /// session event stream can record the exact rule and behavior type.
+    pub served_mock: Option<ServedMock>,
 }
 
 /// A captured request.
@@ -233,6 +242,14 @@ pub struct RequestContext {
     pub connection_id: Option<String>,
     pub stream_id: Option<u64>,
     pub downstream_protocol: Option<String>,
+    /// IP address and port of the downstream client (e.g. "127.0.0.1:54321").
+    /// Populated from the TCP DownstreamPeer extension; serialised into recordings
+    /// so the UI can show "Remote Address" in the session detail panel.
+    pub remote_addr: Option<String>,
+    /// Typed protocol identity for matching/planning. This is the canonical
+    /// in-memory protocol side channel; the legacy flattened fields above remain
+    /// for current UI/API compatibility.
+    pub protocol_context: Option<crate::core::forward::ProtocolContext>,
 }
 
 impl RequestContext {
@@ -288,6 +305,10 @@ pub struct ResponseContext {
     /// recording with an empty body in `on_response`. In-memory only.
     #[serde(skip)]
     pub response_body_observer_pending: bool,
+    /// Typed protocol identity carried into response matching/recording. It is
+    /// cloned from the originating request context by the engine.
+    #[serde(skip)]
+    pub protocol_context: Option<crate::core::forward::ProtocolContext>,
 }
 
 impl ResponseContext {
@@ -314,6 +335,8 @@ struct RequestContextWire {
     headers: HashMap<String, String>,
     body: String,
     host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_addr: Option<String>,
 }
 
 impl From<RequestContext> for RequestContextWire {
@@ -324,6 +347,7 @@ impl From<RequestContext> for RequestContextWire {
             body: String::from_utf8_lossy(&ctx.body).into_owned(),
             host: ctx.host,
             headers: ctx.headers.into(),
+            remote_addr: ctx.remote_addr,
         }
     }
 }
@@ -336,6 +360,7 @@ impl From<RequestContextWire> for RequestContext {
             headers: wire.headers.into(),
             body: Bytes::from(wire.body.into_bytes()),
             host: wire.host,
+            remote_addr: wire.remote_addr,
             ..Default::default()
         }
     }
@@ -413,24 +438,31 @@ pub enum MiddlewareAction {
 /// `forward_stream` in the engine in four stages:
 ///
 /// 1. [`on_request_chunk`] — zero or more calls as request body bytes are
-///    forwarded upstream (before the upstream response arrives).
+///    forwarded upstream (before the upstream response arrives). Observers may
+///    pass through, replace, or drop a chunk.
 /// 2. [`on_response_head`] — once, after the upstream response head arrives
 ///    and the response middleware chain has run.
 /// 3. [`on_chunk`] — zero or more calls as response body bytes arrive.
+///    Observers may pass through, replace, or drop a chunk.
 /// 4. [`finish`] — once after the last response chunk.
 ///
-/// All methods except `finish` are synchronous and must not block. The observer
-/// owns its own state — it must NOT reference the plugin's `Arc<Self>`.
+/// The observer owns its own state — it must NOT reference the plugin's
+/// `Arc<Self>`. Implementations may await bounded control-plane work such as a
+/// frame breakpoint resolution, but must not perform unbounded buffering.
 #[async_trait]
 pub trait BodyObserver: Send + 'static {
     /// Called for each request body chunk before it is forwarded upstream.
-    fn on_request_chunk(&mut self, _chunk: &Bytes) {}
+    async fn on_request_chunk(&mut self, chunk: Bytes) -> Option<Bytes> {
+        Some(chunk)
+    }
     /// Called once after the upstream response head is received and the
     /// response middleware chain has run. Lets observers capture response
     /// metadata (status, headers, protocol, timing) before body chunks arrive.
-    fn on_response_head(&mut self, _res: &ResponseContext, _start: std::time::Instant) {}
+    async fn on_response_head(&mut self, _res: &ResponseContext, _start: std::time::Instant) {}
     /// Called for each response body chunk as bytes arrive from the upstream.
-    fn on_chunk(&mut self, chunk: &Bytes);
+    async fn on_chunk(&mut self, chunk: Bytes) -> Option<Bytes> {
+        Some(chunk)
+    }
     /// Called once after the last chunk. The observer is responsible for any
     /// deferred recording or side-effects (e.g. persisting metrics).
     async fn finish(self: Box<Self>);

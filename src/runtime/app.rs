@@ -31,6 +31,7 @@ pub(crate) async fn run() -> Result<(), StartupError> {
     let timeouts = build_timeouts(&config);
 
     let listeners = bind_listeners(&config, &services.ca).await?;
+    log_startup_summary(&config, &listeners);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut supervisor = super::supervisor::RuntimeSupervisor::new(config.max_connections);
@@ -49,6 +50,67 @@ pub(crate) async fn run() -> Result<(), StartupError> {
     wait_for_shutdown(shutdown_tx, supervisor, timeouts.shutdown_grace).await;
 
     Ok(())
+}
+
+/// Hostname to use in clickable URLs. Wildcard binds aren't reachable as-is,
+/// so point the user at localhost (the admin UI is served on localhost-style
+/// hostnames regardless of the bind address).
+fn url_host(bind_host: &str) -> &str {
+    match bind_host {
+        "0.0.0.0" | "::" | "[::]" => "localhost",
+        other => other,
+    }
+}
+
+/// One consolidated "what is served where" banner, logged right after every
+/// listener has bound (with the real bound addresses, so port 0 / fallbacks
+/// are reported correctly).
+fn log_startup_summary(config: &crate::config::Config, listeners: &BoundListeners) {
+    let ui_host = url_host(&config.bind_host);
+
+    if let Ok(addr) = listeners.http.local_addr() {
+        tracing::info!("HTTP proxy     http://{addr} - set as the HTTP/HTTPS proxy in your client");
+        tracing::info!(
+            "Admin UI/API   http://{ui_host}:{} - open in a browser (served on localhost-style hostnames)",
+            addr.port()
+        );
+    }
+    if let Some((tls_listener, _)) = &listeners.https
+        && let Ok(addr) = tls_listener.local_addr()
+    {
+        tracing::info!(
+            "HTTPS proxy    https://{addr} - TLS proxy listener (clients must trust the oproxy CA)"
+        );
+    }
+    if let Some(socks5) = &listeners.socks5
+        && let Ok(addr) = socks5.local_addr()
+    {
+        tracing::info!("SOCKS5 proxy   socks5://{addr}");
+    }
+    #[cfg(feature = "http3")]
+    if let Some(endpoint) = &listeners.http3
+        && let Ok(addr) = endpoint.local_addr()
+    {
+        tracing::info!("HTTP/3 (QUIC)  udp://{addr} - advertised to clients via alt-svc");
+    }
+    if config.mitm.enabled {
+        tracing::info!(
+            "HTTPS MITM     enabled - download and trust the root CA at http://{ui_host}:{}/admin/ca",
+            config.port
+        );
+    } else {
+        tracing::info!("HTTPS MITM     disabled - HTTPS is tunnelled without decryption");
+    }
+    if config
+        .admin_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty())
+    {
+        tracing::info!(
+            "Admin auth     token required - sign in at http://{ui_host}:{}/login",
+            config.port
+        );
+    }
 }
 
 fn build_timeouts(config: &crate::config::Config) -> RuntimeTimeouts {
@@ -89,6 +151,8 @@ fn build_http_service(
 
     let context = TransportContext {
         session_manager: state.session_manager.clone(),
+        breakpoint_manager: state.breakpoint_manager.clone(),
+        mock_rules: state.mock_rules.clone(),
         engine: state.proxy_engine.clone(),
         dns_overrides: state.dns_overrides.clone(),
         connections: supervisor.connections(),
@@ -107,6 +171,7 @@ fn build_socks5_service(
     ProxySocks5Service {
         engine: state.proxy_engine.clone(),
         dns: state.dns_overrides.clone(),
+        mock_rules: state.mock_rules.clone(),
         connect_timeout: timeouts.connect,
         handshake_timeout: timeouts.handshake,
     }
@@ -120,6 +185,12 @@ fn spawn_runtime_listeners(
     shutdown_rx: watch::Receiver<bool>,
     supervisor: &mut super::supervisor::RuntimeSupervisor,
 ) {
+    // Record whether SOCKS5 actually bound so the status endpoint reflects reality.
+    state.socks5_bound.store(
+        listeners.socks5.is_some(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     let http_service = build_http_service(state.clone(), config, timeouts, supervisor);
     let socks5_service = build_socks5_service(state.clone(), timeouts);
 

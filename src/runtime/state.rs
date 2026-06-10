@@ -26,12 +26,16 @@ use super::StartupError;
 
 // Shared state threaded through every axum handler and the proxy engine.
 pub(crate) struct AppState {
+    /// Whether the SOCKS5 listener actually bound at startup (distinct from being configured).
+    /// Set to true in spawn_runtime_listeners once we know the bind succeeded.
+    pub(crate) socks5_bound: std::sync::atomic::AtomicBool,
     pub(crate) proxy_engine: Arc<ProxyEngine>,
     pub(crate) middleware_chain: Arc<RwLock<MiddlewareChain>>,
     pub(crate) throttling_config: Arc<RwLock<ThrottlingConfig>>,
-    pub(crate) dns_overrides: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub(crate) dns_overrides: Arc<RwLock<crate::middleware::plugins::dns_override::DnsOverrides>>,
     pub(crate) capture_filter: Arc<RwLock<CaptureFilterConfig>>,
     pub(crate) session_manager: crate::session::SharedSessionManager,
+    pub(crate) breakpoint_manager: Arc<BreakpointManager>,
     pub(crate) api_handler: Arc<ApiHandler>,
     pub(crate) storage_path: std::path::PathBuf,
     pub(crate) started_at: std::time::Instant,
@@ -64,10 +68,25 @@ pub(super) async fn build_runtime_services(
 
     let storage_path = config.storage_path.clone();
 
-    let _ = std::fs::create_dir_all(&storage_path);
+    if let Err(e) = std::fs::create_dir_all(&storage_path) {
+        eprintln!(
+            "WARN: could not create storage directory '{}': {}. \
+             Configuration changes will not be persisted across restarts. \
+             Ensure the process has write access to this path.",
+            storage_path.display(),
+            e
+        );
+    }
     // Managed Map Local fixtures live here; UI uploads land in this directory and
     // are served without a restart (reads happen at request time).
-    let _ = std::fs::create_dir_all(storage_path.join("map-local"));
+    if let Err(e) = std::fs::create_dir_all(storage_path.join("map-local")) {
+        eprintln!(
+            "WARN: could not create map-local fixtures directory '{}': {}. \
+             Map Local file uploads will not work until this directory is accessible.",
+            storage_path.join("map-local").display(),
+            e
+        );
+    }
 
     let throttling_config = Arc::new(RwLock::new(storage::load_throttle(&storage_path)));
     let dns_overrides = Arc::new(RwLock::new(storage::load_dns_overrides(&storage_path)));
@@ -132,6 +151,7 @@ pub(super) async fn build_runtime_services(
     chain.add_middleware(Arc::new(GraphQLInspectorMiddleware));
     chain.add_middleware(Arc::new(GrpcInspectorMiddleware {
         session_manager: session_manager.clone(),
+        breakpoint_manager: breakpoint_manager.clone(),
     }));
     chain.add_middleware(Arc::new(InspectionMiddleware::new(session_manager.clone())));
     // MapLocal, Mock and Lua come after InspectionMiddleware so the request is
@@ -150,7 +170,7 @@ pub(super) async fn build_runtime_services(
     let hot_cfg = storage::load_hot_config(&storage_path);
     let effective_max_body = hot_cfg.max_body_bytes.unwrap_or(config.max_body_bytes);
     let upstream_proxy = storage::load_upstream_proxy(&storage_path);
-    let mut proxy_engine = Arc::new(ProxyEngine::new(
+    let proxy_engine = Arc::new(ProxyEngine::new(
         middleware_chain.clone(),
         Some(ca.clone()),
         config.mitm.enabled,
@@ -171,11 +191,8 @@ pub(super) async fn build_runtime_services(
     // Inject Alt-Svc header on all forwarded responses when HTTP/3 is enabled.
     if config.http3_enabled
         && let Some(h3_port) = config.http3_port
-        && let Some(engine) = Arc::get_mut(&mut proxy_engine)
     {
-        // ProxyEngine is behind Arc but we're still in the setup phase
-        // (single-threaded), so Arc::get_mut succeeds before listeners start.
-        engine.alt_svc_header = Some(format!("h3=\":{}\"; ma=86400", h3_port));
+        proxy_engine.set_alt_svc_header(format!("h3=\":{}\"; ma=86400", h3_port));
     }
 
     let api_handler = Arc::new(ApiHandler::new(
@@ -228,12 +245,14 @@ pub(super) async fn build_runtime_services(
     }
 
     let state = Arc::new(AppState {
+        socks5_bound: std::sync::atomic::AtomicBool::new(false),
         proxy_engine,
         middleware_chain,
         throttling_config,
         dns_overrides,
         capture_filter,
         session_manager,
+        breakpoint_manager,
         api_handler,
         storage_path,
         started_at: std::time::Instant::now(),

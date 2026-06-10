@@ -1,3 +1,4 @@
+use crate::core::forward::{ApplicationProtocol, BodyMode, ProtocolContext, WireProtocol};
 use crate::middleware::chain::MiddlewareChain;
 use crate::middleware::{
     MiddlewareAction, RequestContext, ResponseContext, header_value, remove_header,
@@ -29,6 +30,7 @@ struct StreamIdentity {
     connection_id: Option<String>,
     stream_id: Option<u64>,
     downstream_protocol: Option<String>,
+    remote_addr: Option<String>,
 }
 
 /// Human-readable label for an HTTP version, used for protocol observability.
@@ -41,6 +43,107 @@ pub fn protocol_label(v: axum::http::Version) -> &'static str {
         axum::http::Version::HTTP_3 => "HTTP/3",
         _ => "HTTP/?",
     }
+}
+
+fn infer_application_protocol(headers: &crate::middleware::HeaderMap) -> ApplicationProtocol {
+    let content_type = header_value(headers, "content-type")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.starts_with("application/grpc") {
+        ApplicationProtocol::Grpc
+    } else if content_type.starts_with("text/event-stream") {
+        ApplicationProtocol::Sse
+    } else if content_type.contains("graphql") {
+        ApplicationProtocol::Graphql
+    } else if content_type.contains("json") {
+        ApplicationProtocol::Json
+    } else if is_binary_content_type(&content_type) {
+        ApplicationProtocol::Binary
+    } else {
+        ApplicationProtocol::Http
+    }
+}
+
+fn infer_body_mode(
+    method: &axum::http::Method,
+    headers: &crate::middleware::HeaderMap,
+) -> BodyMode {
+    if header_value(headers, "upgrade")
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+    {
+        return BodyMode::Frames;
+    }
+    if infer_application_protocol(headers) == ApplicationProtocol::Grpc {
+        return BodyMode::StreamMessages;
+    }
+    if (method == axum::http::Method::GET
+        || method == axum::http::Method::HEAD
+        || method == axum::http::Method::OPTIONS)
+        && !headers.contains_key("content-length")
+        && !headers.contains_key("transfer-encoding")
+    {
+        return BodyMode::Empty;
+    }
+    let chunked = header_value(headers, "transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false);
+    let large = header_value(headers, "content-length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|len| len > STREAM_THRESHOLD_BYTES)
+        .unwrap_or(false);
+    if chunked || large {
+        BodyMode::StreamBytes
+    } else {
+        BodyMode::Full
+    }
+}
+
+/// Drops client-supplied `x-oproxy-*` headers (side-channel spoofing) and
+/// hop-by-hop headers — illegal in HTTP/2 and never forwarded. Exception:
+/// `te: trailers` is required by gRPC and explicitly allowed in HTTP/2 requests
+/// (RFC 7540 §8.1.2.2), so `te` is stripped only for any other value.
+/// Shared by the buffered and streaming forward paths.
+fn sanitize_forwarded_request_headers(headers: &mut crate::middleware::HeaderMap) {
+    headers.retain(|name, _| !name.trim().to_ascii_lowercase().starts_with("x-oproxy-"));
+    for hdr in &[
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "trailer",
+        "trailers",
+        "upgrade",
+    ] {
+        headers.remove(hdr);
+    }
+    headers.retain(|name, value| name != "te" || value.trim().eq_ignore_ascii_case("trailers"));
+}
+
+/// Strips hop-by-hop headers from an upstream response before it is replayed
+/// to the downstream client. Shared by the buffered and streaming paths.
+fn strip_hop_by_hop_response_headers(headers: &mut crate::middleware::HeaderMap) {
+    for hdr in &[
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "trailers",
+        "upgrade",
+    ] {
+        remove_header(headers, hdr);
+    }
+}
+
+fn request_scheme(uri: &axum::http::Uri, mitm_destination: Option<&str>) -> String {
+    if let Some(destination) = mitm_destination
+        && let Some((scheme, _)) = destination.split_once("://")
+    {
+        return scheme.to_string();
+    }
+    uri.scheme_str().unwrap_or("http").to_string()
 }
 
 fn display_request_uri(
@@ -82,7 +185,10 @@ pub struct ProxyEngine {
     self_lan_hosts: Vec<String>,
     /// If set, injected as `alt-svc` on every forwarded response to advertise
     /// the HTTP/3 listener. Built once from `Config.http3_port` at startup.
-    pub alt_svc_header: Option<String>,
+    /// Set once during startup via [`ProxyEngine::set_alt_svc_header`]; a
+    /// `OnceLock` so it can be set through the `Arc` without the fragile
+    /// `Arc::get_mut` pattern (which silently no-ops if any clone exists).
+    alt_svc_header: std::sync::OnceLock<String>,
 }
 
 impl ProxyEngine {
@@ -96,10 +202,18 @@ impl ProxyEngine {
             .pool_max_idle_per_host(pool_max_idle)
             .pool_idle_timeout(pool_idle)
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(timeout_secs));
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .no_gzip()
+            .no_deflate()
+            .no_brotli()
+            .no_zstd();
         let mut streaming = Client::builder()
             .pool_max_idle_per_host(pool_max_idle)
             .pool_idle_timeout(pool_idle)
+            .no_gzip()
+            .no_deflate()
+            .no_brotli()
+            .no_zstd()
             .redirect(reqwest::redirect::Policy::none());
         // Optionally skip upstream TLS verification (e.g. forwarding to origins
         // with self-signed certs while debugging, like mitmproxy's --ssl-insecure).
@@ -177,7 +291,7 @@ impl ProxyEngine {
             .flatten()
             .map(|h| h.to_ascii_lowercase())
             .collect(),
-            alt_svc_header: None,
+            alt_svc_header: std::sync::OnceLock::new(),
         }
     }
 
@@ -213,6 +327,15 @@ impl ProxyEngine {
     /// Hot-updates the max body buffer size without restarting.
     pub fn set_max_body_bytes(&self, v: usize) {
         self.max_body_bytes.store(v, Ordering::Relaxed);
+    }
+
+    /// Sets the `alt-svc` header value advertised on forwarded responses
+    /// (HTTP/3 discovery). Callable through the `Arc` during startup; setting it
+    /// more than once logs and keeps the first value.
+    pub fn set_alt_svc_header(&self, value: String) {
+        if self.alt_svc_header.set(value).is_err() {
+            tracing::warn!("alt_svc_header was already set; keeping the first value");
+        }
     }
 
     fn is_self_proxy(&self, target_url: &str) -> bool {
@@ -308,6 +431,120 @@ impl ProxyEngine {
         }
     }
 
+    async fn append_session_event(&self, session_id: &str, event: crate::session::SessionEvent) {
+        let Some(session_manager) = self.short_circuit_session_manager.read().await.clone() else {
+            return;
+        };
+        session_manager.append_event(session_id, event);
+    }
+
+    pub(crate) async fn record_socks5_tunnel_opened(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Option<String> {
+        let session_manager = self.short_circuit_session_manager.read().await.clone()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let uri = format!("socks5://{host}:{port}");
+        let connection_id = format!("socks5:{id}");
+        let request = RequestContext {
+            method: "CONNECT".to_string(),
+            uri,
+            host: host.to_string(),
+            protocol_context: Some(
+                ProtocolContext::socks5_tunnel()
+                    .with_identity(Some(connection_id.clone()), Some(1)),
+            ),
+            downstream_protocol: Some(WireProtocol::Socks5.label().to_string()),
+            connection_id: Some(connection_id),
+            stream_id: Some(1),
+            ..Default::default()
+        };
+        session_manager.record_request_with_source(
+            id.clone(),
+            request,
+            crate::session::SessionSource::Proxy,
+        );
+        session_manager.append_event(&id, crate::session::SessionEvent::TunnelOpened);
+        Some(id)
+    }
+
+    pub(crate) async fn record_socks5_tunnel_closed(
+        &self,
+        session_id: &str,
+        bytes_up: u64,
+        bytes_down: u64,
+    ) {
+        let Some(session_manager) = self.short_circuit_session_manager.read().await.clone() else {
+            return;
+        };
+        session_manager.flush().await;
+        let Some(session) = session_manager.get_session(session_id) else {
+            return;
+        };
+        session_manager.append_event(
+            session_id,
+            crate::session::SessionEvent::TunnelClosed {
+                bytes_up,
+                bytes_down,
+            },
+        );
+        let body = Bytes::from(format!("up={bytes_up} down={bytes_down}"));
+        let response = ResponseContext {
+            status: 200,
+            headers: crate::middleware::HeaderMap::new(),
+            body: body.clone(),
+            request_uri: session.request.uri.clone(),
+            session_id: Some(session_id.to_string()),
+            request_host: session.request.host.clone(),
+            request_method: session.request.method.clone(),
+            protocol: Some(WireProtocol::Socks5.label().to_string()),
+            protocol_context: session.protocol_context.clone(),
+            ..Default::default()
+        };
+        let metrics = crate::session::InspectionMetrics {
+            latency_ms: (chrono::Utc::now() - session.timestamp)
+                .num_milliseconds()
+                .max(0) as u64,
+            request_size_bytes: bytes_up as usize,
+            response_size_bytes: bytes_down as usize,
+            status_code: 200,
+            protocol: Some(WireProtocol::Socks5.label().to_string()),
+            ..Default::default()
+        };
+        session_manager.record_response_with_metrics(session_id.to_string(), response, metrics);
+    }
+
+    pub(crate) async fn record_socks5_mock_served(
+        &self,
+        host: &str,
+        port: u16,
+        rule_id: String,
+        behavior: String,
+    ) {
+        let Some(session_manager) = self.short_circuit_session_manager.read().await.clone() else {
+            return;
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = RequestContext {
+            method: "CONNECT".to_string(),
+            uri: format!("socks5://{host}:{port}"),
+            host: host.to_string(),
+            protocol_context: Some(ProtocolContext::socks5_tunnel()),
+            downstream_protocol: Some(WireProtocol::Socks5.label().to_string()),
+            ..Default::default()
+        };
+        session_manager.record_request_with_source(
+            id.clone(),
+            request,
+            crate::session::SessionSource::Proxy,
+        );
+        session_manager.append_event(
+            &id,
+            crate::session::SessionEvent::MockServed { rule_id, behavior },
+        );
+    }
+
     pub async fn handle_request(self: Arc<Self>, req: Request<Body>) -> Response {
         self.handle_request_with_destination(req, None).await
     }
@@ -343,6 +580,10 @@ impl ProxyEngine {
         // request — `next_stream()` mutates the per-connection counter. The
         // downstream protocol is the negotiated request version (h2 requests
         // arrive as HTTP/2 regardless of the upstream leg).
+        let remote_addr = req
+            .extensions()
+            .get::<crate::transport::http::DownstreamPeer>()
+            .map(|p| p.0.to_string());
         let (connection_id, stream_id, downstream_protocol) = {
             let conn = req
                 .extensions()
@@ -372,6 +613,13 @@ impl ProxyEngine {
         }
 
         let display_uri = display_request_uri(&uri, mitm_destination.as_deref(), &host);
+        let protocol_context = ProtocolContext::http(
+            req.version(),
+            request_scheme(&uri, mitm_destination.as_deref()),
+            infer_application_protocol(&req_headers),
+            infer_body_mode(&method, &req_headers),
+        )
+        .with_identity(connection_id.clone(), stream_id);
 
         // Decide the forwarding class from the active plugins' body hints BEFORE
         // the body is buffered (head-only, per the streaming contract). Today
@@ -385,18 +633,29 @@ impl ProxyEngine {
                 uri: display_uri.clone(),
                 headers: req_headers.clone(),
                 host: host.clone(),
+                protocol_context: Some(protocol_context.clone()),
                 ..Default::default()
             };
-            self.middleware_chain.read().await.forward_class(&head_ctx)
+            self.middleware_chain
+                .read()
+                .await
+                .capability_plan(&head_ctx, &protocol_context)
         };
-        debug!(?forward_class, "Forwarding class decided");
+        debug!(
+            execution = ?forward_class.execution,
+            forward_class = ?forward_class.forward_class,
+            diagnostic = ?forward_class.diagnostic,
+            protocol = protocol_context.downstream.label(),
+            body_mode = ?protocol_context.body_mode,
+            "Forwarding capability plan decided"
+        );
 
         // Streaming class: forward without buffering the body. Reached only when
         // every active plugin declared a streaming-capable body hint (inspect-only
         // in v1), so no plugin needs the whole body and none can mutate it. The
         // move of `req`/`req_headers`/`uri` here is sound: this branch diverges
         // (returns), so the buffered path below still owns them when it runs.
-        if forward_class == crate::core::forward::ForwardClass::Streaming {
+        if forward_class.forward_class == crate::core::forward::ForwardClass::Streaming {
             return self
                 .forward_stream(
                     req,
@@ -411,7 +670,9 @@ impl ProxyEngine {
                         connection_id,
                         stream_id,
                         downstream_protocol,
+                        remote_addr,
                     },
+                    protocol_context,
                 )
                 .await;
         }
@@ -444,6 +705,8 @@ impl ProxyEngine {
             connection_id,
             stream_id,
             downstream_protocol,
+            remote_addr,
+            protocol_context: Some(protocol_context.clone()),
             ..Default::default()
         };
 
@@ -463,6 +726,7 @@ impl ProxyEngine {
                             headers,
                             body: raw_body,
                             tags,
+                            served_mock,
                         } = intercepted;
                         let mut res_ctx = ResponseContext {
                             status,
@@ -473,6 +737,7 @@ impl ProxyEngine {
                             tags,
                             request_host: host.clone(),
                             request_method: req_method.clone(),
+                            protocol_context: req_ctx.protocol_context.clone(),
                             ..Default::default()
                         };
                         {
@@ -484,6 +749,18 @@ impl ProxyEngine {
                             }
                         }
                         self.record_short_circuit_response(&res_ctx).await;
+                        if let (Some(session_id), Some(served_mock)) =
+                            (res_ctx.session_id.as_deref(), served_mock)
+                        {
+                            self.append_session_event(
+                                session_id,
+                                crate::session::SessionEvent::MockServed {
+                                    rule_id: served_mock.rule_id,
+                                    behavior: served_mock.behavior,
+                                },
+                            )
+                            .await;
+                        }
                         let sc = StatusCode::from_u16(res_ctx.status).unwrap_or(StatusCode::OK);
                         let mut builder = Response::builder().status(sc);
                         for (k, v) in &res_ctx.headers {
@@ -507,42 +784,7 @@ impl ProxyEngine {
         // Upstream target + session id now travel as typed context fields, not headers.
         let destination = req_ctx.destination.take();
         let oproxy_session_id = req_ctx.session_id.clone();
-        // Defensively drop any client-supplied `x-oproxy-*` headers so a malicious client
-        // can never smuggle one through to the upstream target.
-        req_ctx
-            .headers
-            .retain(|name, _| !name.trim().to_ascii_lowercase().starts_with("x-oproxy-"));
-        // Instead of completely removing Accept-Encoding (which triggers WAF bot protection
-        // on strict CDNs by creating a User-Agent / Accept-Encoding mismatch), we preserve it
-        // but strip `zstd` since we don't have a manual zstd decoder. We rely on our manual
-        // decompression block below for gzip/deflate/br.
-        if let Some(mut ae) = req_ctx.headers.remove("accept-encoding") {
-            ae = ae
-                .replace(", zstd", "")
-                .replace("zstd, ", "")
-                .replace("zstd", "");
-            if !ae.trim().is_empty() {
-                req_ctx.headers.insert("accept-encoding".to_string(), ae);
-            }
-        }
-        // Strip hop-by-hop headers — illegal in HTTP/2 and must not be forwarded.
-        // Exception: `te: trailers` is required by gRPC and is explicitly allowed
-        // in HTTP/2 requests (RFC 7540 §8.1.2.2); strip `te` only when its value
-        // is something other than "trailers".
-        for hdr in &[
-            "connection",
-            "keep-alive",
-            "proxy-connection",
-            "transfer-encoding",
-            "trailer",
-            "trailers",
-            "upgrade",
-        ] {
-            req_ctx.headers.remove(hdr);
-        }
-        req_ctx
-            .headers
-            .retain(|name, value| name != "te" || value.trim().eq_ignore_ascii_case("trailers"));
+        sanitize_forwarded_request_headers(&mut req_ctx.headers);
 
         // In forward-proxy mode the browser sends an absolute URI as the request
         // target (e.g. GET http://api.example.com/path HTTP/1.1).  Concatenating
@@ -613,6 +855,7 @@ impl ProxyEngine {
                 ttfb_ms: 0,
                 request_host: host.clone(),
                 request_method: req_method.clone(),
+                protocol_context: req_ctx.protocol_context.clone(),
                 ..Default::default()
             };
             {
@@ -679,19 +922,7 @@ impl ProxyEngine {
                 }
 
                 let content_type = header_value(&res_headers, "content-type").unwrap_or_default();
-                // Strip hop-by-hop response headers before sending back to client.
-                for hdr in &[
-                    "connection",
-                    "keep-alive",
-                    "proxy-connection",
-                    "transfer-encoding",
-                    "te",
-                    "trailer",
-                    "trailers",
-                    "upgrade",
-                ] {
-                    remove_header(&mut res_headers, hdr);
-                }
+                strip_hop_by_hop_response_headers(&mut res_headers);
 
                 // Streaming path: text/event-stream (SSE) or large response above threshold.
                 // Check Content-Length if present; stream when body is too large to buffer.
@@ -716,6 +947,7 @@ impl ProxyEngine {
                         request_host: host.clone(),
                         request_method: req_method.clone(),
                         protocol: Some(upstream_protocol.clone()),
+                        protocol_context: req_ctx.protocol_context.clone(),
                         ..Default::default()
                     };
                     {
@@ -764,6 +996,7 @@ impl ProxyEngine {
                     request_host: host.clone(),
                     request_method: req_method.clone(),
                     protocol: Some(upstream_protocol.clone()),
+                    protocol_context: req_ctx.protocol_context.clone(),
                     ..Default::default()
                 };
 
@@ -803,7 +1036,7 @@ impl ProxyEngine {
                 for (name, value) in &res_ctx.headers {
                     builder = builder.header(name, value);
                 }
-                if let Some(ref svc) = self.alt_svc_header {
+                if let Some(svc) = self.alt_svc_header.get() {
                     builder = builder.header("alt-svc", svc.as_str());
                 }
 
@@ -857,6 +1090,7 @@ impl ProxyEngine {
                     ttfb_ms: net_start.elapsed().as_millis() as u64,
                     request_host: host.clone(),
                     request_method: req_method.clone(),
+                    protocol_context: req_ctx.protocol_context.clone(),
                     ..Default::default()
                 };
                 {
@@ -885,6 +1119,7 @@ impl ProxyEngine {
         mitm_destination: Option<String>,
         start: Instant,
         identity: StreamIdentity,
+        protocol_context: ProtocolContext,
     ) -> Response {
         let req_uri = uri.to_string();
         let mut req_ctx = RequestContext {
@@ -896,6 +1131,8 @@ impl ProxyEngine {
             connection_id: identity.connection_id,
             stream_id: identity.stream_id,
             downstream_protocol: identity.downstream_protocol,
+            remote_addr: identity.remote_addr,
+            protocol_context: Some(protocol_context.clone()),
             ..Default::default()
         };
 
@@ -913,6 +1150,7 @@ impl ProxyEngine {
                             headers,
                             body: raw_body,
                             tags,
+                            served_mock,
                         } = intercepted;
                         let mut res_ctx = ResponseContext {
                             status,
@@ -923,6 +1161,7 @@ impl ProxyEngine {
                             tags,
                             request_host: host.clone(),
                             request_method: req_method.clone(),
+                            protocol_context: req_ctx.protocol_context.clone(),
                             ..Default::default()
                         };
                         {
@@ -935,6 +1174,18 @@ impl ProxyEngine {
                             }
                         }
                         self.record_short_circuit_response(&res_ctx).await;
+                        if let (Some(session_id), Some(served_mock)) =
+                            (res_ctx.session_id.as_deref(), served_mock)
+                        {
+                            self.append_session_event(
+                                session_id,
+                                crate::session::SessionEvent::MockServed {
+                                    rule_id: served_mock.rule_id,
+                                    behavior: served_mock.behavior,
+                                },
+                            )
+                            .await;
+                        }
                         let sc = StatusCode::from_u16(res_ctx.status).unwrap_or(StatusCode::OK);
                         let mut builder = Response::builder().status(sc);
                         for (k, v) in &res_ctx.headers {
@@ -955,28 +1206,9 @@ impl ProxyEngine {
 
         let destination = req_ctx.destination.take();
         let oproxy_session_id = req_ctx.session_id.clone();
-        // Drop client-supplied x-oproxy-* headers and hop-by-hop headers, matching
-        // the buffered path. The response body is streamed back verbatim, so we
-        // leave content-encoding intact (the client decodes) — no manual decode.
-        req_ctx
-            .headers
-            .retain(|name, _| !name.trim().to_ascii_lowercase().starts_with("x-oproxy-"));
-        for hdr in &[
-            "connection",
-            "keep-alive",
-            "proxy-connection",
-            "transfer-encoding",
-            "trailer",
-            "trailers",
-            "upgrade",
-        ] {
-            req_ctx.headers.remove(hdr);
-        }
-        // `te: trailers` is required by gRPC and allowed in h2 (RFC 7540 §8.1.2.2);
-        // only strip `te` when its value is not "trailers".
-        req_ctx
-            .headers
-            .retain(|name, value| name != "te" || value.trim().eq_ignore_ascii_case("trailers"));
+        // The response body is streamed back verbatim, so content-encoding stays
+        // intact (the client decodes) — no manual decode on this path.
+        sanitize_forwarded_request_headers(&mut req_ctx.headers);
 
         let path_and_query: String = uri
             .path_and_query()
@@ -1046,21 +1278,33 @@ impl ProxyEngine {
         let observers_arc = {
             let chain = self.middleware_chain.read().await;
             let observers = chain.stream_observers(&req_ctx);
-            std::sync::Arc::new(std::sync::Mutex::new(observers))
+            std::sync::Arc::new(tokio::sync::Mutex::new(observers))
         };
 
         // Relay request body as a stream, feeding each chunk to observers.
         let obs_for_req = observers_arc.clone();
-        let body_stream = req.into_body().into_data_stream().map(move |result| {
-            if let Ok(ref bytes) = result
-                && let Ok(ref mut obs) = obs_for_req.lock()
-            {
-                for o in obs.iter_mut() {
-                    o.on_request_chunk(bytes);
+        let body_stream = async_stream::stream! {
+            let mut body = req.into_body().into_data_stream();
+            while let Some(result) = body.next().await {
+                match result {
+                    Ok(bytes) => {
+                        let mut next = Some(bytes);
+                        let mut observers = obs_for_req.lock().await;
+                        for observer in observers.iter_mut() {
+                            let Some(bytes) = next.take() else { break };
+                            next = observer.on_request_chunk(bytes).await;
+                        }
+                        drop(observers);
+                        if let Some(bytes) = next
+                            && !bytes.is_empty()
+                        {
+                            yield Ok::<_, axum::Error>(bytes);
+                        }
+                    }
+                    Err(err) => yield Err(err),
                 }
             }
-            result
-        });
+        };
         let request_builder = client
             .request(forward_method, &target_url)
             .headers(target_headers)
@@ -1076,18 +1320,7 @@ impl ProxyEngine {
                 for (name, value) in res.headers().iter() {
                     res_headers.append(name.to_string(), value.to_str().unwrap_or("").to_string());
                 }
-                for hdr in &[
-                    "connection",
-                    "keep-alive",
-                    "proxy-connection",
-                    "transfer-encoding",
-                    "te",
-                    "trailer",
-                    "trailers",
-                    "upgrade",
-                ] {
-                    remove_header(&mut res_headers, hdr);
-                }
+                strip_hop_by_hop_response_headers(&mut res_headers);
 
                 let mut res_ctx = ResponseContext {
                     status,
@@ -1098,6 +1331,7 @@ impl ProxyEngine {
                     request_host: host.clone(),
                     request_method: req_method.clone(),
                     protocol: Some(upstream_protocol),
+                    protocol_context: req_ctx.protocol_context.clone(),
                     // Signal to InspectionMiddleware that recording is deferred to
                     // the BodyObserver so that on_response skips size recording.
                     response_body_observer_pending: true,
@@ -1112,17 +1346,91 @@ impl ProxyEngine {
                     }
                 }
 
-                // Reclaim observers from the Arc (request body stream is fully consumed
-                // by the time send() returns, so the clone in the map closure was dropped).
-                let mut observers = std::sync::Arc::try_unwrap(observers_arc)
-                    .map(|m| m.into_inner().unwrap_or_default())
-                    .unwrap_or_else(|arc| {
-                        std::mem::take(&mut *arc.lock().unwrap_or_else(|e| e.into_inner()))
-                    });
+                let encoded_response = header_value(&res_ctx.headers, "content-encoding")
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                let content_type = header_value(&res_ctx.headers, "content-type")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                let content_length = res.content_length();
+                if encoded_response
+                    && !content_type.contains("text/event-stream")
+                    && content_length.is_none_or(|len| len <= self.max_body_bytes() as u64)
+                {
+                    let body_start = Instant::now();
+                    // Read with the cap enforced DURING the read: chunked encoded
+                    // responses carry no content-length, so buffering via
+                    // `res.bytes()` first and checking the size afterwards would
+                    // let a hostile upstream exhaust memory before the check runs.
+                    let max = self.max_body_bytes();
+                    let mut res = res;
+                    let mut raw: Vec<u8> =
+                        Vec::with_capacity(content_length.unwrap_or(0).min(64 * 1024) as usize);
+                    let mut too_large = false;
+                    while let Ok(Some(chunk)) = res.chunk().await {
+                        if raw.len() + chunk.len() > max {
+                            too_large = true;
+                            break;
+                        }
+                        raw.extend_from_slice(&chunk);
+                    }
+                    if !too_large {
+                        let raw = Bytes::from(raw);
+                        let decoded = decoded_response_body(&mut res_ctx.headers, &raw);
+                        res_ctx.body = decoded.clone();
+                        res_ctx.body_ms = body_start.elapsed().as_millis() as u64;
+                        res_ctx.response_body_observer_pending = false;
 
-                // Deliver response head to each observer.
-                for obs in &mut observers {
-                    obs.on_response_head(&res_ctx, start);
+                        let mut observers = std::mem::take(&mut *observers_arc.lock().await);
+                        for obs in &mut observers {
+                            obs.on_response_head(&res_ctx, start).await;
+                            let _ = obs.on_chunk(decoded.clone()).await;
+                        }
+                        for obs in observers {
+                            obs.finish().await;
+                        }
+
+                        let status_code = StatusCode::from_u16(res_ctx.status)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let mut builder = Response::builder().status(status_code);
+                        for (name, value) in &res_ctx.headers {
+                            builder = builder.header(name, value);
+                        }
+                        if let Some(svc) = self.alt_svc_header.get() {
+                            builder = builder.header("alt-svc", svc.as_str());
+                        }
+                        return builder
+                            .body(Body::from(decoded))
+                            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "encoded response exceeded max_body_bytes ({}) while normalizing content-encoding",
+                            self.max_body_bytes()
+                        ),
+                    )
+                        .into_response();
+                }
+
+                // Observers stay inside the shared Arc for the rest of the
+                // exchange: for bidirectional streams (gRPC bidi) the response
+                // head can arrive while the client is still sending request
+                // messages, so stealing the observers here would silently stop
+                // request-side frame inspection mid-stream. Both directions lock
+                // the mutex per chunk instead; the response stream takes the
+                // observers out only after the response body completes.
+                {
+                    let mut observers = observers_arc.lock().await;
+                    for obs in observers.iter_mut() {
+                        obs.on_response_head(&res_ctx, start).await;
+                    }
+                    // Observers may drop or resize frames (gRPC frame breakpoints),
+                    // which would falsify a fixed content-length; the streamed body
+                    // is delivered chunked instead.
+                    if !observers.is_empty() {
+                        remove_header(&mut res_ctx.headers, "content-length");
+                    }
                 }
 
                 info!(
@@ -1139,18 +1447,33 @@ impl ProxyEngine {
                 for (name, value) in &res_ctx.headers {
                     builder = builder.header(name, value);
                 }
-                if let Some(ref svc) = self.alt_svc_header {
+                if let Some(svc) = self.alt_svc_header.get() {
                     builder = builder.header("alt-svc", svc.as_str());
                 }
                 let stream_body = axum::body::Body::from_stream(async_stream::stream! {
                     let mut r = res;
-                    let mut observers = observers;
+                    let observers_arc = observers_arc;
                     while let Ok(Some(chunk)) = r.chunk().await {
-                        for obs in &mut observers {
-                            obs.on_chunk(&chunk);
+                        let mut next = Some(chunk);
+                        {
+                            // Lock held across on_chunk: a paused frame breakpoint
+                            // intentionally pauses the whole exchange (both
+                            // directions), matching buffered-path semantics.
+                            let mut observers = observers_arc.lock().await;
+                            for obs in observers.iter_mut() {
+                                let Some(bytes) = next.take() else { break };
+                                next = obs.on_chunk(bytes).await;
+                            }
                         }
-                        yield Ok::<_, reqwest::Error>(chunk);
+                        if let Some(bytes) = next
+                            && !bytes.is_empty()
+                        {
+                            yield Ok::<_, reqwest::Error>(bytes);
+                        }
                     }
+                    // Response complete: take the observers out (a still-running
+                    // request stream then sees an empty set) and finalize.
+                    let observers = std::mem::take(&mut *observers_arc.lock().await);
                     for obs in observers {
                         obs.finish().await;
                     }
@@ -1170,6 +1493,7 @@ impl ProxyEngine {
                     ttfb_ms: net_start.elapsed().as_millis() as u64,
                     request_host: host.clone(),
                     request_method: req_method.clone(),
+                    protocol_context: req_ctx.protocol_context.clone(),
                     ..Default::default()
                 };
                 {
@@ -1253,6 +1577,33 @@ mod tests {
         let bytes = decoded_response_body(&mut headers, &Bytes::from(compressed));
 
         assert_eq!(&bytes[..], b"hello-deflate-body");
+        assert!(!headers.contains_key("Content-Encoding"));
+        assert!(!headers.contains_key("Content-Length"));
+    }
+
+    #[test]
+    fn decoded_response_body_decodes_zstd() {
+        let compressed = zstd::stream::encode_all(&b"hello-zstd-body"[..], 0).unwrap();
+        let mut headers = crate::middleware::HeaderMap::new();
+        headers.insert("Content-Encoding".to_string(), "zstd".to_string());
+        headers.insert("Content-Length".to_string(), compressed.len().to_string());
+
+        let bytes = decoded_response_body(&mut headers, &Bytes::from(compressed));
+
+        assert_eq!(&bytes[..], b"hello-zstd-body");
+        assert!(!headers.contains_key("Content-Encoding"));
+        assert!(!headers.contains_key("Content-Length"));
+    }
+
+    #[test]
+    fn decoded_response_body_strips_stale_zstd_header_for_plain_body() {
+        let mut headers = crate::middleware::HeaderMap::new();
+        headers.insert("Content-Encoding".to_string(), "zstd".to_string());
+        headers.insert("Content-Length".to_string(), "15".to_string());
+
+        let bytes = decoded_response_body(&mut headers, &Bytes::from_static(b"already decoded"));
+
+        assert_eq!(&bytes[..], b"already decoded");
         assert!(!headers.contains_key("Content-Encoding"));
         assert!(!headers.contains_key("Content-Length"));
     }

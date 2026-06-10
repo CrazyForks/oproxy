@@ -75,6 +75,15 @@ pub struct Location {
         deserialize_with = "null_as_empty_vec"
     )]
     pub methods: Vec<String>,
+    /// Optional wire protocol (`http1`, `http2`, `http3`, `socks5`, `websocket`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_protocol: Option<String>,
+    /// Optional application protocol (`http`, `grpc`, `sse`, `graphql`, `json`, `binary`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_protocol: Option<String>,
+    /// Optional body mode (`empty`, `full`, `stream_bytes`, `stream_messages`, `frames`, `tunnel`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_mode: Option<String>,
     /// Interpretation of `host` / `path` / `query`.
     #[serde(default)]
     pub mode: MatchMode,
@@ -90,6 +99,9 @@ pub struct MatchTarget {
     pub port: Option<u16>,
     pub path: String,
     pub query: String,
+    pub wire_protocol: Option<String>,
+    pub application_protocol: Option<String>,
+    pub body_mode: Option<String>,
 }
 
 impl Location {
@@ -111,6 +123,24 @@ impl Location {
                 .methods
                 .iter()
                 .any(|m| m.eq_ignore_ascii_case(&target.method))
+        {
+            return false;
+        }
+        if let Some(expected) = self.wire_protocol.as_deref().filter(|p| !p.is_empty())
+            && !matches_token(&target.wire_protocol, expected)
+        {
+            return false;
+        }
+        if let Some(expected) = self
+            .application_protocol
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            && !matches_token(&target.application_protocol, expected)
+        {
+            return false;
+        }
+        if let Some(expected) = self.body_mode.as_deref().filter(|p| !p.is_empty())
+            && !matches_token(&target.body_mode, expected)
         {
             return false;
         }
@@ -179,6 +209,8 @@ impl MatchTarget {
         let host_authority = uri_host.unwrap_or_else(|| ctx.host.clone());
         let (host, port) = split_host_port(&host_authority);
         let protocol = protocol.or_else(|| ctx.destination.as_deref().and_then(|d| parse_uri(d).0));
+        let (wire_protocol, application_protocol, body_mode) =
+            protocol_tokens(ctx.protocol_context.as_ref());
         MatchTarget {
             protocol,
             method: ctx.method.clone(),
@@ -186,6 +218,9 @@ impl MatchTarget {
             port,
             path,
             query,
+            wire_protocol,
+            application_protocol,
+            body_mode,
         }
     }
 
@@ -204,8 +239,40 @@ impl MatchTarget {
             port,
             path,
             query,
+            wire_protocol: ctx
+                .protocol_context
+                .as_ref()
+                .map(|p| p.downstream.match_value().to_string()),
+            application_protocol: ctx
+                .protocol_context
+                .as_ref()
+                .map(|p| p.application.match_value().to_string()),
+            body_mode: ctx
+                .protocol_context
+                .as_ref()
+                .map(|p| p.body_mode.match_value().to_string()),
         }
     }
+}
+
+fn protocol_tokens(
+    protocol: Option<&crate::core::forward::ProtocolContext>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match protocol {
+        Some(p) => (
+            Some(p.downstream.match_value().to_string()),
+            Some(p.application.match_value().to_string()),
+            Some(p.body_mode.match_value().to_string()),
+        ),
+        None => (None, None, None),
+    }
+}
+
+fn matches_token(actual: &Option<String>, expected: &str) -> bool {
+    actual
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
 }
 
 /// Split an authority into `(host, Some(port))`, tolerating IPv6 brackets and
@@ -365,6 +432,9 @@ mod tests {
             port,
             path: path.into(),
             query: query.into(),
+            wire_protocol: None,
+            application_protocol: None,
+            body_mode: None,
         }
     }
 
@@ -419,6 +489,24 @@ mod tests {
         assert!(loc.matches(&target("GET", "h", None, "/", "")));
         let mut t = target("GET", "h", None, "/", "");
         t.protocol = Some("http".into());
+        assert!(!loc.matches(&t));
+    }
+
+    #[test]
+    fn protocol_dimensions_match_case_insensitive() {
+        let loc = Location {
+            wire_protocol: Some("HTTP2".into()),
+            application_protocol: Some("gRpc".into()),
+            body_mode: Some("stream_messages".into()),
+            ..Default::default()
+        };
+        let mut t = target("POST", "h", None, "/", "");
+        t.wire_protocol = Some("http2".into());
+        t.application_protocol = Some("grpc".into());
+        t.body_mode = Some("stream_messages".into());
+        assert!(loc.matches(&t));
+
+        t.application_protocol = Some("json".into());
         assert!(!loc.matches(&t));
     }
 
@@ -498,6 +586,23 @@ mod tests {
         assert_eq!(t.protocol.as_deref(), Some("https"));
         // host/port still come from the request authority, not the destination.
         assert_eq!(t.host, "h.local");
+    }
+
+    #[test]
+    fn from_request_includes_typed_protocol_context() {
+        let mut r = req("POST", "svc.local", "/pkg.Service/Call");
+        r.protocol_context = Some(crate::core::forward::ProtocolContext {
+            downstream: crate::core::forward::WireProtocol::Http2,
+            application: crate::core::forward::ApplicationProtocol::Grpc,
+            body_mode: crate::core::forward::BodyMode::StreamMessages,
+            scheme: "https".to_string(),
+            ..Default::default()
+        });
+
+        let t = MatchTarget::from_request(&r);
+        assert_eq!(t.wire_protocol.as_deref(), Some("http2"));
+        assert_eq!(t.application_protocol.as_deref(), Some("grpc"));
+        assert_eq!(t.body_mode.as_deref(), Some("stream_messages"));
     }
 
     #[test]

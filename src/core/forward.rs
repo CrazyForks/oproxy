@@ -1,64 +1,184 @@
-//! Phase 2 forwarding contracts (protocol-support RFC §8.2).
+//! Forwarding and protocol planning contracts.
 //!
-//! This module defines the interfaces the streaming-forwarder work is built on.
-//! The `UpstreamTransport`/`UpstreamConn`/`CertResolver` family is public
-//! library API used by the HTTP/3 transport (`transport/http3.rs`, behind the
-//! `http3` feature) and will be wired into `ProxyEngine` when the buffered path
-//! is switched to the streaming path. `dead_code` is suppressed module-wide
-//! so the binary compilation doesn't flag these staged interfaces.
-//!
-//! Design properties (see RFC §8.2):
-//!   * `UpstreamTransport`/`UpstreamConn` speak in **bidirectional streams of
-//!     frames**, never request/response, so one shape covers h1/h2/h3 + gRPC.
-//!   * Bodies are back-pressured channels (`BodyTx`/`BodyRx`); a bounded channel
-//!     models flow control — `send` only resolves when the peer has capacity.
-//!   * Protocol negotiation is exposed via `UpstreamConn::protocol()` /
-//!     `max_concurrent_streams()`; callers never inspect the wire.
-//!   * Cert resolution is pluggable (`CertResolver`) and shared across the TLS
-//!     client and (later) the QUIC endpoint.
-//!   * The body-class boundary is a **head-only** declaration (`BodyHint`) so the
-//!     core can pick buffered-vs-streaming before any body byte moves.
-#![allow(dead_code)]
-//!
+//! The engine currently uses direct reqwest forwarding for buffered and
+//! streaming HTTP traffic. This module keeps only the load-bearing contracts:
+//! typed protocol context, body-access hints, and capability planning.
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
-use crate::middleware::HeaderMap;
-
-/// Negotiated application protocol of an upstream connection. The engine learns
-/// capacity/semantics from this, not by reading wire bytes. For HTTP/3 the value
-/// is implicit (QUIC always means h3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NegotiatedProtocol {
-    H1,
-    H2,
-    H3,
+/// Protocol family on one side of a proxied exchange. This is deliberately
+/// transport-shaped, not feature-shaped: rules and plugins should reason about
+/// "HTTP/2" or "SOCKS5 tunnel" through this enum instead of ad-hoc strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WireProtocol {
+    #[default]
+    Http1,
+    Http2,
+    Http3,
+    Socks5,
+    WebSocket,
 }
 
-impl NegotiatedProtocol {
-    /// Whether multiple request streams may be multiplexed concurrently on one
-    /// connection. False for HTTP/1.1 (one in-flight exchange per connection).
-    pub fn is_multiplexed(self) -> bool {
-        matches!(self, NegotiatedProtocol::H2 | NegotiatedProtocol::H3)
-    }
-
+impl WireProtocol {
     pub fn label(self) -> &'static str {
         match self {
-            NegotiatedProtocol::H1 => "HTTP/1.1",
-            NegotiatedProtocol::H2 => "HTTP/2",
-            NegotiatedProtocol::H3 => "HTTP/3",
+            WireProtocol::Http1 => "HTTP/1.1",
+            WireProtocol::Http2 => "HTTP/2",
+            WireProtocol::Http3 => "HTTP/3",
+            WireProtocol::Socks5 => "SOCKS5",
+            WireProtocol::WebSocket => "WebSocket",
+        }
+    }
+
+    pub fn match_value(self) -> &'static str {
+        match self {
+            WireProtocol::Http1 => "http1",
+            WireProtocol::Http2 => "http2",
+            WireProtocol::Http3 => "http3",
+            WireProtocol::Socks5 => "socks5",
+            WireProtocol::WebSocket => "websocket",
+        }
+    }
+
+    pub fn from_http_version(v: axum::http::Version) -> Self {
+        match v {
+            axum::http::Version::HTTP_2 => WireProtocol::Http2,
+            axum::http::Version::HTTP_3 => WireProtocol::Http3,
+            _ => WireProtocol::Http1,
         }
     }
 }
 
-/// The common currency for every protocol: a body is a sequence of data frames
-/// optionally terminated by a trailers frame (h2/h3/gRPC trailers).
-#[derive(Debug, Clone)]
-pub enum Frame {
-    Data(Bytes),
-    Trailers(HeaderMap),
+/// Application protocol inferred from request metadata. This is separate from
+/// the wire protocol because gRPC and SSE are HTTP applications riding h2/h3/h1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationProtocol {
+    #[default]
+    Http,
+    Grpc,
+    Sse,
+    Graphql,
+    Json,
+    Binary,
+}
+
+impl ApplicationProtocol {
+    pub fn match_value(self) -> &'static str {
+        match self {
+            ApplicationProtocol::Http => "http",
+            ApplicationProtocol::Grpc => "grpc",
+            ApplicationProtocol::Sse => "sse",
+            ApplicationProtocol::Graphql => "graphql",
+            ApplicationProtocol::Json => "json",
+            ApplicationProtocol::Binary => "binary",
+        }
+    }
+}
+
+/// Body shape the engine must preserve for correctness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyMode {
+    Empty,
+    #[default]
+    Full,
+    StreamBytes,
+    StreamMessages,
+    Frames,
+    Tunnel,
+}
+
+impl BodyMode {
+    pub fn match_value(self) -> &'static str {
+        match self {
+            BodyMode::Empty => "empty",
+            BodyMode::Full => "full",
+            BodyMode::StreamBytes => "stream_bytes",
+            BodyMode::StreamMessages => "stream_messages",
+            BodyMode::Frames => "frames",
+            BodyMode::Tunnel => "tunnel",
+        }
+    }
+}
+
+/// Typed protocol identity for one proxied exchange. It is safe to persist, but
+/// it should be moved through the runtime as typed context, never as headers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProtocolContext {
+    pub downstream: WireProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<WireProtocol>,
+    pub application: ApplicationProtocol,
+    pub body_mode: BodyMode,
+    pub scheme: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<u64>,
+}
+
+impl ProtocolContext {
+    pub fn http(
+        version: axum::http::Version,
+        scheme: impl Into<String>,
+        application: ApplicationProtocol,
+        body_mode: BodyMode,
+    ) -> Self {
+        Self {
+            downstream: WireProtocol::from_http_version(version),
+            upstream: None,
+            application,
+            body_mode,
+            scheme: scheme.into(),
+            connection_id: None,
+            stream_id: None,
+        }
+    }
+
+    pub fn with_identity(mut self, connection_id: Option<String>, stream_id: Option<u64>) -> Self {
+        self.connection_id = connection_id;
+        self.stream_id = stream_id;
+        self
+    }
+
+    /// Protocol identity for a WebSocket exchange (frame body mode).
+    pub fn websocket(scheme: impl Into<String>) -> Self {
+        Self {
+            downstream: WireProtocol::WebSocket,
+            upstream: None,
+            application: ApplicationProtocol::Http,
+            body_mode: BodyMode::Frames,
+            scheme: scheme.into(),
+            connection_id: None,
+            stream_id: None,
+        }
+    }
+
+    /// Protocol identity for a raw SOCKS5 tunnel (opaque bytes, no HTTP).
+    pub fn socks5_tunnel() -> Self {
+        Self {
+            downstream: WireProtocol::Socks5,
+            upstream: None,
+            application: ApplicationProtocol::Binary,
+            body_mode: BodyMode::Tunnel,
+            scheme: "socks5".to_string(),
+            connection_id: None,
+            stream_id: None,
+        }
+    }
+}
+
+/// Encodes one gRPC length-prefixed frame:
+/// `[1B compressed flag][4B big-endian length][N bytes message]` — shared by
+/// the gRPC inspector, mock scripts, and Compose forwarding.
+pub fn encode_grpc_frame(compressed: bool, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(u8::from(compressed));
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
 }
 
 /// Granularity at which an inspecting plugin wants to observe a streamed body.
@@ -108,6 +228,85 @@ pub enum ForwardClass {
     Streaming,
 }
 
+/// Execution path selected from protocol context and active middleware needs.
+/// It is richer than [`ForwardClass`] so the planner can represent frame and
+/// tunnel traffic even while the current engine still maps HTTP requests to the
+/// buffered/streaming forwarders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionClass {
+    Buffered,
+    StreamingInspect,
+    FrameInspect,
+    TunnelMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityPlan {
+    pub execution: ExecutionClass,
+    pub forward_class: ForwardClass,
+    pub diagnostic: Option<String>,
+}
+
+/// Selects the execution path for an exchange. The important invariant is that
+/// the decision is made from the request head and plugin declarations only.
+pub fn plan_execution<I>(protocol: &ProtocolContext, hints: I) -> CapabilityPlan
+where
+    I: IntoIterator<Item = BodyHint>,
+{
+    let mut saw_streaming = false;
+    for hint in hints {
+        match hint {
+            BodyHint::FullBody => {
+                let diagnostic = match protocol.body_mode {
+                    BodyMode::Tunnel => Some(
+                        "full-body middleware cannot run on a raw tunnel; only metadata-safe actions are supported"
+                            .to_string(),
+                    ),
+                    BodyMode::Frames => Some(
+                        "full-body middleware forces buffered HTTP handling; frame streams need a frame-aware action"
+                            .to_string(),
+                    ),
+                    _ => None,
+                };
+                return CapabilityPlan {
+                    execution: ExecutionClass::Buffered,
+                    forward_class: ForwardClass::Buffered,
+                    diagnostic,
+                };
+            }
+            BodyHint::StreamingInspect { .. } => saw_streaming = true,
+        }
+    }
+
+    match protocol.body_mode {
+        BodyMode::Tunnel => CapabilityPlan {
+            execution: ExecutionClass::TunnelMetadata,
+            forward_class: ForwardClass::Buffered,
+            diagnostic: None,
+        },
+        BodyMode::Frames => CapabilityPlan {
+            execution: ExecutionClass::FrameInspect,
+            forward_class: ForwardClass::Streaming,
+            diagnostic: None,
+        },
+        BodyMode::StreamBytes | BodyMode::StreamMessages if saw_streaming => CapabilityPlan {
+            execution: ExecutionClass::StreamingInspect,
+            forward_class: ForwardClass::Streaming,
+            diagnostic: None,
+        },
+        _ if saw_streaming => CapabilityPlan {
+            execution: ExecutionClass::StreamingInspect,
+            forward_class: ForwardClass::Streaming,
+            diagnostic: None,
+        },
+        _ => CapabilityPlan {
+            execution: ExecutionClass::Buffered,
+            forward_class: ForwardClass::Buffered,
+            diagnostic: None,
+        },
+    }
+}
+
 /// Selects the forwarding class from the body hints of the active plugins on a
 /// route. Rules (RFC §8.2):
 ///   * any `FullBody` ⇒ `Buffered` (a mutator/whole-body reader is present);
@@ -128,282 +327,6 @@ where
         ForwardClass::Streaming
     } else {
         ForwardClass::Buffered
-    }
-}
-
-/// Errors raised while establishing or driving an upstream transport.
-#[derive(Debug, thiserror::Error)]
-pub enum TransportError {
-    #[error("upstream connect failed: {0}")]
-    Connect(String),
-    #[error("upstream stream closed unexpectedly")]
-    Closed,
-    #[error("upstream transport error: {0}")]
-    Other(String),
-}
-
-/// Where to forward an exchange, decomposed so impls never re-parse a URL.
-#[derive(Debug, Clone)]
-pub struct Origin {
-    pub scheme: String,
-    pub host: String,
-    pub port: u16,
-}
-
-impl Origin {
-    pub fn is_tls(&self) -> bool {
-        self.scheme.eq_ignore_ascii_case("https") || self.scheme.eq_ignore_ascii_case("wss")
-    }
-}
-
-/// Request head handed to a transport. The body travels separately as a
-/// back-pressured `BodyRx`, so the head is available for routing/negotiation
-/// before any payload is read.
-#[derive(Debug, Clone)]
-pub struct RequestHead {
-    pub method: String,
-    pub uri: String,
-    pub headers: HeaderMap,
-}
-
-/// Response head returned by a transport ahead of its streamed body.
-#[derive(Debug, Clone)]
-pub struct ResponseHead {
-    pub status: u16,
-    pub headers: HeaderMap,
-    pub protocol: NegotiatedProtocol,
-}
-
-/// A streamed upstream response: head first, then a back-pressured body.
-pub struct ResponseStream {
-    pub head: ResponseHead,
-    pub body: BodyRx,
-}
-
-/// Producer half of a body stream. `send` awaits channel capacity, which models
-/// the peer's flow-control window (h2 `WINDOW_UPDATE` / QUIC stream FC / h1
-/// socket writability): a fast producer is paused until the slow consumer drains.
-pub struct BodyTx {
-    inner: tokio::sync::mpsc::Sender<Result<Frame, TransportError>>,
-}
-
-/// Consumer half of a body stream.
-pub struct BodyRx {
-    inner: tokio::sync::mpsc::Receiver<Result<Frame, TransportError>>,
-}
-
-/// Creates a back-pressured body channel. `window` is the number of in-flight
-/// frames permitted before the producer is paused — the flow-control proxy.
-pub fn body_channel(window: usize) -> (BodyTx, BodyRx) {
-    let (tx, rx) = tokio::sync::mpsc::channel(window.max(1));
-    (BodyTx { inner: tx }, BodyRx { inner: rx })
-}
-
-impl BodyTx {
-    /// Pushes a frame, awaiting until the consumer has capacity (back-pressure).
-    pub async fn send(&self, frame: Frame) -> Result<(), TransportError> {
-        self.inner
-            .send(Ok(frame))
-            .await
-            .map_err(|_| TransportError::Closed)
-    }
-
-    /// Propagates a stream error to the consumer.
-    pub async fn send_error(&self, err: TransportError) -> Result<(), TransportError> {
-        self.inner
-            .send(Err(err))
-            .await
-            .map_err(|_| TransportError::Closed)
-    }
-}
-
-impl BodyRx {
-    /// Awaits the next frame. `None` marks a clean end of stream.
-    pub async fn recv(&mut self) -> Option<Result<Frame, TransportError>> {
-        self.inner.recv().await
-    }
-}
-
-/// Pumps every frame from `src` to `dst`. Back-pressure is automatic: `dst.send`
-/// awaits the downstream window, so a slow consumer throttles a fast producer
-/// without unbounded buffering. This is the inspect-only relay; a future
-/// mutator would sit between `src` and `dst`.
-pub async fn relay(mut src: BodyRx, dst: &BodyTx) -> Result<(), TransportError> {
-    while let Some(item) = src.recv().await {
-        dst.send(item?).await?;
-    }
-    Ok(())
-}
-
-/// Resolves certificates for both the downstream MITM acceptor and upstream
-/// clients (TLS today, QUIC in Phase 5) — one source of truth for issuance and
-/// verification. The existing `CertificateAuthority` is the intended impl.
-pub trait CertResolver: Send + Sync {
-    /// Leaf cert + private key (DER) for an intercepted SNI, or `None` if it
-    /// cannot be issued. Shape matches `CertificateAuthority::get_certificate_for_domain`.
-    fn resolve_server(&self, sni: &str) -> Option<(Vec<u8>, Vec<u8>)>;
-
-    /// Client config fed to both tokio-rustls and (Phase 5) quinn.
-    fn client_config(&self) -> Arc<rustls::ClientConfig>;
-}
-
-/// A negotiated upstream connection. For h1 exactly one exchange is in flight;
-/// for h2/h3 the handle may be cloned and `send_request` issued concurrently.
-#[async_trait]
-pub trait UpstreamConn: Send + Sync {
-    fn protocol(&self) -> NegotiatedProtocol;
-
-    /// Concurrency capacity — 1 for HTTP/1.1, the peer's SETTINGS value for h2/h3.
-    fn max_concurrent_streams(&self) -> usize;
-
-    /// Sends one request and returns its streamed response. `body` is the
-    /// consumable request-body stream the transport reads from; the caller
-    /// retains the paired [`BodyTx`] to feed it (note: the RFC sketch named this
-    /// parameter `BodyTx` from the producer's view — in code the transport is
-    /// handed the receiver).
-    async fn send_request(
-        &self,
-        head: RequestHead,
-        body: BodyRx,
-    ) -> Result<ResponseStream, TransportError>;
-}
-
-/// Opens/borrows connections to an origin. One impl per wire family:
-/// `BufferedReqwest` (h1/h2 buffered, wraps today's path), `StreamingHyper`
-/// (h1/h2 streaming), and later `H3Quinn` (h3). The engine picks an impl from
-/// the forwarding class plus the Alt-Svc cache.
-#[async_trait]
-pub trait UpstreamTransport: Send + Sync {
-    async fn connect(
-        &self,
-        origin: &Origin,
-        certs: &dyn CertResolver,
-    ) -> Result<Box<dyn UpstreamConn>, TransportError>;
-}
-
-/// `UpstreamTransport` backed by reqwest — wraps today's buffered forwarding
-/// path behind the streaming abstraction. The request body is drained to bytes
-/// (the buffered class never streams the request), but the *response* is exposed
-/// as a real streamed `BodyRx`, so callers already speak the streaming API.
-///
-/// reqwest manages its own TLS, so this impl ignores the [`CertResolver`]; cert
-/// plumbing matters only for `StreamingHyper`/QUIC.
-pub struct BufferedReqwest {
-    client: reqwest::Client,
-}
-
-impl BufferedReqwest {
-    pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait]
-impl UpstreamTransport for BufferedReqwest {
-    async fn connect(
-        &self,
-        _origin: &Origin,
-        _certs: &dyn CertResolver,
-    ) -> Result<Box<dyn UpstreamConn>, TransportError> {
-        Ok(Box::new(ReqwestConn {
-            client: self.client.clone(),
-        }))
-    }
-}
-
-struct ReqwestConn {
-    client: reqwest::Client,
-}
-
-#[async_trait]
-impl UpstreamConn for ReqwestConn {
-    fn protocol(&self) -> NegotiatedProtocol {
-        // reqwest negotiates per-request; the precise version is reported on the
-        // response (`ResponseHead.protocol`). At the connection level we model the
-        // buffered path as single-exchange.
-        NegotiatedProtocol::H1
-    }
-
-    fn max_concurrent_streams(&self) -> usize {
-        1
-    }
-
-    async fn send_request(
-        &self,
-        head: RequestHead,
-        mut body: BodyRx,
-    ) -> Result<ResponseStream, TransportError> {
-        // Buffered class: collect the request body frames before sending.
-        let mut buf = Vec::new();
-        while let Some(item) = body.recv().await {
-            if let Frame::Data(d) = item? {
-                buf.extend_from_slice(&d);
-            }
-        }
-
-        let method = reqwest::Method::from_bytes(head.method.as_bytes())
-            .map_err(|e| TransportError::Other(format!("invalid method: {e}")))?;
-        let mut rb = self.client.request(method, &head.uri);
-        for (name, value) in &head.headers {
-            if name.eq_ignore_ascii_case("content-length") {
-                continue; // reqwest recomputes this
-            }
-            if let (Ok(n), Ok(v)) = (
-                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-                reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
-            ) {
-                rb = rb.header(n, v);
-            }
-        }
-        if !buf.is_empty() {
-            rb = rb.body(buf);
-        }
-
-        let resp = rb
-            .send()
-            .await
-            .map_err(|e| TransportError::Connect(e.to_string()))?;
-
-        let status = resp.status().as_u16();
-        let protocol = match resp.version() {
-            axum::http::Version::HTTP_2 => NegotiatedProtocol::H2,
-            axum::http::Version::HTTP_3 => NegotiatedProtocol::H3,
-            _ => NegotiatedProtocol::H1,
-        };
-        let mut headers = HeaderMap::new();
-        for (name, value) in resp.headers().iter() {
-            headers.append(name.as_str(), value.to_str().unwrap_or("").to_string());
-        }
-        let resp_head = ResponseHead {
-            status,
-            headers,
-            protocol,
-        };
-
-        // Stream the response body back through a back-pressured channel.
-        let (tx, rx) = body_channel(16);
-        tokio::spawn(async move {
-            let mut resp = resp;
-            loop {
-                match resp.chunk().await {
-                    Ok(Some(chunk)) => {
-                        if tx.send(Frame::Data(chunk)).await.is_err() {
-                            break; // consumer dropped
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        let _ = tx.send_error(TransportError::Other(e.to_string())).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(ResponseStream {
-            head: resp_head,
-            body: rx,
-        })
     }
 }
 
@@ -441,121 +364,88 @@ mod tests {
     }
 
     #[test]
-    fn default_body_hint_is_full_body() {
-        assert_eq!(BodyHint::default(), BodyHint::FullBody);
+    fn protocol_context_maps_http_versions_to_wire_protocol() {
+        let ctx = ProtocolContext::http(
+            axum::http::Version::HTTP_2,
+            "https",
+            ApplicationProtocol::Grpc,
+            BodyMode::StreamMessages,
+        )
+        .with_identity(Some("conn-1".to_string()), Some(7));
+
+        assert_eq!(ctx.downstream, WireProtocol::Http2);
+        assert_eq!(ctx.application, ApplicationProtocol::Grpc);
+        assert_eq!(ctx.body_mode, BodyMode::StreamMessages);
+        assert_eq!(ctx.connection_id.as_deref(), Some("conn-1"));
+        assert_eq!(ctx.stream_id, Some(7));
     }
 
     #[test]
-    fn protocol_multiplexing_and_labels() {
-        assert!(!NegotiatedProtocol::H1.is_multiplexed());
-        assert!(NegotiatedProtocol::H2.is_multiplexed());
-        assert!(NegotiatedProtocol::H3.is_multiplexed());
-        assert_eq!(NegotiatedProtocol::H2.label(), "HTTP/2");
-    }
+    fn planner_keeps_stream_messages_streaming_when_plugins_can_inspect() {
+        let ctx = ProtocolContext {
+            downstream: WireProtocol::Http2,
+            application: ApplicationProtocol::Grpc,
+            body_mode: BodyMode::StreamMessages,
+            scheme: "https".to_string(),
+            ..Default::default()
+        };
 
-    #[tokio::test]
-    async fn body_channel_relays_frames_in_order() {
-        let (tx, rx) = body_channel(4);
-        let (out_tx, mut out_rx) = body_channel(4);
-
-        let pump = tokio::spawn(async move { relay(rx, &out_tx).await });
-
-        tx.send(Frame::Data(Bytes::from_static(b"a")))
-            .await
-            .unwrap();
-        tx.send(Frame::Data(Bytes::from_static(b"b")))
-            .await
-            .unwrap();
-        drop(tx); // clean end of stream
-
-        let mut seen = Vec::new();
-        while let Some(item) = out_rx.recv().await {
-            if let Frame::Data(d) = item.unwrap() {
-                seen.extend_from_slice(&d);
-            }
-        }
-        pump.await.unwrap().unwrap();
-        assert_eq!(seen, b"ab");
-    }
-
-    #[tokio::test]
-    async fn body_channel_applies_back_pressure() {
-        // window of 1: the second send must not complete until the first is read.
-        let (tx, mut rx) = body_channel(1);
-        tx.send(Frame::Data(Bytes::from_static(b"1")))
-            .await
-            .unwrap();
-
-        let blocked = tokio::time::timeout(
-            std::time::Duration::from_millis(30),
-            tx.send(Frame::Data(Bytes::from_static(b"2"))),
-        )
-        .await;
-        assert!(
-            blocked.is_err(),
-            "second send should block until consumer drains"
+        let plan = plan_execution(
+            &ctx,
+            [BodyHint::StreamingInspect {
+                granularity: Granularity::Messages,
+            }],
         );
 
-        // Drain one frame, freeing a window slot.
-        let _ = rx.recv().await;
-        tx.send(Frame::Data(Bytes::from_static(b"3")))
-            .await
-            .unwrap();
+        assert_eq!(plan.execution, ExecutionClass::StreamingInspect);
+        assert_eq!(plan.forward_class, ForwardClass::Streaming);
+        assert!(plan.diagnostic.is_none());
     }
 
-    /// Cert resolver stub for transports that manage their own TLS (reqwest).
-    struct NoCerts;
-    impl CertResolver for NoCerts {
-        fn resolve_server(&self, _sni: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-            None
-        }
-        fn client_config(&self) -> Arc<rustls::ClientConfig> {
-            Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(rustls::RootCertStore::empty())
-                    .with_no_client_auth(),
-            )
-        }
+    #[test]
+    fn planner_marks_raw_tunnel_as_metadata_only_without_full_body_plugins() {
+        let ctx = ProtocolContext {
+            downstream: WireProtocol::Socks5,
+            body_mode: BodyMode::Tunnel,
+            scheme: "socks5".to_string(),
+            ..Default::default()
+        };
+
+        let plan = plan_execution(
+            &ctx,
+            [BodyHint::StreamingInspect {
+                granularity: Granularity::Bytes,
+            }],
+        );
+
+        assert_eq!(plan.execution, ExecutionClass::TunnelMetadata);
+        assert_eq!(plan.forward_class, ForwardClass::Buffered);
+        assert!(plan.diagnostic.is_none());
     }
 
-    #[tokio::test]
-    async fn buffered_reqwest_returns_streamed_response_through_the_abstraction() {
-        use axum::{Router, routing::get};
-
-        let app = Router::new().route("/hi", get(|| async { "hello-streamed" }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let transport = BufferedReqwest::new(reqwest::Client::new());
-        let origin = Origin {
-            scheme: "http".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: addr.port(),
+    #[test]
+    fn planner_explains_full_body_plugin_on_tunnel() {
+        let ctx = ProtocolContext {
+            downstream: WireProtocol::Socks5,
+            body_mode: BodyMode::Tunnel,
+            scheme: "socks5".to_string(),
+            ..Default::default()
         };
-        let conn = transport.connect(&origin, &NoCerts).await.unwrap();
-        assert_eq!(conn.max_concurrent_streams(), 1);
 
-        // Empty request body: drop the sender to signal end of stream.
-        let (btx, brx) = body_channel(4);
-        drop(btx);
+        let plan = plan_execution(&ctx, [BodyHint::FullBody]);
 
-        let head = RequestHead {
-            method: "GET".to_string(),
-            uri: format!("http://{addr}/hi"),
-            headers: HeaderMap::new(),
-        };
-        let mut resp = conn.send_request(head, brx).await.unwrap();
-        assert_eq!(resp.head.status, 200);
+        assert_eq!(plan.execution, ExecutionClass::Buffered);
+        assert_eq!(plan.forward_class, ForwardClass::Buffered);
+        assert!(
+            plan.diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("raw tunnel")
+        );
+    }
 
-        let mut body = Vec::new();
-        while let Some(item) = resp.body.recv().await {
-            if let Frame::Data(d) = item.unwrap() {
-                body.extend_from_slice(&d);
-            }
-        }
-        assert_eq!(&body, b"hello-streamed");
+    #[test]
+    fn default_body_hint_is_full_body() {
+        assert_eq!(BodyHint::default(), BodyHint::FullBody);
     }
 }

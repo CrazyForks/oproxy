@@ -27,6 +27,7 @@
   --c-5xx: oklch(0.72 0.18 25);
   --c-pending: oklch(0.7 0.02 250);
   --c-paused: oklch(0.78 0.16 305);
+  --warn: var(--c-4xx);
 
   /* method colors (subtle) */
   --m-get: oklch(0.78 0.13 215);
@@ -34,6 +35,7 @@
   --m-put: oklch(0.82 0.15 78);
   --m-delete: oklch(0.72 0.18 25);
   --m-patch: oklch(0.78 0.16 305);
+  --m-ws: oklch(0.8 0.14 188);
   --m-connect: oklch(0.7 0.02 250);
   --m-options: oklch(0.7 0.02 250);
   --m-head: oklch(0.7 0.02 250);
@@ -193,6 +195,30 @@ body {
   font-size: 12px;
   line-height: 1.4;
 }
+.proxy-down-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 8px 0;
+  padding: 7px 12px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in oklab, var(--c-5xx) 35%, var(--border));
+  background: color-mix(in oklab, var(--c-5xx) 10%, var(--surface));
+  color: var(--text);
+  animation: proxy-down-fadein 0.3s ease;
+}
+.proxy-down-banner .dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--c-5xx);
+  box-shadow: 0 0 5px var(--c-5xx);
+  animation: proxy-down-pulse 1.4s ease-in-out infinite;
+}
+@keyframes proxy-down-fadein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@keyframes proxy-down-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 .mono { font-family: var(--font-mono); font-size: var(--fs-mono); }
 button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
 input, select, textarea { font: inherit; color: inherit; }
@@ -466,6 +492,7 @@ body.resizing-split * {
 }
 .chip:hover { color: var(--text-hi); }
 .chip.on { background: var(--surface-hi); color: var(--text-hi); }
+.chip.on[data-tone="1xx"] { color: var(--accent); }
 .chip.on[data-tone="2xx"] { color: var(--c-2xx); }
 .chip.on[data-tone="3xx"] { color: var(--c-3xx); }
 .chip.on[data-tone="4xx"] { color: var(--c-4xx); }
@@ -577,11 +604,13 @@ body.col-resizing .t tbody tr { background: inherit !important; }
 .cell-method[data-m="PUT"] { color: var(--m-put); }
 .cell-method[data-m="DELETE"] { color: var(--m-delete); }
 .cell-method[data-m="PATCH"] { color: var(--m-patch); }
+.cell-method[data-m="WS"] { color: var(--m-ws); }
 .cell-method[data-m="CONNECT"] { color: var(--m-connect); }
 .cell-method[data-m="OPTIONS"] { color: var(--m-options); }
 .cell-method[data-m="HEAD"] { color: var(--m-head); }
 
 .cell-status { font-weight: 500; }
+.cell-status[data-c="1"] { color: var(--accent); }
 .cell-status[data-c="2"] { color: var(--c-2xx); }
 .cell-status[data-c="3"] { color: var(--c-3xx); }
 .cell-status[data-c="4"] { color: var(--c-4xx); }
@@ -632,7 +661,7 @@ body.col-resizing .t tbody tr { background: inherit !important; }
 .tag-badge.ws     { color: var(--c-2xx); }
 .tag-badge.sse    { color: var(--c-3xx); }
 
-/* Negotiated-protocol badge in the Sessions PROTO column. */
+/* Compact protocol badge used by the Sessions APP and WIRE columns. */
 .proto-badge {
   display: inline-block;
   min-width: 26px;
@@ -649,6 +678,9 @@ body.col-resizing .t tbody tr { background: inherit !important; }
 .proto-badge[data-proto="h1"]    { color: var(--text-low); }
 .proto-badge[data-proto="h2"]    { color: var(--accent); }
 .proto-badge[data-proto="h3"]    { color: var(--c-2xx); }
+.proto-badge[data-proto="ws"]    { color: var(--c-3xx); }
+.proto-badge[data-proto="grpc"]  { color: var(--c-4xx); }
+.proto-badge[data-proto="socks"] { color: var(--c-paused); }
 .proto-badge[data-proto="other"] { color: var(--text-low); opacity: 0.7; }
 
 /* Protocol dashboard (live aggregates). */
@@ -1046,6 +1078,7 @@ body.col-resizing .t tbody tr { background: inherit !important; }
 .statusbar .group .dot { width: 6px; height: 6px; border-radius: 50%; }
 .statusbar .group .dot.ok { background: var(--c-2xx); box-shadow: 0 0 6px var(--c-2xx); }
 .statusbar .group .dot.warn { background: var(--c-4xx); }
+.statusbar .group .dot.err { background: var(--c-5xx); box-shadow: 0 0 4px var(--c-5xx); }
 .statusbar .right { margin-left: auto; display: inline-flex; gap: 14px; }
 
 /* empty state */
@@ -2091,6 +2124,8 @@ body.col-resizing .t tbody tr { background: inherit !important; }
 .status-pill .dot { width: 6px; height: 6px; border-radius: 50%; }
 .status-pill .code { font-weight: 600; }
 .status-pill .text { color: var(--text-mid); }
+.status-pill[data-c="1"] { color: var(--accent); border-color: oklch(0.72 0.16 215 / 0.35); }
+.status-pill[data-c="1"] .dot { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
 .status-pill[data-c="2"] { color: var(--c-2xx); border-color: oklch(0.78 0.15 148 / 0.35); }
 .status-pill[data-c="2"] .dot { background: var(--c-2xx); box-shadow: 0 0 5px var(--c-2xx); }
 .status-pill[data-c="3"] { color: var(--c-3xx); border-color: oklch(0.74 0.12 250 / 0.35); }
@@ -2315,6 +2350,14 @@ body.col-resizing .t tbody tr { background: inherit !important; }
   border-bottom: 1px solid var(--border-soft);
   background: var(--surface);
 }
+.cmp-kind {
+  flex-shrink: 0;
+  height: 30px;
+}
+.cmp-kind button {
+  min-width: 42px;
+  height: 26px;
+}
 .cmp-method {
   height: 30px;
   background: var(--bg-deep);
@@ -2333,6 +2376,7 @@ body.col-resizing .t tbody tr { background: inherit !important; }
 .cmp-method[data-m="PUT"]    { color: var(--m-put); }
 .cmp-method[data-m="PATCH"]  { color: var(--m-patch); }
 .cmp-method[data-m="DELETE"] { color: var(--m-delete); }
+.cell-method[data-m="WS"], .cmp-method[data-m="WS"] { color: var(--c-3xx); }
 
 .cmp-url {
   flex: 1;
@@ -2423,6 +2467,10 @@ body.col-resizing .t tbody tr { background: inherit !important; }
   letter-spacing: 0.08em;
   color: var(--text-faint);
   font-weight: 500;
+}
+.kvedit-head.ws,
+.kvedit-row.ws {
+  grid-template-columns: 36px 120px minmax(180px, 1fr) 36px;
 }
 .kvedit-row {
   display: grid;

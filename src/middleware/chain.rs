@@ -32,8 +32,23 @@ impl MiddlewareChain {
     /// request head only, before any body byte is forwarded, so the engine never
     /// buffers a stream by accident. Any plugin needing the full body forces the
     /// buffered class; see [`crate::core::forward::select_class`] for the rules.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn forward_class(&self, head: &RequestContext) -> crate::core::forward::ForwardClass {
         crate::core::forward::select_class(self.middlewares.iter().map(|m| m.body_hint(head)))
+    }
+
+    /// Full protocol-aware execution plan. This supersedes `forward_class` for
+    /// new code while keeping the old method available for tests/callers that
+    /// only care about buffered vs streaming.
+    pub fn capability_plan(
+        &self,
+        head: &RequestContext,
+        protocol: &crate::core::forward::ProtocolContext,
+    ) -> crate::core::forward::CapabilityPlan {
+        crate::core::forward::plan_execution(
+            protocol,
+            self.middlewares.iter().map(|m| m.body_hint(head)),
+        )
     }
 
     #[instrument(skip(self, ctx))]

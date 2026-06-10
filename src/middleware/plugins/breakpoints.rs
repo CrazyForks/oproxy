@@ -2,6 +2,7 @@ use crate::middleware::matcher::{Location, MatchTarget};
 use crate::middleware::{Middleware, MiddlewareAction, RequestContext, ResponseContext};
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,6 +19,54 @@ pub enum BreakpointType {
     Response,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakpointTier {
+    /// Headers and metadata only. Safe for streams and tunnels.
+    Head,
+    /// Full request/response body editing. Compatible with buffered bodies only.
+    #[default]
+    Body,
+    /// Frame/message-level pause for WebSocket frames or gRPC messages.
+    Frame,
+    /// SOCKS5/raw tunnel metadata pause only.
+    Tunnel,
+}
+
+impl BreakpointTier {
+    pub(crate) fn is_compatible_with_target(self, target: &MatchTarget) -> bool {
+        match self {
+            BreakpointTier::Head => true,
+            BreakpointTier::Body => !matches!(
+                target.body_mode.as_deref(),
+                Some("tunnel" | "frames" | "stream_bytes" | "stream_messages")
+            ),
+            BreakpointTier::Frame => {
+                matches!(
+                    target.body_mode.as_deref(),
+                    Some("frames" | "stream_messages")
+                )
+            }
+            BreakpointTier::Tunnel => matches!(target.body_mode.as_deref(), Some("tunnel")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BreakpointDiagnostic {
+    pub at: DateTime<Utc>,
+    pub rule_id: String,
+    pub bp_type: BreakpointType,
+    pub tier: BreakpointTier,
+    pub reason: String,
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub wire_protocol: Option<String>,
+    pub application_protocol: Option<String>,
+    pub body_mode: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BreakpointRule {
     #[serde(default)]
@@ -26,6 +75,8 @@ pub struct BreakpointRule {
     /// Leave all fields at default to match every request/response.
     pub location: Location,
     pub bp_type: BreakpointType,
+    #[serde(default)]
+    pub tier: BreakpointTier,
     pub enabled: bool,
 }
 
@@ -52,6 +103,7 @@ pub enum BreakpointResolution {
 pub struct BreakpointManager {
     pub rules: Arc<RwLock<Vec<BreakpointRule>>>,
     pub pending: Arc<RwLock<HashMap<String, PendingBreakpoint>>>,
+    diagnostics: Arc<RwLock<Vec<BreakpointDiagnostic>>>,
 }
 
 impl BreakpointManager {
@@ -59,6 +111,7 @@ impl BreakpointManager {
         Self {
             rules: Arc::new(RwLock::new(Vec::new())),
             pending: Arc::new(RwLock::new(HashMap::new())),
+            diagnostics: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -84,6 +137,37 @@ impl BreakpointManager {
         self.rules.read().await.clone()
     }
 
+    pub async fn list_diagnostics(&self) -> Vec<BreakpointDiagnostic> {
+        self.diagnostics.read().await.clone()
+    }
+
+    async fn record_diagnostic(
+        &self,
+        rule: &BreakpointRule,
+        target: &MatchTarget,
+        reason: impl Into<String>,
+    ) {
+        let mut diagnostics = self.diagnostics.write().await;
+        diagnostics.push(BreakpointDiagnostic {
+            at: Utc::now(),
+            rule_id: rule.id.clone(),
+            bp_type: rule.bp_type.clone(),
+            tier: rule.tier,
+            reason: reason.into(),
+            method: target.method.clone(),
+            host: target.host.clone(),
+            path: target.path.clone(),
+            wire_protocol: target.wire_protocol.clone(),
+            application_protocol: target.application_protocol.clone(),
+            body_mode: target.body_mode.clone(),
+        });
+        const MAX_DIAGNOSTICS: usize = 50;
+        if diagnostics.len() > MAX_DIAGNOSTICS {
+            let drain = diagnostics.len() - MAX_DIAGNOSTICS;
+            diagnostics.drain(0..drain);
+        }
+    }
+
     pub async fn delete_rule(&self, id: &str) {
         self.rules.write().await.retain(|r| r.id != id);
     }
@@ -97,6 +181,129 @@ impl BreakpointManager {
         updated.id = id.to_string();
         *rule = updated;
         true
+    }
+
+    /// Returns the first matching enabled rule and records diagnostics for
+    /// enabled rules whose Location matched but whose tier cannot run for the
+    /// target protocol/body mode.
+    pub async fn first_match(
+        &self,
+        bp_type_filter: impl Fn(&BreakpointType) -> bool,
+        target: &MatchTarget,
+    ) -> Option<BreakpointRule> {
+        // Match under the read lock without cloning the whole rule set (this runs
+        // per request); only matching/incompatible rules are cloned out, and
+        // diagnostics are recorded after the lock is released.
+        let (matched, incompatible) = {
+            let rules = self.rules.read().await;
+            let mut matched = None;
+            let mut incompatible = Vec::new();
+            for rule in rules
+                .iter()
+                .filter(|r| r.enabled && bp_type_filter(&r.bp_type))
+            {
+                if !rule.location.matches(target) {
+                    continue;
+                }
+                if rule.tier.is_compatible_with_target(target) {
+                    if matched.is_none() {
+                        matched = Some(rule.clone());
+                    }
+                } else {
+                    incompatible.push(rule.clone());
+                }
+            }
+            (matched, incompatible)
+        };
+        for rule in &incompatible {
+            self.record_diagnostic(
+                rule,
+                target,
+                format!(
+                    "{:?} breakpoint is incompatible with body mode {:?}",
+                    rule.tier, target.body_mode
+                ),
+            )
+            .await;
+        }
+        matched
+    }
+
+    /// Cheap fast path for per-frame callers: `true` when any enabled Frame-tier
+    /// rule exists. Lets the WS relay and gRPC observer skip building a
+    /// `MatchTarget` + breakpoint context for every frame when no frame
+    /// breakpoints are configured (the overwhelmingly common case).
+    pub async fn has_frame_rules(&self) -> bool {
+        self.rules
+            .read()
+            .await
+            .iter()
+            .any(|r| r.enabled && r.tier == BreakpointTier::Frame)
+    }
+
+    pub async fn pause_frame(
+        &self,
+        session_manager: &crate::session::SharedSessionManager,
+        session_id: &str,
+        context: BreakpointContext,
+    ) -> BreakpointResolution {
+        let (target, bp_type) = match &context {
+            BreakpointContext::Request(ctx) => {
+                (MatchTarget::from_request(ctx), BreakpointType::Request)
+            }
+            BreakpointContext::Response(ctx) => {
+                (MatchTarget::from_response(ctx), BreakpointType::Response)
+            }
+        };
+        // Per-frame hot path: find the matching rule under the read lock and
+        // clone only that rule (no whole-vec clone per frame).
+        let rule = {
+            let rules = self.rules.read().await;
+            rules
+                .iter()
+                .find(|rule| {
+                    rule.enabled
+                        && std::mem::discriminant(&rule.bp_type) == std::mem::discriminant(&bp_type)
+                        && rule.tier == BreakpointTier::Frame
+                        && rule.tier.is_compatible_with_target(&target)
+                        && rule.location.matches(&target)
+                })
+                .cloned()
+        };
+        let Some(rule) = rule else {
+            return BreakpointResolution::Continue;
+        };
+
+        let bp_id = Uuid::new_v4().to_string();
+        session_manager.mark_paused(session_id);
+        session_manager.append_event(
+            session_id,
+            crate::session::SessionEvent::BreakpointPaused {
+                breakpoint_id: bp_id.clone(),
+            },
+        );
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.write().await.insert(
+            bp_id.clone(),
+            PendingBreakpoint {
+                id: bp_id.clone(),
+                bp_type: rule.bp_type,
+                context,
+                tx,
+            },
+        );
+
+        let resolution = match tokio::time::timeout(BREAKPOINT_TIMEOUT, rx).await {
+            Ok(Ok(resolution)) => resolution,
+            Ok(Err(_)) | Err(_) => {
+                self.pending.write().await.remove(&bp_id);
+                tracing::warn!(id = %bp_id, "Frame breakpoint timed out, dropping frame");
+                BreakpointResolution::Drop
+            }
+        };
+        session_manager.clear_paused(session_id);
+        resolution
     }
 }
 
@@ -122,19 +329,13 @@ impl BreakpointMiddleware {
         }
     }
 
-    /// Returns the first matching enabled rule of the given type, releasing all
-    /// locks before returning so no lock is held during the async breakpoint wait.
+    /// Returns the first matching enabled rule of the given type.
     async fn first_match(
         &self,
         bp_type_filter: impl Fn(&BreakpointType) -> bool,
         target: &MatchTarget,
     ) -> Option<BreakpointRule> {
-        let rules = self.manager.rules.read().await;
-        rules
-            .iter()
-            .filter(|r| r.enabled && bp_type_filter(&r.bp_type))
-            .find(|r| r.location.matches(target))
-            .cloned()
+        self.manager.first_match(bp_type_filter, target).await
     }
 }
 
@@ -157,6 +358,50 @@ mod tests {
             host: "localhost".to_string(),
             ..Default::default()
         }
+    }
+
+    fn tunnel_req(uri: &str) -> RequestContext {
+        let mut ctx = req(uri, "");
+        ctx.protocol_context = Some(crate::core::forward::ProtocolContext {
+            downstream: crate::core::forward::WireProtocol::Socks5,
+            upstream: None,
+            application: crate::core::forward::ApplicationProtocol::Binary,
+            body_mode: crate::core::forward::BodyMode::Tunnel,
+            scheme: "socks5".to_string(),
+            connection_id: None,
+            stream_id: None,
+        });
+        ctx
+    }
+
+    fn ws_frame_req(uri: &str, body: &str) -> RequestContext {
+        let mut ctx = req(uri, body);
+        ctx.method = "WS".to_string();
+        ctx.protocol_context = Some(crate::core::forward::ProtocolContext {
+            downstream: crate::core::forward::WireProtocol::WebSocket,
+            upstream: None,
+            application: crate::core::forward::ApplicationProtocol::Http,
+            body_mode: crate::core::forward::BodyMode::Frames,
+            scheme: "ws".to_string(),
+            connection_id: None,
+            stream_id: None,
+        });
+        ctx
+    }
+
+    fn grpc_message_req(uri: &str, body: &str) -> RequestContext {
+        let mut ctx = req(uri, body);
+        ctx.method = "POST".to_string();
+        ctx.protocol_context = Some(crate::core::forward::ProtocolContext {
+            downstream: crate::core::forward::WireProtocol::Http2,
+            upstream: None,
+            application: crate::core::forward::ApplicationProtocol::Grpc,
+            body_mode: crate::core::forward::BodyMode::StreamMessages,
+            scheme: "https".to_string(),
+            connection_id: None,
+            stream_id: None,
+        });
+        ctx
     }
 
     fn res(uri: &str, _body: &str) -> ResponseContext {
@@ -183,6 +428,7 @@ mod tests {
                 ..Default::default()
             },
             bp_type: BreakpointType::Request,
+            tier: BreakpointTier::Body,
             enabled,
         }
     }
@@ -201,6 +447,7 @@ mod tests {
                 ..Default::default()
             },
             bp_type: BreakpointType::Response,
+            tier: BreakpointTier::Body,
             enabled,
         }
     }
@@ -258,6 +505,188 @@ mod tests {
             mw.on_request(&mut req("/api/users", "")).await,
             MiddlewareAction::Continue
         );
+    }
+
+    #[tokio::test]
+    async fn body_breakpoint_does_not_pause_raw_tunnel() {
+        let manager = Arc::new(BreakpointManager::new());
+        manager.add_rule(req_rule(r"/tunnel", true)).await;
+        let mw = BreakpointMiddleware::new(manager, session_manager_for_tests());
+        assert_eq!(
+            mw.on_request(&mut tunnel_req("/tunnel")).await,
+            MiddlewareAction::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn incompatible_tier_records_diagnostic() {
+        let manager = Arc::new(BreakpointManager::new());
+        manager.add_rule(req_rule(r"/tunnel", true)).await;
+        let mw = BreakpointMiddleware::new(manager.clone(), session_manager_for_tests());
+
+        assert_eq!(
+            mw.on_request(&mut tunnel_req("/tunnel")).await,
+            MiddlewareAction::Continue
+        );
+
+        let diagnostics = manager.list_diagnostics().await;
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].tier, BreakpointTier::Body);
+        assert_eq!(diagnostics[0].body_mode.as_deref(), Some("tunnel"));
+    }
+
+    #[test]
+    fn old_breakpoint_json_defaults_to_body_tier() {
+        let rule: BreakpointRule = serde_json::from_value(serde_json::json!({
+            "id": "old",
+            "location": {},
+            "bp_type": "Request",
+            "enabled": true
+        }))
+        .unwrap();
+
+        assert_eq!(rule.tier, BreakpointTier::Body);
+    }
+
+    #[tokio::test]
+    async fn head_breakpoint_can_pause_raw_tunnel_metadata() {
+        let manager = Arc::new(BreakpointManager::new());
+        let mut rule = req_rule(r"/tunnel", true);
+        rule.tier = BreakpointTier::Head;
+        manager.add_rule(rule).await;
+        auto_resolve(manager.clone(), BreakpointResolution::Continue).await;
+        let mw = BreakpointMiddleware::new(manager, session_manager_for_tests());
+        assert_eq!(
+            mw.on_request(&mut tunnel_req("/tunnel")).await,
+            MiddlewareAction::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_breakpoint_can_pause_raw_tunnel_metadata() {
+        let manager = Arc::new(BreakpointManager::new());
+        let mut rule = req_rule(r"/tunnel", true);
+        rule.tier = BreakpointTier::Tunnel;
+        manager.add_rule(rule).await;
+        auto_resolve(manager.clone(), BreakpointResolution::Continue).await;
+        let mw = BreakpointMiddleware::new(manager.clone(), session_manager_for_tests());
+
+        assert_eq!(
+            mw.on_request(&mut tunnel_req("/tunnel")).await,
+            MiddlewareAction::Continue
+        );
+        assert!(manager.list_diagnostics().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_breakpoint_can_pause_stream_message_metadata() {
+        let manager = Arc::new(BreakpointManager::new());
+        let mut rule = req_rule(r"/grpc.Service/Call", true);
+        rule.tier = BreakpointTier::Head;
+        manager.add_rule(rule).await;
+        auto_resolve(manager.clone(), BreakpointResolution::Continue).await;
+        let mw = BreakpointMiddleware::new(manager.clone(), session_manager_for_tests());
+
+        assert_eq!(
+            mw.on_request(&mut grpc_message_req("/grpc.Service/Call", "message"))
+                .await,
+            MiddlewareAction::Continue
+        );
+        assert!(manager.list_diagnostics().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_breakpoint_can_pause_frame_context() {
+        let manager = Arc::new(BreakpointManager::new());
+        let mut rule = req_rule(r"/socket", true);
+        rule.tier = BreakpointTier::Frame;
+        manager.add_rule(rule).await;
+        auto_resolve(manager.clone(), BreakpointResolution::Continue).await;
+        let sm = session_manager_for_tests();
+
+        let resolution = manager
+            .pause_frame(
+                &sm,
+                "sess-1",
+                BreakpointContext::Request(Box::new(ws_frame_req("/socket", "hello"))),
+            )
+            .await;
+
+        assert!(matches!(resolution, BreakpointResolution::Continue));
+        assert!(manager.pending.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_breakpoint_drop_resolution_is_returned_to_frame_handler() {
+        let manager = Arc::new(BreakpointManager::new());
+        let mut rule = req_rule(r"/socket", true);
+        rule.tier = BreakpointTier::Frame;
+        manager.add_rule(rule).await;
+        auto_resolve(manager.clone(), BreakpointResolution::Drop).await;
+        let sm = session_manager_for_tests();
+
+        let resolution = manager
+            .pause_frame(
+                &sm,
+                "sess-drop",
+                BreakpointContext::Request(Box::new(ws_frame_req("/socket", "drop me"))),
+            )
+            .await;
+
+        assert!(matches!(resolution, BreakpointResolution::Drop));
+        assert!(manager.pending.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_breakpoint_modify_resolution_preserves_modified_frame_context() {
+        let manager = Arc::new(BreakpointManager::new());
+        let mut rule = req_rule(r"/socket", true);
+        rule.tier = BreakpointTier::Frame;
+        manager.add_rule(rule).await;
+        let resolver = manager.clone();
+        tokio::spawn(async move {
+            loop {
+                let pending = resolver.pending.read().await;
+                if let Some(id) = pending.keys().next().cloned() {
+                    let context = pending.get(&id).unwrap().context.clone();
+                    drop(pending);
+                    if let BreakpointContext::Request(mut request) = context {
+                        request.set_body_text("modified-frame");
+                        let _ = resolver
+                            .resolve_breakpoint(
+                                &id,
+                                BreakpointResolution::Modify(Box::new(BreakpointContext::Request(
+                                    request,
+                                ))),
+                            )
+                            .await;
+                    }
+                    return;
+                }
+                drop(pending);
+                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+            }
+        });
+        let sm = session_manager_for_tests();
+
+        let resolution = manager
+            .pause_frame(
+                &sm,
+                "sess-modify",
+                BreakpointContext::Request(Box::new(ws_frame_req("/socket", "original-frame"))),
+            )
+            .await;
+
+        match resolution {
+            BreakpointResolution::Modify(context) => match *context {
+                BreakpointContext::Request(request) => {
+                    assert_eq!(request.body_text(), "modified-frame");
+                }
+                BreakpointContext::Response(_) => panic!("expected modified request frame"),
+            },
+            _ => panic!("expected modified frame resolution"),
+        }
+        assert!(manager.pending.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -427,6 +856,8 @@ impl Middleware for BreakpointMiddleware {
         // generating a fresh one and creating a duplicate ghost session.
         ctx.session_id = Some(session_id.clone());
 
+        let bp_id = Uuid::new_v4().to_string();
+
         // Record the request immediately so it appears in the sessions list as paused
         self.session_manager.record_request_with_source(
             session_id.clone(),
@@ -434,9 +865,14 @@ impl Middleware for BreakpointMiddleware {
             crate::session::SessionSource::Proxy,
         );
         self.session_manager.mark_paused(&session_id);
+        self.session_manager.append_event(
+            &session_id,
+            crate::session::SessionEvent::BreakpointPaused {
+                breakpoint_id: bp_id.clone(),
+            },
+        );
 
         let (tx, rx) = oneshot::channel();
-        let bp_id = Uuid::new_v4().to_string();
         self.manager.pending.write().await.insert(
             bp_id.clone(),
             PendingBreakpoint {
@@ -480,6 +916,7 @@ impl Middleware for BreakpointMiddleware {
                     headers,
                     body: Bytes::from_static(b"Breakpoint timed out"),
                     tags: Vec::new(),
+                    served_mock: None,
                 });
                 MiddlewareAction::StopAndReturn
             }
@@ -496,13 +933,20 @@ impl Middleware for BreakpointMiddleware {
             return MiddlewareAction::Continue;
         }
 
+        let bp_id = Uuid::new_v4().to_string();
+
         // For response breakpoints, mark the session as paused if it exists
         if let Some(session_id) = &ctx.session_id {
             self.session_manager.mark_paused(session_id);
+            self.session_manager.append_event(
+                session_id,
+                crate::session::SessionEvent::BreakpointPaused {
+                    breakpoint_id: bp_id.clone(),
+                },
+            );
         }
 
         let (tx, rx) = oneshot::channel();
-        let bp_id = Uuid::new_v4().to_string();
         self.manager.pending.write().await.insert(
             bp_id.clone(),
             PendingBreakpoint {

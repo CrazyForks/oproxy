@@ -16,7 +16,7 @@ async function resetWorkspace(request) {
           query: '',
           regex: false,
           methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'CONNECT', 'OPTIONS', 'HEAD'],
-          status_buckets: ['2', '3', '4', '5', '-'],
+          status_buckets: ['1', '2', '3', '4', '5', '-'],
           host_focus: [],
           host_filter: null,
           sort: null,
@@ -59,7 +59,11 @@ function sampleSession(overrides = {}) {
       status_code: overrides.status || 200,
       ttfb_ms: 5,
       body_ms: 3,
+      protocol: overrides.protocol,
     } : overrides.metrics,
+    downstream_protocol: overrides.downstream_protocol,
+    protocol_context: overrides.protocol_context,
+    inspector_data: overrides.inspector_data,
     ws_frames: overrides.ws_frames || [],
   };
 }

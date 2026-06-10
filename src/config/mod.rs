@@ -545,6 +545,19 @@ impl Config {
                 config.map_local_base_path = Some(PathBuf::from(trimmed));
             }
         }
+        if let Ok(val) = std::env::var("OPROXY_SOCKS5_PORT") {
+            let trimmed = val.trim();
+            if trimmed.is_empty() || trimmed == "0" {
+                config.socks5_port = None;
+            } else {
+                match trimmed.parse::<u16>() {
+                    Ok(v) => config.socks5_port = Some(v),
+                    Err(_) => {
+                        warn!(value = %val, "OPROXY_SOCKS5_PORT is not a valid port, ignoring")
+                    }
+                }
+            }
+        }
 
         for w in config.validate() {
             warn!(warning = %w, "Config validation");

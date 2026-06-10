@@ -13,6 +13,8 @@
 #   OPROXY_CONNECT_TIMEOUT_SECS - TCP connect timeout for tunnels
 #   OPROXY_HANDSHAKE_TIMEOUT_SECS - TLS/SOCKS handshake timeout
 #   OPROXY_SHUTDOWN_GRACE_SECS - graceful shutdown drain period
+#   OPROXY_HTTP3_ENABLED - true/false; enables the feature-gated HTTP/3 listener
+#   OPROXY_HTTP3_PORT    - UDP port for the HTTP/3 listener
 #   OPROXY_CONFIG         - path to this file itself
 
 # ── Network ────────────────────────────────────────────────────────────────────
@@ -88,7 +90,15 @@ max_connections: 1024
 
 # Uncomment to enable a SOCKS5 proxy listener on this port.
 # Supports CONNECT tunnelling with optional MITM TLS interception.
+# No OPROXY_SOCKS5_PORT override exists yet; set this YAML value instead.
 socks5_port: 1080
+
+# ── HTTP/3 listener ────────────────────────────────────────────────────────────
+
+# Research preview. Requires a binary built with the `http3` Cargo feature.
+# Environment variables OPROXY_HTTP3_ENABLED and OPROXY_HTTP3_PORT override these.
+# http3_enabled: false
+# http3_port: 8443
 
 # ── Traffic log ────────────────────────────────────────────────────────────────
 

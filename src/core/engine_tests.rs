@@ -10,6 +10,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::{Router, routing::get};
+    use bytes::Bytes;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -58,6 +59,64 @@ mod tests {
             None,
         );
         assert!(engine.mitm_enabled);
+    }
+
+    #[tokio::test]
+    async fn socks5_tunnel_close_completes_session_with_metrics() {
+        let session_manager = Arc::new(SessionManager::new(10_000));
+        let engine = ProxyEngine::new(
+            Arc::new(RwLock::new(MiddlewareChain::new())),
+            None,
+            false,
+            8080,
+            "127.0.0.1".to_string(),
+            30,
+            10 * 1024 * 1024,
+            10,
+            30,
+            None,
+        );
+        engine
+            .set_short_circuit_session_manager(session_manager.clone())
+            .await;
+
+        let id = engine
+            .record_socks5_tunnel_opened("example.com", 443)
+            .await
+            .expect("session id");
+        engine.record_socks5_tunnel_closed(&id, 12, 34).await;
+        session_manager.flush().await;
+
+        let session = session_manager.get_session(&id).expect("session");
+        assert_eq!(session.request.method, "CONNECT");
+        assert_eq!(session.request.uri, "socks5://example.com:443");
+        assert_eq!(session.downstream_protocol.as_deref(), Some("SOCKS5"));
+        let expected_connection_id = format!("socks5:{id}");
+        assert_eq!(
+            session.connection_id.as_deref(),
+            Some(expected_connection_id.as_str())
+        );
+        assert_eq!(session.stream_id, Some(1));
+        let response = session.response.as_ref().expect("tunnel close response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, Bytes::from_static(b"up=12 down=34"));
+        let metrics = session.metrics.as_ref().expect("tunnel metrics");
+        assert_eq!(metrics.status_code, 200);
+        assert_eq!(metrics.request_size_bytes, 12);
+        assert_eq!(metrics.response_size_bytes, 34);
+        assert_eq!(metrics.protocol.as_deref(), Some("SOCKS5"));
+        assert_eq!(session.events.len(), 2);
+        assert!(matches!(
+            session.events[0],
+            crate::session::SessionEvent::TunnelOpened
+        ));
+        assert!(matches!(
+            session.events[1],
+            crate::session::SessionEvent::TunnelClosed {
+                bytes_up: 12,
+                bytes_down: 34
+            }
+        ));
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ pub enum AccessAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessRule {
+    #[serde(default)]
     pub id: String,
     pub name: String,
     #[serde(default = "default_true")]
@@ -57,6 +58,7 @@ impl AccessControlMiddleware {
             )]),
             body: Bytes::from("Blocked by access control rule"),
             tags: vec!["access-blocked".to_string()],
+            served_mock: None,
         }
     }
 }

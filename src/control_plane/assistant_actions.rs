@@ -195,8 +195,13 @@ fn validate_action_payload_shape(
         ("POST", "/admin/webhooks") => require_payload::<WebhookConfig>(payload),
         ("POST", "/admin/throttling") => require_payload::<ThrottlingConfig>(payload),
         ("POST", "/admin/capture-filter") => require_payload::<CaptureFilterConfig>(payload),
-        ("POST", "/admin/dns") => require_payload::<HashMap<String, String>>(payload),
+        ("POST", "/admin/dns") => require_payload::<
+            HashMap<String, crate::middleware::plugins::dns_override::DnsEntry>,
+        >(payload),
         ("POST", "/admin/forward") => require_payload::<AssistantForwardReq>(payload),
+        ("POST", "/admin/forward/websocket") => {
+            require_payload::<super::forward::ForwardWsReq>(payload)
+        }
         ("POST", "/admin/upstream-proxy") => {
             if !payload
                 .get("upstream_proxy")
@@ -435,7 +440,8 @@ pub(super) async fn execute_action_payload(
             ))
         }
         ("POST", "/admin/dns") => {
-            let map: HashMap<String, String> = from_payload(&action.payload)?;
+            let map: HashMap<String, crate::middleware::plugins::dns_override::DnsEntry> =
+                from_payload(&action.payload)?;
             *state.dns_overrides.write().await = map;
             let snapshot = state.dns_overrides.read().await.clone();
             storage::save_dns_overrides(&state.storage_path, &snapshot)
@@ -483,6 +489,9 @@ pub(super) async fn execute_action_payload(
             ))
         }
         ("POST", "/admin/forward") => execute_forward_action(state, &action).await,
+        ("POST", "/admin/forward/websocket") => {
+            execute_forward_websocket_action(state, &action).await
+        }
         _ => execute_collection_action(state, &action).await,
     }
 }
@@ -819,6 +828,19 @@ struct AssistantForwardReq {
     headers: HashMap<String, String>,
     #[serde(default)]
     body: Option<String>,
+    /// Mirrors `ForwardReq.kind` on /admin/forward: `http` (default) or `grpc`.
+    /// gRPC forwards wrap the body in a length-prefixed gRPC frame and POST it
+    /// with an `application/grpc+proto` content type.
+    #[serde(default)]
+    kind: AssistantForwardKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AssistantForwardKind {
+    #[default]
+    Http,
+    Grpc,
 }
 
 async fn execute_forward_action(
@@ -826,8 +848,14 @@ async fn execute_forward_action(
     action: &AssistantAction,
 ) -> Result<(Value, Vec<String>), String> {
     let req: AssistantForwardReq = from_payload(&action.payload)?;
-    let method = reqwest::Method::from_bytes(req.method.as_bytes())
-        .map_err(|_| format!("invalid HTTP method: {}", req.method))?;
+    let is_grpc = req.kind == AssistantForwardKind::Grpc;
+    // gRPC is always POST over HTTP/2; the body is one length-prefixed frame.
+    let method = if is_grpc {
+        reqwest::Method::POST
+    } else {
+        reqwest::Method::from_bytes(req.method.as_bytes())
+            .map_err(|_| format!("invalid HTTP method: {}", req.method))?
+    };
     let url = reqwest::Url::parse(&req.url).map_err(|e| format!("invalid URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("unsupported URL scheme: {}", url.scheme()));
@@ -842,7 +870,19 @@ async fn execute_forward_action(
     for (name, value) in &req.headers {
         builder = builder.header(name, value);
     }
-    if let Some(body) = req.body {
+    if is_grpc {
+        if !req
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-type"))
+        {
+            builder = builder.header("content-type", "application/grpc+proto");
+        }
+        builder = builder.body(crate::core::forward::encode_grpc_frame(
+            false,
+            req.body.unwrap_or_default().as_bytes(),
+        ));
+    } else if let Some(body) = req.body {
         builder = builder.body(body);
     }
     let response = builder
@@ -865,6 +905,28 @@ async fn execute_forward_action(
         }),
         action_refresh_resources(action, &["sessions"]),
     ))
+}
+
+/// Executes a confirmed WebSocket forward through the same core as the
+/// `/admin/forward/websocket` handler, so frames, session recording, and
+/// egress policy behave identically for assistant-driven sends.
+async fn execute_forward_websocket_action(
+    state: &Arc<AppState>,
+    action: &AssistantAction,
+) -> Result<(Value, Vec<String>), String> {
+    let req: super::forward::ForwardWsReq = from_payload(&action.payload)?;
+    match super::forward::forward_websocket_exchange(state, req).await {
+        Ok(resp) => Ok((
+            redact_value(&serde_json::to_value(&resp).map_err(|e| e.to_string())?),
+            action_refresh_resources(action, &["sessions"]),
+        )),
+        Err(super::forward::ForwardWsFailure::BadRequest(error)) => Err(error),
+        Err(super::forward::ForwardWsFailure::EgressBlocked(error)) => Err(error),
+        Err(super::forward::ForwardWsFailure::Upstream { session_id, error }) => Err(format!(
+            "{} (recorded as session {session_id})",
+            redact_string(&error)
+        )),
+    }
 }
 
 fn validate_action_route(

@@ -42,6 +42,7 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 regex = "1.12"
 flate2 = "1"
 brotli = "8"
+zstd = "0.13"
 bytes = "1"
 indexmap = { version = "2", features = ["serde"] }
 hyper = { version = "1.10.0", features = ["http1", "http2", "server"] }
