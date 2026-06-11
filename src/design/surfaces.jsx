@@ -1852,6 +1852,8 @@ async function computeCertFingerprint(pemText) {
 // ─── Root CA surface ───────────────────────────────────────────────────
 function CertSurface() {
   const [certInfo, setCertInfo] = React.useState({ loaded: false, bytes: 0, fingerprint: null });
+  const [qrFailed, setQrFailed] = React.useState(false);
+  const [net, setNet] = React.useState(null);
   React.useEffect(() => {
     fetch('/admin/ca')
       .then(r => r.ok ? r.text() : '')
@@ -1860,6 +1862,10 @@ function CertSurface() {
         setCertInfo({ loaded: !!text, bytes: text.length, fingerprint });
       })
       .catch(() => setCertInfo({ loaded: false, bytes: 0, fingerprint: null }));
+    fetch('/admin/network')
+      .then(r => r.ok ? r.json() : null)
+      .then(setNet)
+      .catch(() => setNet(null));
   }, []);
 
   return (
@@ -1888,6 +1894,40 @@ function CertSurface() {
               <a className="btn ghost" href="/setup/mobile" target="_blank" rel="noopener">Open install guide</a>
               <div className="spacer" />
             </div>
+          </div>
+        </div>
+
+        <div>
+          <div className="ca-card">
+            <h3>Install on a phone</h3>
+            <div className="desc">Scan with a phone on the same Wi-Fi to open the certificate download — no typing the address. The phone only needs to reach this machine; it doesn’t have to be set up to use the proxy yet. After downloading, open Settings to trust it.</div>
+            {!qrFailed ? (
+              <div style={{ display: 'flex', justifyContent: 'center', margin: '14px 0' }}>
+                <img
+                  src="/admin/ca/qr"
+                  alt="QR code linking to the oproxy Root CA download"
+                  width={220}
+                  height={220}
+                  onError={() => setQrFailed(true)}
+                  style={{ background: '#fff', padding: 12, borderRadius: 10, border: '1px solid var(--border, #2a2a2a)' }}
+                />
+              </div>
+            ) : (
+              <div className="mute" style={{ fontSize: 12, margin: '14px 0' }}>
+                QR unavailable. Use the Download certificate button, or browse to the address below from your phone.
+              </div>
+            )}
+            {net?.ca_url && (
+              <div className="kv" style={{ gridTemplateColumns: '90px 1fr', fontSize: 12 }}>
+                <div className="k">Opens</div>
+                <div className="v"><code style={{ wordBreak: 'break-all' }}>{net.ca_url}</code></div>
+              </div>
+            )}
+            {net && net.lan_ip_available === false && (
+              <div className="mute" style={{ fontSize: 11, marginTop: 10 }}>
+                No LAN address was detected{net.running_in_container ? ' (running in a container)' : ''}, so the QR points at <code>{net.lan_ip || '127.0.0.1'}</code>, which a phone likely can’t reach. Publish the host’s LAN IP and reload to fix the QR.
+              </div>
+            )}
           </div>
         </div>
       </div>

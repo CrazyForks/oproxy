@@ -30,6 +30,14 @@ pub(crate) async fn run() -> Result<(), StartupError> {
     let services = super::state::build_runtime_services(&config).await?;
     let timeouts = build_timeouts(&config);
 
+    // Best-effort, non-blocking update check (notify only). Opt out with
+    // OPROXY_UPDATE_CHECK=false.
+    if config.update_check {
+        tokio::spawn(control_plane::refresh_update_status(
+            services.state.update_status.clone(),
+        ));
+    }
+
     let listeners = bind_listeners(&config, &services.ca).await?;
     log_startup_summary(&config, &listeners);
 

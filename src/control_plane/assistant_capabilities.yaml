@@ -169,18 +169,13 @@ features:
     read_tools: [list_sessions, get_session]
     action_endpoints:
       - /admin/sessions
-      - /admin/sessions/save
-      - /admin/sessions/load
-      - /admin/sessions/import
-      - /admin/sessions/export/har
-      - /admin/sessions/import/har
     examples:
       - show failed requests
       - summarize calls to api.example.com
       - clear captured sessions
-      - export these sessions as HAR
     notes:
-      - Session reads are automatic; clearing, importing, loading, saving, and exporting require confirmation.
+      - Session reads are automatic; clearing captured sessions requires confirmation.
+      - Saving, loading, importing, and HAR export/import are UI-only actions the assistant cannot perform; direct the user to the Sessions toolbar buttons instead of proposing an action.
       - Bodies and sensitive headers must be redacted before model context.
       - Sessions carry protocol identity (downstream protocol, negotiated upstream protocol, connection_id, stream_id) and can be sorted by the protocol column.
       - Streamed exchanges record an event timeline (gRPC messages, WebSocket frames, breakpoint pauses, served mocks, tunnel open/close).
@@ -302,8 +297,6 @@ features:
     read_tools: [get_rules, get_breakpoint_diagnostics]
     action_endpoints:
       - /admin/breakpoints
-      - /admin/breakpoints/pending/{id}/resolve
-      - /admin/breakpoints/diagnostics
     examples:
       - pause POST /login requests
       - break on 500 responses from api.example.com
@@ -313,8 +306,8 @@ features:
       - Breakpoint payloads accept a `tier` field (head, body, frame, tunnel); body is the default and only works for buffered bodies.
       - Body-tier breakpoints cannot pause streams, frames, or tunnels; the engine records a diagnostic instead. Use get_breakpoint_diagnostics to surface these mismatches.
       - Frame-tier breakpoints require frame or stream_messages body modes (WebSocket / gRPC); pair them with location wire_protocol/application_protocol/body_mode matchers.
-      - Creating breakpoints requires confirmation.
-      - Resolving a held breakpoint changes live traffic and requires confirmation.
+      - Creating, updating, and deleting breakpoint rules requires confirmation.
+      - Resolving a held breakpoint (continue/drop) and reading diagnostics happen in the Pending UI queue; the assistant can read diagnostics via get_breakpoint_diagnostics but cannot resolve held traffic itself.
 
   - id: mock_server
     title: Mock Responses
@@ -337,7 +330,6 @@ features:
     read_tools: [get_rules]
     action_endpoints:
       - /admin/mock/rules
-      - /admin/mock/rules/{id}/reset
     examples:
       - mock GET /users with a 200 JSON response
       - return 429 for /checkout with retry-after header
@@ -345,7 +337,7 @@ features:
       - mock a gRPC method
     notes:
       - Use mock_server for synthetic responses; use map_local for serving files from disk.
-      - Resetting call count requires confirmation.
+      - Creating, updating, and deleting mock rules requires confirmation. Resetting a rule's call count is a UI-only button the assistant cannot trigger.
       - Prefer propose_mock_rule for HTTP response mocks.
       - For WebSocket, gRPC, or Tunnel mocks, use propose_action with the full behavior payload (behavior.type = web_socket_script, grpc_script, or tunnel_decision).
       - "WebSocket script: behavior.frames is an array of {opcode (1=text, 2=binary, 8=close, 9=ping, 10=pong), payload, delay_ms}; match with wire_protocol=websocket, body_mode=frames."
@@ -512,12 +504,12 @@ features:
       - The user cannot see HTTPS bodies.
       - The user asks how to set up browser, mobile, or CLI HTTPS capture.
     read_tools: [get_config]
-    action_endpoints: [/admin/ca, /admin/config/reload]
+    action_endpoints: []
     examples:
       - why are HTTPS bodies empty
       - download the CA certificate
     notes:
-      - CA download is a setup/read action; trusting the CA happens on the client/OS.
+      - The CA certificate is downloaded from the Root CA UI surface or /admin/ca in a browser; trusting the CA happens on the client/OS. The assistant cannot download or reload it for the user, so give UI steps.
       - Without client trust, CONNECT traffic may be visible but decrypted HTTP details are not.
 
   - id: inspectors
@@ -578,12 +570,12 @@ features:
       - The client can use SOCKS but not HTTP proxy settings.
       - The user asks whether SOCKS5 is running.
     read_tools: [get_config]
-    action_endpoints: [/admin/socks5/status]
+    action_endpoints: []
     examples:
       - is SOCKS5 enabled
       - how do I proxy a CLI through SOCKS5
     notes:
-      - SOCKS5 status is read-only; listener configuration comes from runtime config.
+      - SOCKS5 status is read-only and exposed through get_config (socks5_port); listener configuration comes from runtime config and is not assistant-editable.
       - SOCKS5 tunnels are recorded as CONNECT sessions with open/close events and byte counts; TLS tunnels on known TLS ports are MITM-intercepted when enabled.
       - Mock rules with behavior type tunnel_decision can allow or deny matching SOCKS5 tunnels (match on wire_protocol=socks5, body_mode=tunnel).
 
@@ -630,7 +622,7 @@ features:
   - id: settings
     title: Runtime Settings
     category: setup
-    purpose: Read config, reload configuration, and explain listener/auth/storage state.
+    purpose: Read config and explain listener/auth/storage/MITM/upstream-proxy state.
     ui_steps:
       - Open the Settings rail item.
       - Review listener, auth, MITM, storage, upstream proxy, and runtime state.
@@ -638,13 +630,13 @@ features:
     use_when:
       - The user asks how oproxy is running, where data is stored, or whether auth/MITM is enabled.
     read_tools: [get_config]
-    action_endpoints: [/admin/config/reload]
+    action_endpoints: []
     examples:
       - show current config
-      - reload config
       - is admin auth enabled
     notes:
-      - Reloading config is a mutation and requires confirmation.
+      - Settings are read via get_config. Reloading configuration is a UI-only button (Settings surface); the assistant cannot reload config and should point the user there.
+      - To change the upstream proxy, use propose_upstream_proxy (the only assistant-editable setting).
 
 tools:
   - name: get_feature_catalog

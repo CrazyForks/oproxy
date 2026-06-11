@@ -64,6 +64,42 @@ pub(super) async fn get_ca_cert(State(state): State<Arc<AppState>>) -> impl Into
     }
 }
 
+/// SVG QR code encoding the LAN-reachable certificate download URL
+/// (`http://<lan-ip>:<port>/admin/ca`). Phone cameras can only act on real
+/// URLs — they cannot extract a file from a QR (iOS rejects `data:` URIs,
+/// Android shows them as text) — so the QR points a phone on the same network
+/// at the download. The phone does not need to be configured to use the proxy,
+/// only to be able to reach this host's IP. The encoded URL matches the
+/// `ca_url` reported by `/admin/network`.
+pub(super) async fn get_ca_qr(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.proxy_engine.ca.is_none() {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+    let remote_ip =
+        crate::setup::public_lan_ip_for_setup().unwrap_or_else(|| "127.0.0.1".to_string());
+    let url = format!("http://{}:{}/admin/ca", remote_ip, state.config.port);
+
+    match qrcode::QrCode::new(url.as_bytes()) {
+        Ok(code) => {
+            let svg = code
+                .render::<qrcode::render::svg::Color>()
+                .min_dimensions(220, 220)
+                .quiet_zone(true)
+                .build();
+            (
+                axum::http::StatusCode::OK,
+                [
+                    ("Content-Type", "image/svg+xml"),
+                    ("Cache-Control", "no-store"),
+                ],
+                svg,
+            )
+                .into_response()
+        }
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 pub(super) async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let uptime = state.started_at.elapsed().as_secs();
     axum::Json(serde_json::json!({
@@ -132,4 +168,22 @@ pub(super) async fn get_socks5_status(State(state): State<Arc<AppState>>) -> imp
         "mode": if mitm_active { "mitm" } else { "tunnel-only" },
         "captures_sessions": mitm_active,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Locks the QR rendering used by `get_ca_qr`: the LAN CA download URL
+    /// encodes to a self-contained SVG (what the Root CA tab embeds via `<img>`).
+    #[test]
+    fn ca_url_renders_to_svg_qr() {
+        let url = "http://192.168.1.10:8080/admin/ca";
+        let code = qrcode::QrCode::new(url.as_bytes()).expect("url encodes to a QR");
+        let svg = code
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(220, 220)
+            .quiet_zone(true)
+            .build();
+        assert!(svg.starts_with("<?xml") || svg.contains("<svg"));
+        assert!(svg.contains("</svg>"));
+    }
 }

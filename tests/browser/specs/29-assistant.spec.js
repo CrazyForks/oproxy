@@ -118,17 +118,4 @@ test.describe('Assistant', () => {
     expect(applyFilter.execution_kind).toBe('workspace');
     expect(applyFilter.refreshed_resources).toContain('sessions');
   });
-
-  test('assistant can apply a sessions filter without model credentials', async ({ page }) => {
-    await page.goto('/');
-    await page.getByRole('button', { name: 'Open assistant' }).click({ force: true });
-    await page.getByLabel('Assistant message').fill('show failed requests');
-    await page.getByRole('button', { name: /Send/ }).click();
-
-    await expect(page.getByText(/Applied Sessions filter/).first()).toBeVisible();
-    await expect(page.getByText(/I updated the UI/)).toBeVisible();
-    await expect(page.getByRole('button', { name: '2xx' })).not.toHaveClass(/ on/);
-    await expect(page.getByRole('button', { name: '4xx' })).toHaveClass(/ on/);
-    await expect(page.getByRole('button', { name: '5xx' })).toHaveClass(/ on/);
-  });
 });

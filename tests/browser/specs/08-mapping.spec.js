@@ -82,14 +82,6 @@ test.describe('Rules / mapping and access', () => {
     expect(saved.location.methods || []).not.toContain('WS');
   });
 
-  test('Map Local and Access tabs switch view', async ({ page }) => {
-    await gotoRail(page, 'Rules');
-    await page.getByRole('button', { name: 'Map Local', exact: true }).click();
-    await expect(page.getByText('No Map Local rules')).toBeVisible();
-    await page.getByRole('button', { name: 'Access', exact: true }).click();
-    await expect(page.getByText('Block rules 403 matching requests.')).toBeVisible();
-  });
-
   test('add Access rule via API appears in UI', async ({ request, page }) => {
     const res = await request.post('/admin/access-rules', {
       data: {

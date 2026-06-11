@@ -4,6 +4,7 @@ mod config;
 mod control_plane;
 mod core;
 mod diff;
+mod examples;
 mod export;
 mod har;
 mod middleware;

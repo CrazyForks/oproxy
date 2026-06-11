@@ -145,13 +145,6 @@ pub(super) fn workspace_action_name_for_tool(tool_name: &str) -> Option<String> 
         .map(|action| action.name)
 }
 
-pub(super) fn workspace_tool_name_for_action(action_type: &str) -> Option<String> {
-    workspace_action_definitions()
-        .into_iter()
-        .find(|action| action.name == action_type)
-        .and_then(|action| workspace_tool_name(&action))
-}
-
 pub(super) fn tool_info() -> Vec<AssistantToolInfo> {
     let mut tools: Vec<AssistantToolInfo> = assistant_manifest()
         .tools
@@ -315,6 +308,26 @@ mod tests {
         let guidance = assistant_response_guidance();
 
         assert!(guidance.contains("UI steps first"));
+    }
+
+    #[test]
+    fn every_feature_read_tool_is_a_real_read_tool() {
+        use std::collections::BTreeSet;
+        let read_tools: BTreeSet<String> = tool_info()
+            .into_iter()
+            .filter(|tool| tool.category == "read")
+            .map(|tool| tool.name)
+            .collect();
+        for feature in assistant_feature_catalog() {
+            for referenced in &feature.read_tools {
+                assert!(
+                    read_tools.contains(referenced),
+                    "feature '{}' references read tool '{}' that is not declared as a read tool",
+                    feature.id,
+                    referenced
+                );
+            }
+        }
     }
 
     #[test]

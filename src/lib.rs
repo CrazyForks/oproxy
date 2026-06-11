@@ -3,6 +3,7 @@ pub mod certs;
 pub mod config;
 pub mod core;
 pub mod diff;
+pub mod examples;
 pub mod export;
 pub mod har;
 pub mod middleware;

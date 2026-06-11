@@ -291,4 +291,26 @@ mod tests {
         assert!(action_route_contract("POST", "/admin/rule-sets?x=1").is_err());
         assert!(action_route_contract("POST", "/admin/../config").is_err());
     }
+
+    /// Capability honesty: every endpoint the feature catalog advertises under
+    /// `action_endpoints` must be executable by the assistant for at least one
+    /// mutating method. Otherwise the model reads the catalog, proposes the
+    /// advertised endpoint, and the executor rejects it as "not allowlisted" —
+    /// a confusing dead-end. Curly-brace placeholders (e.g. `/admin/dns/{host}`)
+    /// stand in for an item id and resolve through the same matcher.
+    #[test]
+    fn every_advertised_action_endpoint_is_executable() {
+        for feature in super::super::assistant_registry::assistant_feature_catalog() {
+            for endpoint in &feature.action_endpoints {
+                let executable = ["POST", "PUT", "DELETE"]
+                    .iter()
+                    .any(|method| action_route_contract(method, endpoint).is_ok());
+                assert!(
+                    executable,
+                    "feature '{}' advertises action endpoint '{}' that no allowlisted POST/PUT/DELETE route can execute",
+                    feature.id, endpoint
+                );
+            }
+        }
+    }
 }

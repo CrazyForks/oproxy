@@ -18,6 +18,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # The running binary reports CARGO_PKG_VERSION; the in-app update check
+      # compares it to the latest GitHub release tag. If Cargo.toml is not bumped
+      # to match the tag being released, every build of this release would report
+      # "update available" against itself. Fail the release early when they drift.
+      - name: Verify Cargo.toml version matches release tag
+        if: github.event_name == 'release'
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          tag="${tag#v}"
+          cargo_ver="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -n1)"
+          echo "release tag: $tag | Cargo.toml version: $cargo_ver"
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::Release tag '$tag' does not match Cargo.toml version '$cargo_ver'. Bump the version in Cargo.toml to $tag before publishing the release."
+            exit 1
+          fi
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

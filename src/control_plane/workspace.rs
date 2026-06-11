@@ -5,7 +5,6 @@ use std::sync::OnceLock;
 
 use axum::{extract::State, response::IntoResponse};
 use chrono::{DateTime, Utc};
-use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -539,15 +538,6 @@ pub(crate) fn workspace_action_definitions() -> Vec<WorkspaceActionDefinition> {
     workspace_manifest().workspace_actions.clone()
 }
 
-pub(crate) fn deterministic_workspace_action_from_text(
-    text: &str,
-) -> Option<WorkspaceActionRequest> {
-    deterministic_clear_filter_action(text)
-        .or_else(|| deterministic_sessions_filter_action(text))
-        .or_else(|| deterministic_view_mode_action(text))
-        .or_else(|| deterministic_open_surface_action(text))
-}
-
 fn apply_workspace_action_to_state(
     workspace: &mut WorkspaceState,
     action: &WorkspaceActionDefinition,
@@ -565,313 +555,6 @@ fn apply_workspace_action_to_state(
             action.name
         )),
     }
-}
-
-fn deterministic_clear_filter_action(text: &str) -> Option<WorkspaceActionRequest> {
-    let lower = text.to_ascii_lowercase();
-    let looks_like_clear = has_any_word(&lower, &["clear", "reset", "remove"])
-        && has_any_word(&lower, &["filter", "filters", "search"])
-        && has_any_word(
-            &lower,
-            &["session", "sessions", "request", "requests", "traffic"],
-        );
-    looks_like_clear.then(|| WorkspaceActionRequest {
-        action_type: "sessions.clear_filter".to_string(),
-        payload: Value::Object(Default::default()),
-    })
-}
-
-fn deterministic_sessions_filter_action(text: &str) -> Option<WorkspaceActionRequest> {
-    let lower = text.to_ascii_lowercase();
-    let looks_like_filter = has_any_word(
-        &lower,
-        &[
-            "show", "filter", "find", "focus", "only", "list", "where", "see",
-        ],
-    ) && has_any_word(
-        &lower,
-        &[
-            "request",
-            "requests",
-            "session",
-            "sessions",
-            "traffic",
-            "calls",
-            "api",
-            "host",
-            "status",
-            "failed",
-            "failure",
-            "error",
-            "errors",
-            "pending",
-            "paused",
-            "graphql",
-            "grpc",
-            "websocket",
-            "ws",
-        ],
-    );
-    if !looks_like_filter {
-        return None;
-    }
-
-    let methods: Vec<String> = ALLOWED_METHODS
-        .iter()
-        .filter(|method| has_word(&lower, &method.to_ascii_lowercase()))
-        .map(|method| (*method).to_string())
-        .collect();
-    let mut status_buckets: Vec<String> = ALLOWED_STATUS_BUCKETS
-        .iter()
-        .map(|bucket| (*bucket).to_string())
-        .collect();
-    let mut constrained_status = false;
-    let mut search_terms = Vec::new();
-
-    if has_any_word(
-        &lower,
-        &["failed", "failure", "error", "errors", "bad", "broken"],
-    ) {
-        status_buckets = vec!["4".to_string(), "5".to_string()];
-        constrained_status = true;
-    }
-    if has_any_word(&lower, &["2xx", "success", "successful"]) {
-        status_buckets = vec!["2".to_string()];
-        constrained_status = true;
-    }
-    if has_any_word(&lower, &["3xx", "redirect", "redirects"]) {
-        status_buckets = vec!["3".to_string()];
-        constrained_status = true;
-    }
-    if lower.contains("4xx") || lower.contains("client error") || lower.contains("client errors") {
-        status_buckets = vec!["4".to_string()];
-        constrained_status = true;
-    }
-    if lower.contains("5xx") || lower.contains("server error") || lower.contains("server errors") {
-        status_buckets = vec!["5".to_string()];
-        constrained_status = true;
-    }
-    if has_any_word(&lower, &["pending", "paused", "held"]) {
-        status_buckets = vec!["-".to_string()];
-        constrained_status = true;
-    }
-
-    if let Some(status) = status_code_from_text(&lower) {
-        status_buckets = vec![status.chars().next().unwrap_or('0').to_string()];
-        constrained_status = true;
-        search_terms.push(format!("status:{status}"));
-    }
-
-    let host = host_from_text(text);
-    if let Some(host) = &host {
-        search_terms.push(format!("host:{host}"));
-    }
-    for method in &methods {
-        search_terms.push(format!("method:{method}"));
-    }
-    if has_word(&lower, "graphql") {
-        search_terms.push("graphql".to_string());
-    }
-    if has_word(&lower, "grpc") {
-        search_terms.push("grpc".to_string());
-    }
-    if has_any_word(&lower, &["websocket", "ws"]) || lower.contains("web socket") {
-        search_terms.push("ws".to_string());
-    }
-    if let Some(tag) = tag_from_text(&lower) {
-        search_terms.push(format!("tag:{tag}"));
-    }
-
-    Some(WorkspaceActionRequest {
-        action_type: "sessions.apply_filter".to_string(),
-        payload: json_object([
-            ("query", Value::String(search_terms.join(" "))),
-            ("regex", Value::Bool(false)),
-            (
-                "methods",
-                Value::Array(if methods.is_empty() {
-                    ALLOWED_METHODS
-                        .iter()
-                        .map(|method| Value::String((*method).to_string()))
-                        .collect()
-                } else {
-                    methods
-                        .iter()
-                        .map(|method| Value::String(method.clone()))
-                        .collect()
-                }),
-            ),
-            (
-                "status_buckets",
-                Value::Array(
-                    if constrained_status {
-                        status_buckets
-                    } else {
-                        ALLOWED_STATUS_BUCKETS
-                            .iter()
-                            .map(|bucket| (*bucket).to_string())
-                            .collect()
-                    }
-                    .into_iter()
-                    .map(Value::String)
-                    .collect(),
-                ),
-            ),
-            (
-                "host_focus",
-                Value::Array(
-                    host.iter()
-                        .map(|host| Value::String(host.clone()))
-                        .collect(),
-                ),
-            ),
-            ("host_filter", Value::Null),
-            (
-                "view_mode",
-                if lower.contains("structure") || lower.contains("tree") {
-                    Value::String("structure".to_string())
-                } else {
-                    Value::Null
-                },
-            ),
-            ("selected_session_id", Value::Null),
-        ]),
-    })
-}
-
-fn deterministic_view_mode_action(text: &str) -> Option<WorkspaceActionRequest> {
-    let lower = text.to_ascii_lowercase();
-    if !has_any_word(
-        &lower,
-        &["session", "sessions", "traffic", "request", "requests"],
-    ) {
-        return None;
-    }
-    let view_mode = if has_any_word(&lower, &["structure", "tree"]) {
-        Some("structure")
-    } else if has_any_word(&lower, &["sequence", "table", "list"]) {
-        Some("sequence")
-    } else {
-        None
-    }?;
-    Some(WorkspaceActionRequest {
-        action_type: "sessions.set_view_mode".to_string(),
-        payload: json_object([("view_mode", Value::String(view_mode.to_string()))]),
-    })
-}
-
-fn deterministic_open_surface_action(text: &str) -> Option<WorkspaceActionRequest> {
-    let lower = text.to_ascii_lowercase();
-    if !has_any_word(
-        &lower,
-        &["open", "go", "goto", "show", "navigate", "switch", "where"],
-    ) {
-        return None;
-    }
-    let surface = if has_word(&lower, "sessions") || has_word(&lower, "traffic") {
-        "sessions"
-    } else if has_word(&lower, "dashboard") || lower.contains("protocol metrics") {
-        "dashboard"
-    } else if has_word(&lower, "connections") || has_word(&lower, "multiplexing") {
-        "connections"
-    } else if has_word(&lower, "compose") || lower.contains("send request") {
-        "compose"
-    } else if has_word(&lower, "rules")
-        || lower.contains("map remote")
-        || lower.contains("map local")
-    {
-        "rules"
-    } else if has_word(&lower, "breakpoints") || has_word(&lower, "breakpoint") {
-        "breakpoints"
-    } else if has_word(&lower, "mock") {
-        "mock"
-    } else if has_word(&lower, "lua") || has_word(&lower, "script") || has_word(&lower, "scripts") {
-        "lua"
-    } else if has_word(&lower, "inspector") || has_word(&lower, "inspectors") {
-        "inspector"
-    } else if has_word(&lower, "dns") {
-        "dns"
-    } else if lower.contains("capture filter") {
-        "capture"
-    } else if has_word(&lower, "webhook") || has_word(&lower, "webhooks") {
-        "webhooks"
-    } else if lower.contains("root ca")
-        || has_word(&lower, "certificate")
-        || has_word(&lower, "cert")
-        || has_word(&lower, "ca")
-    {
-        "ca"
-    } else if has_word(&lower, "settings") || has_word(&lower, "config") {
-        "settings"
-    } else {
-        return None;
-    };
-
-    Some(WorkspaceActionRequest {
-        action_type: "navigation.open_surface".to_string(),
-        payload: json_object([("surface", Value::String(surface.to_string()))]),
-    })
-}
-
-fn has_any_word(text: &str, words: &[&str]) -> bool {
-    words.iter().any(|word| has_word(text, word))
-}
-
-fn has_word(text: &str, word: &str) -> bool {
-    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
-        .any(|token| token == word)
-}
-
-fn status_code_from_text(text: &str) -> Option<String> {
-    static STATUS_RE: OnceLock<Regex> = OnceLock::new();
-    let re = STATUS_RE.get_or_init(|| {
-        Regex::new(r"\b(?:status[:\s]+)?([1-5][0-9]{2})s?\b").expect("valid status regex")
-    });
-    re.captures(text)
-        .and_then(|captures| captures.get(1).map(|m| m.as_str().to_string()))
-}
-
-fn host_from_text(text: &str) -> Option<String> {
-    static HOST_RE: OnceLock<Regex> = OnceLock::new();
-    static ANY_HOST_RE: OnceLock<Regex> = OnceLock::new();
-    let host_re = HOST_RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)\b(?:host|from|for|to|on)\s+([a-z0-9][a-z0-9.-]*(?::\d+)?\.[a-z]{2,}(?::\d+)?)",
-        )
-        .expect("valid host regex")
-    });
-    let any_host_re = ANY_HOST_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b([a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?::\d+)?)\b").expect("valid host regex")
-    });
-    host_re
-        .captures(text)
-        .or_else(|| any_host_re.captures(text))
-        .and_then(|captures| captures.get(1))
-        .and_then(|m| {
-            normalize_host(
-                m.as_str()
-                    .trim_matches(|ch| matches!(ch, ')' | ',' | '.' | ';' | '?'))
-                    .to_string(),
-            )
-            .ok()
-            .flatten()
-        })
-}
-
-fn tag_from_text(text: &str) -> Option<String> {
-    static TAG_RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        TAG_RE.get_or_init(|| Regex::new(r"\btag[:\s]+([a-z0-9_-]+)\b").expect("valid tag regex"));
-    re.captures(text)
-        .and_then(|captures| captures.get(1).map(|m| m.as_str().to_string()))
-}
-
-fn json_object<const N: usize>(entries: [(&str, Value); N]) -> Value {
-    let mut map = serde_json::Map::new();
-    for (key, value) in entries {
-        map.insert(key.to_string(), value);
-    }
-    Value::Object(map)
 }
 
 fn default_feature_views() -> BTreeMap<String, FeatureViewState> {
@@ -1427,6 +1110,56 @@ mod tests {
         );
     }
 
+    /// Capability honesty: the enum values advertised to the model in the
+    /// `workspace_sessions_apply_filter` tool schema must exactly equal the
+    /// allowlists the executor validates against (`ALLOWED_METHODS`,
+    /// `ALLOWED_STATUS_BUCKETS`, `ALLOWED_SORT_KEYS`) and the SessionsViewMode
+    /// variants. Otherwise the model is told it may use a value the executor
+    /// rejects, or is denied a value the executor accepts.
+    #[test]
+    fn apply_filter_spec_enums_match_executor_allowlists() {
+        let action = workspace_action_definition("sessions.apply_filter").expect("action");
+        let props = action
+            .openai_spec
+            .pointer("/function/parameters/properties")
+            .expect("apply_filter properties");
+
+        let enum_at = |ptr: &str| -> Vec<String> {
+            props
+                .pointer(ptr)
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("missing enum at {ptr}"))
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        };
+        let expected = |tokens: &[&str]| -> Vec<String> {
+            tokens.iter().map(|token| token.to_string()).collect()
+        };
+
+        assert_eq!(
+            enum_at("/methods/items/enum"),
+            expected(ALLOWED_METHODS),
+            "apply_filter methods enum drifted from ALLOWED_METHODS"
+        );
+        assert_eq!(
+            enum_at("/status_buckets/items/enum"),
+            expected(ALLOWED_STATUS_BUCKETS),
+            "apply_filter status_buckets enum drifted from ALLOWED_STATUS_BUCKETS"
+        );
+        assert_eq!(
+            enum_at("/sort/properties/key/enum"),
+            expected(ALLOWED_SORT_KEYS),
+            "apply_filter sort.key enum drifted from ALLOWED_SORT_KEYS"
+        );
+        // SessionsViewMode is snake_case: sequence, structure.
+        assert_eq!(
+            enum_at("/view_mode/enum"),
+            vec!["sequence".to_string(), "structure".to_string()],
+            "apply_filter view_mode enum drifted from SessionsViewMode"
+        );
+    }
+
     #[test]
     fn workspace_action_apply_filter_updates_state() {
         let action = workspace_action_definition("sessions.apply_filter").expect("action");
@@ -1497,24 +1230,6 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_text_builds_sessions_filter_action() {
-        let req = deterministic_workspace_action_from_text(
-            "show failed GET requests from API.TEST.COM in structure view",
-        )
-        .expect("deterministic action");
-
-        assert_eq!(req.action_type, "sessions.apply_filter");
-        assert_eq!(req.payload["query"], "host:api.test.com method:GET");
-        assert_eq!(req.payload["methods"], serde_json::json!(["GET"]));
-        assert_eq!(req.payload["status_buckets"], serde_json::json!(["4", "5"]));
-        assert_eq!(
-            req.payload["host_focus"],
-            serde_json::json!(["api.test.com"])
-        );
-        assert_eq!(req.payload["view_mode"], "structure");
-    }
-
-    #[test]
     fn open_surface_accepts_dashboard_and_connections() {
         let action = workspace_action_definition("navigation.open_surface").expect("action");
         for (surface, expected) in [
@@ -1530,29 +1245,5 @@ mod tests {
             .expect("surface navigates");
             assert_eq!(workspace.active_surface, expected);
         }
-    }
-
-    #[test]
-    fn deterministic_text_navigates_to_protocol_surfaces() {
-        let dash = deterministic_workspace_action_from_text("open the protocol dashboard")
-            .expect("dashboard action");
-        assert_eq!(dash.action_type, "navigation.open_surface");
-        assert_eq!(dash.payload["surface"], "dashboard");
-
-        let conns =
-            deterministic_workspace_action_from_text("show connections").expect("connections");
-        assert_eq!(conns.payload["surface"], "connections");
-    }
-
-    #[test]
-    fn deterministic_text_builds_clear_and_navigation_actions() {
-        let clear = deterministic_workspace_action_from_text("clear session filters")
-            .expect("clear action");
-        assert_eq!(clear.action_type, "sessions.clear_filter");
-
-        let nav =
-            deterministic_workspace_action_from_text("open root ca").expect("navigation action");
-        assert_eq!(nav.action_type, "navigation.open_surface");
-        assert_eq!(nav.payload["surface"], "ca");
     }
 }

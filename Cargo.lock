@@ -1494,7 +1494,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "oproxy"
-version = "0.1.0"
+version = "0.1.8"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1515,6 +1515,7 @@ dependencies = [
  "indexmap",
  "mlua",
  "prost",
+ "qrcode",
  "quinn",
  "rcgen",
  "regex",
@@ -1657,6 +1658,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quinn"

@@ -26,7 +26,6 @@ use crate::security::{AdminEgressPolicy, enforce_admin_egress_policy};
 use crate::storage;
 use crate::webhooks::{WebhookConfig, sanitize_webhook_events};
 
-use super::assistant::AssistantMessage;
 use super::assistant_action_contracts::{
     AssistantActionRisk, AssistantActionRouteContract, action_route_contract,
     id_backed_collection_bases, refreshed_resources_for_action,
@@ -263,35 +262,6 @@ pub(super) fn propose_map_remote_action(args: Value) -> Result<AssistantAction, 
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
     build_map_remote_action(source, destination, name)
-}
-
-pub(super) fn deterministic_action_from_messages(
-    messages: &[AssistantMessage],
-) -> Result<Option<AssistantAction>, String> {
-    let Some(text) = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .map(|message| message.content.as_str())
-    else {
-        return Ok(None);
-    };
-    deterministic_map_remote_action(text)
-}
-
-fn deterministic_map_remote_action(text: &str) -> Result<Option<AssistantAction>, String> {
-    let re = regex::RegexBuilder::new(
-        r"\b(?:map|route|proxy|forward)\b(?:\s+all\s+traffic|\s+traffic)?\s+from\s+(\S+)\s+to\s+(\S+)",
-    )
-    .case_insensitive(true)
-    .build()
-    .map_err(|e| format!("assistant map-remote parser failed: {e}"))?;
-    let Some(caps) = re.captures(text) else {
-        return Ok(None);
-    };
-    let source = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-    let destination = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-    build_map_remote_action(source, destination, None).map(Some)
 }
 
 fn build_map_remote_action(
@@ -1152,11 +1122,11 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_map_remote_request_builds_confirmed_action() {
-        let action = deterministic_map_remote_action(
-            "can you map all traffic from api.test.com to google.com",
-        )
-        .unwrap()
+    fn propose_map_remote_builds_confirmed_action() {
+        let action = propose_map_remote_action(json!({
+            "source_host": "api.test.com",
+            "destination": "google.com",
+        }))
         .expect("map remote action");
 
         assert_eq!(action.method, "POST");
@@ -1168,11 +1138,11 @@ mod tests {
     }
 
     #[test]
-    fn map_remote_parser_handles_ports_and_existing_scheme() {
-        let action = deterministic_map_remote_action(
-            "route traffic from http://api.test.com:8080/v1 to http://localhost:3000",
-        )
-        .unwrap()
+    fn propose_map_remote_normalizes_ports_and_existing_scheme() {
+        let action = propose_map_remote_action(json!({
+            "source_host": "http://api.test.com:8080/v1",
+            "destination": "http://localhost:3000",
+        }))
         .expect("map remote action");
 
         assert_eq!(action.payload["location"]["host"], "api.test.com");

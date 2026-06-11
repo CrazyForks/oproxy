@@ -8,19 +8,14 @@ use tokio::sync::RwLock;
 
 use crate::AppState;
 
-use super::assistant_actions::{
-    AssistantAction, deterministic_action_from_messages, execute_action_payload,
-};
+use super::assistant_actions::{AssistantAction, execute_action_payload};
 use super::assistant_context::build_assistant_context;
 use super::assistant_contracts::grouped_tool_contract_info;
 use super::assistant_prompt::build_initial_messages;
 use super::assistant_provider::{AssistantProviderConfig, OpenAiCompatibleProviderClient};
 use super::assistant_redaction::redact_value;
-use super::assistant_registry::{openai_tool_specs, workspace_tool_name_for_action};
+use super::assistant_registry::openai_tool_specs;
 use super::assistant_tools::{ToolOutcome, execute_assistant_tool, tool_summary};
-use super::workspace::{
-    WorkspaceActionRequest, apply_workspace_action, deterministic_workspace_action_from_text,
-};
 
 const ASSISTANT_ACTION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_TOOL_LOOPS: usize = 4;
@@ -183,38 +178,12 @@ async fn run_assistant_chat(
     state: Arc<AppState>,
     req: AssistantChatRequest,
 ) -> Result<AssistantChatResponse, String> {
-    if let Some(workspace_request) = deterministic_workspace_action_from_messages(&req.messages) {
-        let result = apply_workspace_action(&state, workspace_request).await?;
-        return Ok(AssistantChatResponse {
-            message: format!(
-                "{}. I updated the UI so you can inspect it there.",
-                result.message
-            ),
-            tool_events: vec![AssistantToolEvent {
-                name: workspace_tool_name_for_action(&result.action_type)
-                    .unwrap_or_else(|| result.action_type.clone()),
-                category: "ui".to_string(),
-                status: "ok".to_string(),
-                summary: Some(result.message),
-            }],
-            proposed_actions: vec![],
-        });
-    }
-
-    if let Some(mut action) = deterministic_action_from_messages(&req.messages)? {
-        register_pending_action(&state, &mut action).await;
-        return Ok(AssistantChatResponse {
-            message: "I prepared the map-remote rule below. Review it and click Apply when you want me to run it.".to_string(),
-            tool_events: vec![AssistantToolEvent {
-                name: "propose_map_remote".to_string(),
-                category: action.risk_category().to_string(),
-                status: "needs_confirmation".to_string(),
-                summary: Some(action.summary.clone()),
-            }],
-            proposed_actions: vec![action],
-        });
-    }
-
+    // All intent resolution flows through the model. Earlier builds short-cut
+    // certain phrasings ("map A to B", "show failed requests") with keyword
+    // regex before calling the provider; those heuristics misfired often
+    // (hijacking questions, wrong host/status extraction) and are gone. The
+    // model drives workspace navigation/filtering via the workspace_* tools and
+    // mutations via the propose_* tools, all of which carry full context.
     let provider_client =
         OpenAiCompatibleProviderClient::new(req.provider.clone(), req.api_key.clone())?;
 
@@ -332,8 +301,16 @@ async fn run_assistant_chat(
         }
     }
 
+    // The tool budget is spent and the model never produced a final text turn
+    // (it kept calling read tools). Rather than discarding everything it
+    // gathered behind a canned failure string, make one more completion with
+    // tools disabled so it must answer from the context already in `messages`.
+    let message = match provider_client.chat_completion_text_only(&messages).await {
+        Ok(final_message) if !final_message.content.trim().is_empty() => final_message.content,
+        _ => "I gathered the available context but could not compose a final answer within the tool budget. Try narrowing the request.".to_string(),
+    };
     Ok(AssistantChatResponse {
-        message: "I gathered the available context, but the provider did not finish within the tool loop limit.".to_string(),
+        message,
         tool_events,
         proposed_actions,
     })
@@ -379,43 +356,38 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
         == 0
 }
 
-fn parse_tool_arguments(call: &Value) -> Result<Value, String> {
+/// Parse a tool call's `arguments` into a JSON object, tolerant of the shapes
+/// real OpenAI-compatible providers actually emit:
+///
+/// - a JSON *string* (the OpenAI spec): parse it;
+/// - an empty/whitespace string or absent/null: treat as `{}`;
+/// - an already-decoded *object* (vLLM, llama.cpp, some Ollama models): use it.
+///
+/// This is spec-tolerant, not model-specific — no provider is special-cased.
+pub(super) fn parse_tool_arguments(call: &Value) -> Result<Value, String> {
     let Some(args) = call.pointer("/function/arguments") else {
         return Ok(json!({}));
     };
-    let Some(args) = args.as_str() else {
-        return Err("assistant tool arguments must be a JSON string".to_string());
-    };
-    serde_json::from_str(args)
-        .map_err(|e| format!("assistant tool arguments were invalid JSON: {e}"))
-}
-
-fn deterministic_workspace_action_from_messages(
-    messages: &[AssistantMessage],
-) -> Option<WorkspaceActionRequest> {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .and_then(|message| deterministic_workspace_action_from_text(&message.content))
+    match args {
+        Value::Null => Ok(json!({})),
+        Value::Object(_) | Value::Array(_) => Ok(args.clone()),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(json!({}));
+            }
+            serde_json::from_str(trimmed)
+                .map_err(|e| format!("assistant tool arguments were invalid JSON: {e}"))
+        }
+        other => Err(format!(
+            "assistant tool arguments must be a JSON object or string, got {other}"
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn deterministic_workspace_intent_is_detected_before_provider_use() {
-        let action = deterministic_workspace_action_from_messages(&[AssistantMessage {
-            role: "user".to_string(),
-            content: "show failed requests from api.test.com".to_string(),
-        }])
-        .expect("workspace action");
-
-        assert_eq!(action.action_type, "sessions.apply_filter");
-        assert_eq!(action.payload["status_buckets"], json!(["4", "5"]));
-        assert_eq!(action.payload["host_focus"], json!(["api.test.com"]));
-    }
 
     #[test]
     fn confirmation_compare_is_constant_time_style() {
@@ -445,6 +417,42 @@ mod tests {
         .expect("missing arguments");
 
         assert_eq!(args, json!({}));
+    }
+
+    #[test]
+    fn object_form_tool_arguments_are_accepted() {
+        // vLLM / llama.cpp / some Ollama models emit arguments as a decoded
+        // object instead of a JSON string. We must accept it as-is.
+        let args = parse_tool_arguments(&json!({
+            "function": {
+                "name": "list_sessions",
+                "arguments": { "q": "host:api.test.com", "limit": 5 }
+            }
+        }))
+        .expect("object arguments");
+
+        assert_eq!(args, json!({ "q": "host:api.test.com", "limit": 5 }));
+    }
+
+    #[test]
+    fn empty_and_null_tool_arguments_default_to_empty_object() {
+        let from_empty = parse_tool_arguments(&json!({
+            "function": { "name": "get_config", "arguments": "" }
+        }))
+        .expect("empty-string arguments");
+        assert_eq!(from_empty, json!({}));
+
+        let from_whitespace = parse_tool_arguments(&json!({
+            "function": { "name": "get_config", "arguments": "  \n " }
+        }))
+        .expect("whitespace arguments");
+        assert_eq!(from_whitespace, json!({}));
+
+        let from_null = parse_tool_arguments(&json!({
+            "function": { "name": "get_config", "arguments": Value::Null }
+        }))
+        .expect("null arguments");
+        assert_eq!(from_null, json!({}));
     }
 
     #[test]

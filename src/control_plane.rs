@@ -8,6 +8,7 @@ mod assets;
 mod assistant;
 mod assistant_action_contracts;
 mod assistant_actions;
+mod assistant_compat;
 mod assistant_context;
 mod assistant_contracts;
 mod assistant_payload_repair;
@@ -26,6 +27,7 @@ mod policy;
 mod sessions;
 mod settings;
 mod storage_paths;
+mod update;
 mod webhooks;
 mod workspace;
 
@@ -37,6 +39,7 @@ pub(crate) use assistant::{SharedAssistantState, new_assistant_state};
 use assistant::{
     cancel_assistant_action, chat_assistant, execute_assistant_action, get_assistant_tools,
 };
+use assistant_compat::check_assistant_compatibility;
 pub use auth::proxy_dispatch_layer;
 use auth::{admin_auth_layer, security_headers};
 use breakpoints::{
@@ -67,9 +70,11 @@ use sessions::{
     list_sessions, load_sessions, protocol_metrics, save_sessions, sessions_stream,
 };
 use settings::{
-    get_ca_cert, get_config, get_socks5_status, get_upstream_proxy, reload_config,
+    get_ca_cert, get_ca_qr, get_config, get_socks5_status, get_upstream_proxy, reload_config,
     set_upstream_proxy_handler,
 };
+use update::get_update_status;
+pub(crate) use update::{SharedUpdateStatus, new_update_status, refresh_update_status};
 use webhooks::{create_webhook, delete_webhook, list_webhooks, update_webhook};
 pub(crate) use workspace::{SharedWorkspaceState, new_workspace_state};
 use workspace::{execute_workspace_action, get_workspace, patch_workspace};
@@ -136,6 +141,8 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
                 .delete(delete_rule_set),
         )
         .route("/admin/ca", get(get_ca_cert))
+        .route("/admin/ca/qr", get(get_ca_qr))
+        .route("/admin/update", get(get_update_status))
         .route("/admin/metrics", get(get_metrics))
         .route("/admin/playback", axum::routing::post(start_playback))
         .route("/admin/breakpoints", get(list_bp_rules).post(add_bp_rule))
@@ -207,6 +214,10 @@ pub fn control_plane_router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/assistant/tools", get(get_assistant_tools))
         .route("/admin/assistant/chat", axum::routing::post(chat_assistant))
+        .route(
+            "/admin/assistant/compatibility",
+            axum::routing::post(check_assistant_compatibility),
+        )
         .route(
             "/admin/assistant/actions/execute",
             axum::routing::post(execute_assistant_action),
@@ -298,31 +309,20 @@ async fn proxy_fallback(
 }
 
 async fn get_network_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let detected_lan_ip = crate::setup::detect_lan_ip();
-    let lan_setup_ip = crate::setup::public_lan_ip_for_setup();
-    let running_in_container = crate::setup::running_in_container();
+    let lan_ip = crate::setup::public_lan_ip_for_setup();
     let port = state.config.port;
     let socks5_port = state.config.socks5_port;
-    // Best IP to advertise to remote clients (other devices on LAN).
-    // In a container the bridge IP is not reachable from outside, so we fall back
-    // to detected_lan_ip with a caveat flag; the client can show both options.
-    let remote_ip = lan_setup_ip
-        .clone()
-        .or_else(|| detected_lan_ip.clone())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let lan_ip_available = lan_setup_ip.is_some();
+    let remote_ip = lan_ip.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+    let lan_ip_available = lan_ip.is_some();
     let ca_url = format!("http://{}:{}/admin/ca", remote_ip, port);
     axum::Json(serde_json::json!({
         "lan_ip": remote_ip,
-        "detected_lan_ip": detected_lan_ip,
-        "lan_setup_ip": lan_setup_ip,
         "port": port,
         "socks5_port": socks5_port,
         "localhost_proxy": format!("127.0.0.1:{port}"),
         "lan_proxy": format!("{remote_ip}:{port}"),
         "ca_url": ca_url,
         "ca_local_url": format!("http://127.0.0.1:{port}/admin/ca"),
-        "running_in_container": running_in_container,
         "lan_ip_available": lan_ip_available,
         "mitm_enabled": state.proxy_engine.mitm_enabled,
     }))
