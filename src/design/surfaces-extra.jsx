@@ -727,6 +727,7 @@ function SettingsSurface() {
   const [cfg, setCfg] = React.useState(null);
   const [upstream, setUpstream] = React.useState(null);
   const [socks5, setSocks5] = React.useState(null);
+  const [upd, setUpd] = React.useState(null);
   const [errors, setErrors] = React.useState({});
 
   React.useEffect(() => {
@@ -741,15 +742,17 @@ function SettingsSurface() {
       }
     };
     (async () => {
-      const [config, upstreamProxy, socksStatus] = await Promise.all([
+      const [config, upstreamProxy, socksStatus, update] = await Promise.all([
         load('config', '/admin/config'),
         load('upstream proxy', '/admin/upstream-proxy'),
         load('socks5', '/admin/socks5/status'),
+        load('update', '/admin/update'),
       ]);
       if (cancelled) return;
       setCfg(config.value);
       setUpstream(upstreamProxy.value);
       setSocks5(socksStatus.value);
+      setUpd(update.value);
       setErrors(Object.fromEntries(
         [config, upstreamProxy, socksStatus]
           .filter(part => part.error)
@@ -791,6 +794,38 @@ function SettingsSurface() {
             SOCKS5 is configured on port {socks5.port} but failed to bind at startup — the port may already be in use. Set <code>OPROXY_SOCKS5_PORT</code> to a free port and restart.
           </div>
         )}
+        {upd?.update_available && (
+          <div className="warn-strip" style={{ gridColumn: '1 / -1' }}>
+            Update available: <b>{upd.latest}</b> (you’re on {upd.current}).{' '}
+            {upd.release_url && <a href={upd.release_url} target="_blank" rel="noopener">View release notes</a>}
+            {' '}— pull the latest Docker image or release binary to upgrade.
+          </div>
+        )}
+        <div className="insp-card" style={{ margin: 0, gridColumn: '1 / -1' }}>
+          <div className="head"><h3>About</h3></div>
+          <div className="body">
+            <div className="kv" style={{ gridTemplateColumns: '160px 1fr' }}>
+              <div className="k">Version</div>
+              <div className="v">
+                {value(upd?.current)}
+                {upd?.update_available && <span className="badge" style={{ marginLeft: 8, color: 'var(--warn, #b26a00)' }}>update available → {upd.latest}</span>}
+                {upd && upd.checked && !upd.update_available && !upd.error && <span style={{ marginLeft: 8, color: 'var(--text-faint)' }}>up to date</span>}
+              </div>
+              <div className="k">Updates</div>
+              <div className="v">
+                {upd && upd.enabled === false
+                  ? 'Checks disabled (OPROXY_UPDATE_CHECK)'
+                  : !upd || !upd.checked
+                    ? 'Checking…'
+                    : upd.error
+                      ? `Last check failed (${upd.error})`
+                      : upd.update_available
+                        ? <a href={upd.release_url || '#'} target="_blank" rel="noopener">{upd.latest} available</a>
+                        : 'Running the latest release'}
+              </div>
+            </div>
+          </div>
+        </div>
         <div className="insp-card" style={{ margin: 0 }}>
           <div className="head"><h3>Listener</h3></div>
           <div className="body">

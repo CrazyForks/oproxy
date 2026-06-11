@@ -859,6 +859,57 @@ mod tests {
         payload: Value,
     }
 
+    /// Executor coverage: every tool exposed to the model must dispatch to a
+    /// real executor. `contract_for_tool` already gates unknown names, and a
+    /// separate test guarantees contracts == exposed tools, but neither catches
+    /// a tool that has a contract yet falls through `execute_assistant_tool` to
+    /// the "no executor" arm. This locks the match arms against the registry so
+    /// adding a tool to the manifest without wiring an executor fails in CI.
+    #[test]
+    fn every_model_tool_has_an_executor() {
+        use std::collections::BTreeSet;
+        let handled: BTreeSet<&str> = [
+            "list_sessions",
+            "get_session",
+            "get_config",
+            "get_feature_catalog",
+            "get_rules",
+            "get_protocol_metrics",
+            "get_connections",
+            "get_breakpoint_diagnostics",
+            "get_throttling",
+            "get_dns",
+            "get_capture_filter",
+            "get_webhooks",
+            "get_upstream_proxy",
+            "propose_map_remote",
+            "propose_dns_override",
+            "propose_throttling",
+            "propose_rewrite_rule",
+            "propose_mock_rule",
+            "propose_access_rule",
+            "propose_capture_filter",
+            "propose_upstream_proxy",
+            "propose_action",
+        ]
+        .into_iter()
+        .collect();
+
+        for name in super::super::assistant_registry::openai_tool_names() {
+            if name.starts_with("workspace_") {
+                assert!(
+                    workspace_action_name_for_tool(&name).is_some(),
+                    "workspace tool '{name}' has no backing workspace action executor"
+                );
+            } else {
+                assert!(
+                    handled.contains(name.as_str()),
+                    "model tool '{name}' is exposed but has no executor arm in execute_assistant_tool"
+                );
+            }
+        }
+    }
+
     #[test]
     fn tool_summary_describes_common_payload_shapes() {
         assert_eq!(

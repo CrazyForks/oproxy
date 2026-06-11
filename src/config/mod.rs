@@ -70,6 +70,10 @@ fn default_allow_private_admin_egress() -> bool {
     false
 }
 
+fn default_update_check() -> bool {
+    true
+}
+
 fn default_map_local_base_path() -> Option<PathBuf> {
     None
 }
@@ -187,6 +191,12 @@ pub struct Config {
     /// In containerized deployments, set via OPROXY_MAP_LOCAL_BASE_PATH env var.
     #[serde(default = "default_map_local_base_path")]
     pub map_local_base_path: Option<PathBuf>,
+    /// Check GitHub Releases once at startup to surface a "newer version
+    /// available" badge in the UI. Best-effort and non-blocking. This is the
+    /// only outbound call oproxy makes on its own behalf; set
+    /// `OPROXY_UPDATE_CHECK=false` to disable it.
+    #[serde(default = "default_update_check")]
+    pub update_check: bool,
     /// Logging configuration.
     #[serde(default)]
     pub log: LogConfig,
@@ -231,6 +241,7 @@ impl Default for Config {
             otel_enabled: false,
             otel_endpoint: None,
             map_local_base_path: default_map_local_base_path(),
+            update_check: default_update_check(),
         }
     }
 }
@@ -467,6 +478,9 @@ impl Config {
         }
         if let Ok(val) = std::env::var("OPROXY_OTEL_ENABLED") {
             config.otel_enabled = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(val) = std::env::var("OPROXY_UPDATE_CHECK") {
+            config.update_check = !matches!(val.to_lowercase().as_str(), "0" | "false" | "no");
         }
         if let Ok(val) = std::env::var("OPROXY_OTEL_ENDPOINT") {
             let v = val.trim().to_string();

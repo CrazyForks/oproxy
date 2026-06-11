@@ -42,6 +42,7 @@ pub(crate) struct AppState {
     pub(crate) endpoint_metrics: crate::control_plane::SharedEndpointMetrics,
     pub(crate) assistant: crate::control_plane::SharedAssistantState,
     pub(crate) workspace: crate::control_plane::SharedWorkspaceState,
+    pub(crate) update_status: crate::control_plane::SharedUpdateStatus,
     pub(crate) config: crate::config::Config,
     pub(crate) webhooks: crate::webhooks::SharedWebhooks,
     pub(crate) mock_rules: crate::middleware::plugins::mock::SharedMockRules,
@@ -87,6 +88,11 @@ pub(super) async fn build_runtime_services(
             e
         );
     }
+
+    // First install: seed disabled example rules for every modification feature
+    // so each surface demonstrates a use case. Per-file and non-destructive —
+    // a feature whose storage file already exists is never touched.
+    crate::examples::seed_first_run_examples(&storage_path).await;
 
     let throttling_config = Arc::new(RwLock::new(storage::load_throttle(&storage_path)));
     let dns_overrides = Arc::new(RwLock::new(storage::load_dns_overrides(&storage_path)));
@@ -259,6 +265,7 @@ pub(super) async fn build_runtime_services(
         endpoint_metrics: control_plane::new_endpoint_metrics(),
         assistant: control_plane::new_assistant_state(),
         workspace: control_plane::new_workspace_state(),
+        update_status: control_plane::new_update_status(),
         config: config.clone(),
         webhooks: webhooks_shared,
         mock_rules: mock_rules_shared,

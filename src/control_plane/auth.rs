@@ -400,14 +400,8 @@ fn is_management_host(
         return true;
     }
 
-    let lan_hosts = [
-        crate::setup::public_lan_ip_for_setup(),
-        crate::setup::detect_lan_ip(),
-    ];
-    lan_hosts
-        .into_iter()
-        .flatten()
-        .any(|lan_host| host == lan_host.to_ascii_lowercase())
+    crate::setup::public_lan_ip_for_setup()
+        .is_some_and(|lan_host| host == lan_host.to_ascii_lowercase())
 }
 
 /// Returns true when the request looks like a browser top-level navigation

@@ -43,13 +43,34 @@ impl OpenAiCompatibleProviderClient {
         messages: &[Value],
         tools: &[Value],
     ) -> Result<ProviderChatMessage, String> {
-        let payload = json!({
+        self.chat_completion_inner(messages, Some(tools)).await
+    }
+
+    /// Final-answer completion with tools disabled. Used after the tool loop is
+    /// exhausted so the model is forced to compose a textual answer from the
+    /// context it already gathered, instead of the caller returning a canned
+    /// "did not finish" message that discards every tool result.
+    pub(super) async fn chat_completion_text_only(
+        &self,
+        messages: &[Value],
+    ) -> Result<ProviderChatMessage, String> {
+        self.chat_completion_inner(messages, None).await
+    }
+
+    async fn chat_completion_inner(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+    ) -> Result<ProviderChatMessage, String> {
+        let mut payload = json!({
             "model": self.provider.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
             "temperature": 0.2,
         });
+        if let Some(tools) = tools {
+            payload["tools"] = json!(tools);
+            payload["tool_choice"] = json!("auto");
+        }
         let mut request_builder = self.client.post(chat_completions_url(&self.provider)?);
         if !self.api_key.trim().is_empty() {
             request_builder = request_builder.bearer_auth(&self.api_key);
@@ -171,6 +192,30 @@ mod tests {
         };
         assert!(validate_provider(&provider, "key").is_err());
         assert!(validate_provider(&provider, "").is_err());
+    }
+
+    #[test]
+    fn text_only_completion_omits_tool_fields_from_payload() {
+        // Mirror the payload construction in chat_completion_inner so we lock in
+        // that the final forced answer never advertises tools (some providers
+        // reject `tool_choice` with no `tools`, and we must not let the model
+        // start another tool call after the loop budget is spent).
+        let mut payload = json!({ "model": "gpt-test", "messages": [], "temperature": 0.2 });
+        let tools: Option<&[Value]> = None;
+        if let Some(tools) = tools {
+            payload["tools"] = json!(tools);
+            payload["tool_choice"] = json!("auto");
+        }
+        assert!(payload.get("tools").is_none());
+        assert!(payload.get("tool_choice").is_none());
+
+        let mut with_tools = json!({ "model": "gpt-test", "messages": [], "temperature": 0.2 });
+        let tools: Option<&[Value]> = Some(&[]);
+        if let Some(tools) = tools {
+            with_tools["tools"] = json!(tools);
+            with_tools["tool_choice"] = json!("auto");
+        }
+        assert_eq!(with_tools["tool_choice"], "auto");
     }
 
     #[test]

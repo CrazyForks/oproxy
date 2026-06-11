@@ -180,8 +180,7 @@ pub struct ProxyEngine {
     pub(crate) bind_port: u16,
     pub(crate) bind_host: String,
     /// LAN/host IPs of this proxy, resolved once at construction. Used for
-    /// self-proxy loop detection when bound to a wildcard address. Cached to
-    /// avoid a per-request UDP socket syscall in `detect_lan_ip`.
+    /// self-proxy loop detection when bound to a wildcard address.
     self_lan_hosts: Vec<String>,
     /// If set, injected as `alt-svc` on every forwarded response to advertise
     /// the HTTP/3 listener. Built once from `Config.http3_port` at startup.
@@ -283,14 +282,9 @@ impl ProxyEngine {
             pool_idle_timeout_secs,
             bind_port,
             bind_host,
-            self_lan_hosts: [
-                crate::setup::public_lan_ip_for_setup(),
-                crate::setup::detect_lan_ip(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|h| h.to_ascii_lowercase())
-            .collect(),
+            self_lan_hosts: crate::setup::public_lan_ip_for_setup()
+                .map(|h| vec![h.to_ascii_lowercase()])
+                .unwrap_or_default(),
             alt_svc_header: std::sync::OnceLock::new(),
         }
     }

@@ -203,10 +203,35 @@ function AssistantSurface({ onRefresh, onWorkspaceChanged, uiState, activeSurfac
   const [toolEvents, setToolEvents] = React.useState([]);
   const [proposedActions, setProposedActions] = React.useState([]);
   const [busy, setBusy] = React.useState(false);
+  const [compat, setCompat] = React.useState(null);
+  const [compatBusy, setCompatBusy] = React.useState(false);
 
   React.useEffect(() => {
     saveConfig(config);
   }, [config]);
+
+  const testCompatibility = async () => {
+    setCompatBusy(true);
+    setCompat(null);
+    try {
+      const res = await fetch('/admin/assistant/compatibility', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: { base_url: config.base_url, model: config.model },
+          api_key: config.api_key,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      setCompat(body);
+    } catch (err) {
+      notifyError(err.message || err);
+      setCompat({ compatible: false, summary: `Compatibility check failed: ${err.message || err}`, checks: [] });
+    } finally {
+      setCompatBusy(false);
+    }
+  };
 
   const updateConfig = (key, value) => setConfig(prev => ({ ...prev, [key]: value }));
 
@@ -221,7 +246,9 @@ function AssistantSurface({ onRefresh, onWorkspaceChanged, uiState, activeSurfac
 
     setBusy(true);
     setToolEvents([]);
-    setProposedActions([]);
+    // Intentionally do NOT clear proposedActions here. A proposal prepared on a
+    // previous turn stays valid (server-side TTL) and applyable; wiping it would
+    // orphan a pending change the moment the user types a follow-up message.
 
     try {
       const res = await fetch('/admin/assistant/chat', {
@@ -238,7 +265,16 @@ function AssistantSurface({ onRefresh, onWorkspaceChanged, uiState, activeSurfac
       if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
       setMessages(prev => [...prev, { role: 'assistant', content: body.message || 'I finished the request.' }]);
       setToolEvents(body.tool_events || []);
-      setProposedActions(body.proposed_actions || []);
+      // Merge new proposals with any still-pending ones, deduped by action_id,
+      // so earlier prepared actions remain visible and applyable.
+      setProposedActions(prev => {
+        const next = [...prev];
+        for (const action of (body.proposed_actions || [])) {
+          const idx = next.findIndex(a => a.action_id === action.action_id);
+          if (idx >= 0) next[idx] = action; else next.push(action);
+        }
+        return next;
+      });
       if ((body.tool_events || []).some(event => event.category === 'ui' && event.status === 'ok')) {
         onWorkspaceChanged?.();
       }
@@ -301,6 +337,9 @@ function AssistantSurface({ onRefresh, onWorkspaceChanged, uiState, activeSurfac
       <input className="cmp-input" aria-label="Provider base URL" value={config.base_url} onChange={e => updateConfig('base_url', e.target.value)} placeholder="https://api.openai.com/v1" />
       <input className="cmp-input" aria-label="Model" value={config.model} onChange={e => updateConfig('model', e.target.value)} placeholder="model" />
       <input className="cmp-input" aria-label="API key" type="password" value={config.api_key} onChange={e => updateConfig('api_key', e.target.value)} placeholder="API key stays in this tab" />
+      <button className="btn sm ghost" type="button" disabled={compatBusy || !config.model.trim()} onClick={testCompatibility} title="Probe this model for assistant compatibility">
+        {compatBusy ? 'Testing…' : 'Test compatibility'}
+      </button>
     </div>
   );
 
@@ -334,6 +373,46 @@ function AssistantSurface({ onRefresh, onWorkspaceChanged, uiState, activeSurfac
         </div>
 
         <aside className="assistant-side">
+          {compat && (
+            <div className="assistant-panel">
+              <div className="assistant-panel-title">
+                Model compatibility{' '}
+                {typeof compat.compatibility_percent === 'number' ? (
+                  <b style={{ color: compat.compatibility_percent >= 80 ? 'var(--ok, #2e7d32)' : compat.compatibility_percent >= 50 ? 'var(--warn, #b26a00)' : 'var(--danger, #c62828)' }}>
+                    {compat.compatibility_percent}%
+                  </b>
+                ) : (
+                  <b style={{ color: 'var(--danger, #c62828)' }}>Not compatible</b>
+                )}
+              </div>
+              <p className="assistant-empty" style={{ marginTop: 0 }}>{compat.summary}</p>
+              {typeof compat.avg_eval_latency_ms === 'number' && (
+                <div className="assistant-event"><span>Avg latency / prompt</span><b>{compat.avg_eval_latency_ms} ms</b></div>
+              )}
+              {(compat.checks || []).map(check => (
+                <div key={check.id} className={`assistant-event ${check.ok ? 'ok' : 'error'}`}>
+                  <span>{check.ok ? '✓' : '✕'} {check.label}{check.required ? '' : ' (recommended)'}</span>
+                  {typeof check.latency_ms === 'number' && <b>{check.latency_ms} ms</b>}
+                  {check.detail && <small>{check.detail}</small>}
+                </div>
+              ))}
+              {(compat.evals || []).length > 0 && (
+                <>
+                  <div className="assistant-panel-title" style={{ marginTop: 10 }}>
+                    Eval cases ({compat.evals_passed}/{compat.evals_total})
+                  </div>
+                  {compat.evals.map(ev => (
+                    <div key={ev.id} className={`assistant-event ${ev.ok ? 'ok' : ev.score_percent > 0 ? 'needs_confirmation' : 'error'}`}>
+                      <span>{ev.ok ? '✓' : ev.score_percent > 0 ? '◐' : '✕'} {ev.prompt}</span>
+                      <b>{typeof ev.score_percent === 'number' ? `${ev.score_percent}%` : ''}{ev.fields_total > 0 ? ` · ${ev.fields_matched}/${ev.fields_total} fields` : ''}</b>
+                      <small>{ev.detail}</small>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          )}
+
           <div className="assistant-panel">
             <div className="assistant-panel-title">Tool events</div>
             {toolEvents.length === 0 && <div className="assistant-empty">No tool calls yet.</div>}
